@@ -16,7 +16,8 @@ import torch
 import pufferlib  # noqa: F401  (loads pufferlib._C, registering the op)
 from pufferlib.ocean.drive.raster_ref import (
     DEFAULT_RIG,
-    PICTURA_RIG,  # noqa: F401  (re-exported for callers)
+    NUPLAN_RIG,  # noqa: F401  (re-exported for callers)
+    WAYMO_RIG,  # noqa: F401  (re-exported for callers)
     Camera,
     rig_from_config,  # noqa: F401
     rig_tensor,

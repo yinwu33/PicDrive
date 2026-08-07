@@ -534,3 +534,158 @@ Phase 7 = 论文 3.1 的 Gigaflow 特性补齐，也是渲染保真度的真正�
   注意 RenderState 是 **per-env** 的，而 pufferl 的观测是 **per-agent 扁平** 的，
   包装器要按 `env.agent_offsets` 把每个 env 的 ego 段对齐回全局 agent 下标。
   可直接返回 GPU tensor（`pufferl.py:270` 是直通），但需 `cpu_offload=false`。
+
+### 2026-08-06 / 08-07 — session 2：两次 NaN 训练崩溃 + 非有限更新守卫
+
+**症状**：`puffer train puffer_drive_cam` 两次训到中途 loss 全部变 `nan`，且再也不恢复。
+
+| run | 目录 | 相机 rig | 最后一个好 ckpt | 炸点 | 浪费 |
+|---|---|---|---|---|---|
+| 1 | `experiments/puffer_drive_cam_178600831551` | nuPlan 96x54 | `model_..._003000.pt` | epoch 3000–4000 之间 | ~2.8 h |
+| 2 | `experiments/puffer_drive_cam_zv75yuy4` | Waymo 96x64 | `model_..._004000.pt` | **epoch 4745** | ~2.6 h（且当时仍在跑） |
+
+**取证结论（已验证，不要重做）**
+
+1. **是瞬间事件，不是渐进发散。** 解析 run 2 的 `wandb/run-20260806_210429-zv75yuy4/files/output.log`
+   （6171 帧 dashboard），epoch 4744 各项完全健康：`value_loss 0.961`、`entropy 1.653`、
+   `approx_kl 0.013`、`clipfrac 0.147`、`importance 0.999`；4745 直接全 nan。**没有任何预兆。**
+   → 降 lr / 降 gamma / 降 update_epochs 这类"治发散"的手段对此**无效**，只会推迟触发时间。
+2. **炸在 epoch 4745 的 minibatch 0。** 该 epoch 的 `clipfrac` 是 0.003 而非 nan，
+   而 `nan > 0.2` 求值为 False：0.147/32 ≈ 0.0046 ≈ 0.003，说明 mb 0 前向有限、
+   算出了正常 clipfrac，NaN 产生在 mb 0 的 ratio 之后到 `optimizer.step()` 之间，mb 1–31 全被污染。
+3. **一旦发生就是永久的。** `clip_grad_norm_` 用一个全局系数乘所有梯度，
+   NaN 的 `total_norm` 让 34 个张量同时中招；Adam 的 `exp_avg`/`exp_avg_sq` 变 NaN 后是吸收态。
+   实测：ckpt 权重 1,794,093/1,794,093 全 NaN，`trainer_state.pt` 的 Adam 状态 3,588,186/3,588,220 全 NaN
+   （幸存的 34 个是整数 `step` 标量）。
+4. **环境和数据已排除。** 全部 10000 张地图（680,847 个 object）扫描：无 non-finite 轨迹/goal/尺寸，
+   无 `length == 0`（最小 |length| = 0.2，所以 `drive.h:1746` 的 `tanf(steer)/wheelbase` 除零触发不了）。
+   jerk 动力学实跑 192,000 agent-step，11 维 ego 特征全部有限且在范围内。图像是 uint8，本身不可能是 NaN。
+5. **光栅器已排除。** `raster.cu` 的 tile 装箱有 `if (s < MAX_TILE_TRIS)`，输出写有
+   `x >= c.width || y >= c.height` 检查，scratch 每次调用按本 batch 最大场景重新分配（非缓存复用），
+   索引上界 `2*num_roads` / `12*num_agents` 与 `max_*_tris` 一致。
+6. **`mb_prio` → inf 数值上不可能。** 要让 `prio_probs` 下溢到精确 0 需要 `Σprio_weights > 7e38`；
+   `value_loss ≈ 1` 时 advantage 量级差 30 多个数量级。它能到 ~1e6（训练质量问题，仍待改），但不是 NaN 源。
+
+**已实施的改动（session 2）**
+
+- `pufferl.py` — **非有限更新守卫**：`optimizer.step()` 前用 `torch._foreach_norm` 自行求梯度范数，
+  非有限则跳过这次更新并计数，Adam 状态和权重都不被污染。
+  注意范数**必须在 clip 之前**求：`clip_grad_norm_` 会把 NaN 系数乘进所有梯度，之后就没有证据可看了。
+  单元验证：注入一次 NaN loss，无守卫 → 权重 212/212 + Adam 424/428 全 NaN；有守卫 → 全 0。
+- `pufferl.py` — **首次触发时 dump 现场**（`PuffeRL.dump_nonfinite`），落盘到
+  `experiments/<env>_<run_id>/nonfinite_epoch<E>_mb<M>.pt`。内含：逐张量的 nan/inf 计数与有限最大值
+  （`ratio / logratio / newlogprob / mb_logprobs / mb_prio / adv / advantages / newvalue / mb_values /
+  mb_returns / mb_rewards / entropy / idx`）、**未经 clip 的**逐参数梯度健康度与逐层梯度范数、
+  以及出问题那几行的观测。只存坏行，不存整个 minibatch（相机帧整批约 130 MB）。
+- `pufferl.py` — loss 累加只累加有限项，另出 `losses/nonfinite_minibatches` 计数。
+  否则一次跳过会让所有 loss 曲线永久停在 nan，正好把你最需要读的信号毁掉。
+- `pufferl.py` — `self.values[idx]` 写回加 `torch.where(isfinite)` 保护，
+  避免一个坏预测污染 rollout buffer 导致整个 epoch 的后续 minibatch 全部作废（该 buffer 下个 evaluate() 会重建）。
+- `config/ocean/drive_cam.ini` — `checkpoint_interval` 1000 → **200**。
+  run 2 从最后一个好 ckpt(4000) 到炸点(4745) 丢了 745 个 epoch ≈ 1.4 h；间隔 200 最多丢 22 min。
+- 烟测：`--env.num-maps 200 --train.total-timesteps 800000` 跑完 exit 0，7 个 epoch 指标正常，
+  dashboard 出现 `nonfinite_min…  0.000`。
+
+**⚠️ 从 ckpt resume 的已知行为（`pufferl.py:1549` 附近）**
+
+`--load-model-path` **只加载权重**，优化器状态的加载是注释掉的。所以从
+`puffer_drive_cam_zv75yuy4/model_puffer_drive_cam_004000.pt` 续跑时：
+- Adam 动量从零开始（这次反而是想要的，因为 `trainer_state.pt` 已经是 NaN）；
+- `self.epoch` 和 `self.global_step` **重置为 0** → **cosine lr 调度从 5e-4 重新开始**
+  （run 2 死的时候已经退火到 3.32e-4），`total_epochs` 也按完整 `total_timesteps` 重算。
+  如果想接着原来的退火位置，需要另外处理，目前没做。
+
+**下一步（按顺序）**
+
+1. 从 ckpt 4000 续跑，**盯 `losses/nonfinite_minibatches`**：
+   - 稳定为 0 → 之前是极罕见单点事件，守卫已经够用；
+   - 每个 epoch 跳几十次 → 那是真发散，守卫在掩盖问题，要回头查。
+2. 一旦落盘了 `nonfinite_*.pt`，看 `summary` 里**哪个张量先非有限**，再决定打哪个补丁：
+   - `ratio` / `logratio` 非有限 → **B1**：`logratio.clamp(max=10)` 再 exp。
+     float32 的 exp 在 88.7 溢出，而 PPO clip 只用到 1±0.2，ratio > 20 在数学上无意义。
+     这是目前排第一的嫌疑（单样本事件，8192 个样本里 1 个 inf 不会影响 clipfrac）。
+   - `mb_rewards` / `advantages` 非有限 → **B4**：在环境边界加断言。
+     注意 `pufferl.py:301` 的 `torch.clamp(r, -1, 1)` 对 NaN 是透传的，
+     而 `pufferl.py:326` 的 truncation bootstrap `r + gamma*V` 是**不裁剪**的（代码注释自己写了）。
+   - 权重已 NaN 而梯度干净 → 说明更早的某次更新就坏了，守卫的判定位置要往前挪。
+3. 与病因无关、无论如何都该做的两条：
+   - **B2**：`mb_prio` 按 batch 内 max 归一化（`pufferl.py:404`），标准 PER 做法。现在能到 ~1e6。
+   - **B3**：补上论文 Tab. 5 明写的 advantage 过滤（0.01× running max abs）。
+     **论文有一个专门压制 advantage 离群值的机制，这份复现漏了，还额外加了会放大离群值的 PER。**
+4. 暂不动的（会偏离 Pictura 复现基线，等 1–3 做完确认还有问题再说）：
+   换回 Muon（baseline `puffer_drive` 从 `default.ini:28` 继承的就是 muon，
+   `drive_cam` 为对齐论文 Tab. 5 才显式改成 AdamW）、γ 0.999 → 0.99
+   （论文的 0.999 配 1280 步 episode，这里 `episode_length = 91`，有效视界是 episode 的 11 倍）、
+   关 PER、去掉 `vf_clip_coef`（论文明写"无 value clipping"）。
+
+#### session 2 续 —— 真凶找到了：CNN 激活尺度失控，被 LayerNorm 掩盖
+
+**上面 "下一步" 里对 B1/B4 的猜测全部作废**，dump 落盘后指向的是架构，不是 trainer。
+
+**过程**：从 `zv75yuy4/model_..._004000.pt` 续跑（run `66lj6rha`）。
+epoch 1–623 干净，**epoch 624 开始每个 epoch 恰好跳 32/32 次，一次不落**。
+判据是 `approx_kl` 和 `clipfrac` **精确等于 0.000** —— 策略在 rollout 和 update 之间完全没变。
+即：守卫把"永久 NaN"换成了"**永久死锁**"，而且是静默的（score 稳在 0.89、loss 正常波动、dashboard 看着完全活着）。
+ckpt 800/1000/…/2000 的 CNN 权重**逐位相同**，实际空转了 1376+ 个 epoch。
+
+**守卫的设计缺陷（记住）**：跳过式守卫只对**瞬时离群**有效。这次的 NaN 是**权重状态的确定性函数**，
+跳过 → 权重不变 → 下次 backward 产生一模一样的 NaN → 无限循环。守卫必须能区分这两种情况
+（例如连续 N 个 minibatch 全跳就该报警/中止，而不是继续跑）。
+
+**dump 的结论**（`experiments/puffer_drive_cam_66lj6rha/nonfinite_epoch000624_mb021.pt`）：
+
+- 14 个前向张量**全部有限**，loss 也全部健康（`policy_loss -0.103`、`value_loss 0.963`、
+  `entropy 1.734`、`approx_kl 0.022`、`importance 1.002`）。**NaN 只存在于 backward。**
+- 逐参数梯度里只有 `cam_proj.0.weight` 坏：`g_nan=256`、`g_inf=0`、其余部分 `g_max_abs=0`。
+  该权重是 `[128, 3072]`，**256 = 2 × 128** → 3072 个 CNN 特征里有 2 个污染了全部 128 个输出行。
+- **整个 CNN（10 个参数）的梯度范数精确等于 0**；`cam_proj.0.bias` 的梯度是 6.4e-7。
+
+**根因**（用同一批合成输入跑所有 ckpt 实测，跨两个 run）：
+
+| ckpt | max\|feat\| | mean\|feat\| | LN 输入 σ | 传回 CNN 的梯度 |
+|---|---|---|---|---|
+| zv75yuy4 @1000 | 41 | 1.56 | 41 | 1.7e-2 |
+| zv75yuy4 @2000 | 54 | 1.34 | 62 | 2.0e-2 |
+| zv75yuy4 @3000 | 116 | 1.85 | 112 | 8.4e-3 |
+| zv75yuy4 @4000 | 891 | **37.0** | 1381 | 4.5e-4 |
+| *@4745 → NaN* | | | | |
+| 66lj6rha @200 | 943 | 43.7 | 2280 | 3.0e-4 |
+| 66lj6rha @400 | 1173 | 80.0 | 3854 | 1.8e-4 |
+| 66lj6rha @600 | 1875 | 136 | 7387 | 1.3e-4 |
+| *@624 → 冻结* | | | | |
+| 66lj6rha @800（冻结态） | 9442 | **992** | 38041 | **2.4e-5** |
+
+`DriveCam` 的 `cam_proj = Linear(3072→128) → LayerNorm(128) → GELU`，而它前面那个 5 层 conv stack
+**层间完全没有归一化**。这构成一个没有回复力的正反馈：
+
+- LayerNorm **前向对尺度不变** → CNN 输出涨多大 loss 都感觉不到，没有任何惩罚；
+- LayerNorm **反向正比于 1/σ** → CNN 输出越大，唯一能把它拉回来的梯度就越弱（实测衰减 700 倍）。
+
+越涨越没人管，越没人管涨得越快，终点是 σ² 溢出 float32 → backward 出 NaN。
+**前向自始至终有限**（LayerNorm 本来就是干这个的），所以两次都毫无预兆 —— 这解释了
+为什么 epoch 4744 的每一项指标都完全健康。
+
+**关键的修复选择依据：weight decay 没用。** 实测 CNN 权重范数在 epoch 200→600 几乎不动
+（`cnn.0` 6.97→7.19、`cnn.2` 31.4→35.6、`cnn.4` 41.5→45.6、`cnn.6` 58.0→63.6、`cnn.8` 53.5→55.8，
+全部只涨 3~13%），bias 更是几乎不变，而同期 `mean|feat|` 涨了 23 倍。
+**尺度爆炸来自 5 层之间的方向对齐（每层约 1.87×），不是权重变大。**
+所以任何约束权重范数的手段（weight decay、weight norm penalty）都打不中，
+必须直接归一化**激活**（conv 之间加 GroupNorm/LayerNorm）。
+
+**这条通路的来历**：`torch.py:130-134` 的注释写明，论文 Alberti 用 **16 个 learned query token
+做 cross-attention 池化**，本复现单相机下换成了 flatten + Linear + LayerNorm。
+替换本身有道理，但它在 CNN 和 LayerNorm 之间留下了一条尺度无约束的通路。
+
+**手上所有 checkpoint 都已污染，包括 zv75yuy4 的 4000**（`mean|feat|` 37，健康值 1.5，已在失控轨道上）。
+从任何一个续跑都只是重复这次 —— 这正是 `66lj6rha` 只撑了 624 个 epoch
+而原 run 从头跑撑了 4745 个的原因：**resume 继承了病灶。**
+
+**下一步（取代上面那份）**
+
+1. **先改架构再训**：给 conv stack 层间加归一化。不改就重训 = 花 ~11 小时复现一个已知 bug。
+2. **监控换成前瞻指标**：`nonfinite_minibatches` 现在是**滞后**指标 —— 它响的时候网络已经死了/冻了。
+   前瞻指标是 CNN 激活尺度本身（`mean|cnn feat|`，健康 ~1.5，>10 就该警觉），
+   每个 epoch 从一批观测上量一次几乎不花钱，也可以离线从任意 ckpt 秒级量出来（脚本见本条表格的做法）。
+3. 守卫补一条：连续 N 次全跳 → 报警并中止，不要静默空转。
+4. B2（`mb_prio` 按 max 归一化）/ B3（补论文 Tab. 5 的 advantage 过滤）仍然值得做，
+   但它们与本次故障无关，别再把它们当成 NaN 的修复。

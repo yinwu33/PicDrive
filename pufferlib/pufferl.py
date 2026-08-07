@@ -227,6 +227,11 @@ class PuffeRL:
         self.vecenv = vecenv
         self.epoch = 0
         self.global_step = 0
+        # Non-finite update guard. A single NaN gradient handed to Adam turns every
+        # parameter and both moment buffers into NaN permanently, so the update is
+        # dropped instead and the first occurrence is dumped for diagnosis.
+        self.nonfinite_updates = 0
+        self.nonfinite_dumped = False
         self.last_log_step = 0
         self.last_log_time = time.time()
         self.start_time = time.time()
@@ -477,24 +482,71 @@ class PuffeRL:
             self.amp_context.__enter__()  # TODO: AMP needs some debugging
 
             # This breaks vloss clipping?
-            self.values[idx] = newvalue.detach().float()
+            # Non-finite predictions are dropped rather than written: poisoning the
+            # rollout buffer makes every later minibatch in this epoch non-finite
+            # too. The next evaluate() rebuilds this buffer, so the stale estimate
+            # costs nothing.
+            new_values = newvalue.detach().float()
+            self.values[idx] = torch.where(torch.isfinite(new_values), new_values, self.values[idx])
 
-            # Logging
+            # Logging. Only finite terms accumulate: one bad minibatch would
+            # otherwise leave every loss curve at nan for the rest of the run, which
+            # is exactly the signal you need to still be able to read.
+            # `nonfinite_minibatches` below carries the count instead.
             profile("train_misc", epoch)
-            losses["policy_loss"] += pg_loss.item() / self.total_minibatches
-            losses["value_loss"] += v_loss.item() / self.total_minibatches
-            losses["entropy"] += entropy_loss.item() / self.total_minibatches
-            losses["old_approx_kl"] += old_approx_kl.item() / self.total_minibatches
-            losses["approx_kl"] += approx_kl.item() / self.total_minibatches
-            losses["clipfrac"] += clipfrac.item() / self.total_minibatches
-            losses["importance"] += ratio.mean().item() / self.total_minibatches
+            mb_losses = dict(
+                policy_loss=pg_loss.item(),
+                value_loss=v_loss.item(),
+                entropy=entropy_loss.item(),
+                old_approx_kl=old_approx_kl.item(),
+                approx_kl=approx_kl.item(),
+                clipfrac=clipfrac.item(),
+                importance=ratio.mean().item(),
+            )
+            for loss_name, loss_value in mb_losses.items():
+                if np.isfinite(loss_value):
+                    losses[loss_name] += loss_value / self.total_minibatches
 
             # Learn on accumulated minibatches
             profile("learn", epoch)
             loss.backward()
             if (mb + 1) % self.accumulate_minibatches == 0:
-                torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
-                self.optimizer.step()
+                # The norm is taken before clipping, not from clip_grad_norm_'s return
+                # value: clip_grad_norm_ scales every gradient by one global
+                # coefficient, so a NaN norm overwrites all of them and there is
+                # nothing left to diagnose. This also names the layer whose gradient
+                # went non-finite, which the global norm alone does not.
+                grads = [p.grad for p in self.policy.parameters() if p.grad is not None]
+                param_grad_norms = torch.stack(torch._foreach_norm(grads))
+                grad_norm = torch.linalg.vector_norm(param_grad_norms)
+                # A NaN gradient handed to Adam turns every parameter and both moment
+                # buffers into NaN permanently. Two runs died exactly this way with
+                # every loss healthy the epoch before, so the update is dropped
+                # rather than taken.
+                if torch.isfinite(grad_norm):
+                    torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
+                    self.optimizer.step()
+                else:
+                    self.nonfinite_updates += 1
+                    if not self.nonfinite_dumped:
+                        self.nonfinite_dumped = True
+                        dump_path = self.dump_nonfinite(mb, grad_norm, mb_losses, dict(
+                            idx=idx,
+                            mb_prio=mb_prio,
+                            advantages=advantages[idx],
+                            adv=adv,
+                            ratio=ratio,
+                            logratio=logratio,
+                            newlogprob=newlogprob,
+                            mb_logprobs=mb_logprobs,
+                            entropy=entropy,
+                            newvalue=newvalue,
+                            mb_values=mb_values,
+                            mb_returns=mb_returns,
+                            mb_rewards=mb_rewards,
+                            mb_terminals=mb_terminals,
+                        ), mb_obs, param_grad_norms)
+                        self.msg = f"Non-finite update at epoch {self.epoch} mb {mb}; dumped {dump_path}"
                 self.optimizer.zero_grad()
 
         # Reprioritize experience
@@ -507,6 +559,7 @@ class PuffeRL:
         var_y = y_true.var()
         explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
         losses["explained_variance"] = explained_var.item()
+        losses["nonfinite_minibatches"] = float(self.nonfinite_updates)
 
         profile.end()
         logs = None
@@ -599,6 +652,81 @@ class PuffeRL:
         path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}.pt")
         shutil.copy(model_path, path)
         return path
+
+    def dump_nonfinite(self, mb, grad_norm, mb_losses, tensors, obs=None, param_grad_norms=None):
+        """Write the first non-finite update to disk so the cause can be identified.
+
+        Records which tensor went non-finite and where, per-parameter weight and
+        gradient health (a NaN gradient on one layer with clean weights points at
+        the loss; NaN weights point at an earlier update), and the observation rows
+        behind the offending samples. The full minibatch of camera frames is ~130 MB
+        and is not evidence, so only the bad rows are kept.
+        """
+        run_id = self.logger.run_id
+        path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}")
+        os.makedirs(path, exist_ok=True)
+        dump_path = os.path.join(path, f"nonfinite_epoch{self.epoch:06d}_mb{mb:03d}.pt")
+
+        summary, saved, bad_rows = {}, {}, None
+        for name, t in tensors.items():
+            if not torch.is_tensor(t):
+                continue
+            t = t.detach()
+            saved[name] = t.cpu()
+            if not torch.is_floating_point(t):
+                summary[name] = dict(shape=tuple(t.shape), dtype=str(t.dtype))
+                continue
+            finite = torch.isfinite(t)
+            n_bad = int((~finite).sum())
+            fin = t[finite]
+            summary[name] = dict(
+                shape=tuple(t.shape),
+                n_nan=int(torch.isnan(t).sum()),
+                n_inf=int(torch.isinf(t).sum()),
+                max_abs_finite=float(fin.abs().max()) if fin.numel() else float("nan"),
+            )
+            # First tensor with a non-finite entry names the rows worth keeping.
+            if n_bad and bad_rows is None:
+                flat = (~finite).reshape(t.shape[0], -1).any(dim=1)
+                bad_rows = torch.nonzero(flat).flatten()[:16].cpu()
+                summary[name]["bad_rows"] = bad_rows.tolist()
+
+        # Gradients here are un-clipped, so a layer showing NaN gradients under clean
+        # weights points at the loss, while NaN weights point at an earlier update.
+        params = {}
+        for name, param in self.uncompiled_policy.named_parameters():
+            entry = dict(w_nan=int(torch.isnan(param).sum()), w_inf=int(torch.isinf(param).sum()))
+            if param.grad is not None:
+                g = param.grad
+                g_fin = g[torch.isfinite(g)]
+                entry.update(
+                    g_nan=int(torch.isnan(g).sum()),
+                    g_inf=int(torch.isinf(g).sum()),
+                    g_max_abs=float(g_fin.abs().max()) if g_fin.numel() else float("nan"),
+                )
+            params[name] = entry
+        if param_grad_norms is not None:
+            saved["param_grad_norms"] = param_grad_norms.detach().cpu()
+
+        if obs is not None and bad_rows is not None and bad_rows.numel():
+            saved["obs_bad_rows"] = obs.detach()[bad_rows.to(obs.device)].cpu()
+            saved["obs_bad_row_ids"] = bad_rows
+
+        torch.save(
+            dict(
+                epoch=self.epoch,
+                minibatch=mb,
+                global_step=self.global_step,
+                grad_norm=float(grad_norm),
+                learning_rate=self.optimizer.param_groups[0]["lr"],
+                minibatch_losses=mb_losses,
+                summary=summary,
+                params=params,
+                tensors=saved,
+            ),
+            dump_path,
+        )
+        return dump_path
 
     def save_checkpoint(self):
         if torch.distributed.is_initialized():

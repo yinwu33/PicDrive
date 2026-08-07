@@ -92,12 +92,12 @@ class Camera:
     pitch_deg: float = 0.0
     roll_deg: float = 0.0
     width: int = 96
-    height: int = 54
-    # Sensor focal length in pixels at `sensor_width`. The paper specifies the rig
-    # this way (1545 px on a 1920x1080 sensor); the 63.7 x 38.5 degree field of
-    # view quoted alongside it is the derived quantity, so deriving fx from the
-    # focal length rather than from a rounded angle reproduces it exactly.
-    focal_px: float = 1545.0
+    height: int = 64
+    # Sensor focal length in pixels at `sensor_width`. Both rigs below are
+    # specified this way; the field of view quoted alongside them is the derived
+    # quantity, so deriving fx from the focal length rather than from a rounded
+    # angle reproduces the sensor exactly. Defaults are Waymo's front camera.
+    focal_px: float = 2066.7
     sensor_width: int = 1920
     hfov_deg: float | None = None  # overrides focal_px when set
     near: float = 0.15
@@ -141,19 +141,56 @@ class Camera:
         return torch.tensor([right, down, fwd], dtype=torch.float32)
 
 
-# The four-camera rig of the paper (Tab. 3), modelled on nuPlan. Shared
-# intrinsics: 1920x1080 sensor, 1545 px focal length, 63.7 x 38.5 degree FOV,
-# rendered at 96x54. Only yaw varies between cameras; there is no pitch or roll.
-PICTURA_RIG: list[Camera] = [
-    Camera("front", (1.66, -0.01, 1.49), yaw_deg=0.0),
-    Camera("front_left", (1.63, 0.12, 1.48), yaw_deg=55.0),
-    Camera("front_right", (1.62, -0.16, 1.49), yaw_deg=-55.0),
-    Camera("back", (-0.47, 0.02, 1.43), yaw_deg=180.0),
+# Distance from the rear axle to the centre of the ego bounding box, for the
+# Waymo platform (Chrysler Pacifica: 5.18 m long, 1.15 m rear overhang). WOD
+# reports extrinsics in a vehicle frame whose origin is the rear axle at ground
+# level; this rasterizer works in an ego frame centred on the bounding box,
+# because that is what WOMD stores and what `Drive` keeps in `agent->x/y`. z is
+# already measured from the road surface in both, so only x shifts.
+WAYMO_REAR_AXLE_TO_BOX_CENTER = 1.44
+
+
+def _box_center_frame(pos: tuple[float, float, float]) -> tuple[float, float, float]:
+    """WOD vehicle frame (rear axle, ground level) -> the box-centre ego frame."""
+    return (round(pos[0] - WAYMO_REAR_AXLE_TO_BOX_CENTER, 4), pos[1], pos[2])
+
+
+# Waymo's own rig, medians of the camera calibration in 36 Perception v1.4.3
+# segments; the positions below are passed in as calibrated. Shared
+# intrinsics: 1920x1280 sensor, 2066.7 px focal length, 49.8 x 34.4 degree FOV,
+# rendered at 96x64 -- the sensor's own 3:2, so pixels stay square.
+#
+# Measured pitch and roll are within a degree of zero on every camera (front is
+# 0.08 and -0.17) and the front camera's yaw is 0.14, all of it calibration
+# jitter rather than mounting, so only the mounting yaw of the side pair is kept.
+#
+# The two side cameras (yaw +-90) are left out: they are 1920x886, and a rig has
+# to share one resolution. WOD has no rear camera, so unlike NUPLAN_RIG this one
+# cannot see behind the vehicle.
+WAYMO_RIG: list[Camera] = [
+    Camera("front", _box_center_frame((1.5440, -0.0237, 2.1157)), yaw_deg=0.0),
+    Camera("front_left", _box_center_frame((1.4961, 0.0946, 2.1155)), yaw_deg=44.6),
+    Camera("front_right", _box_center_frame((1.4938, -0.0963, 2.1157)), yaw_deg=-44.7),
 ]
 
-# Default rig for this reproduction: the paper's front camera alone. Adding the
-# other three is a config change, not a kernel change.
-DEFAULT_RIG: list[Camera] = PICTURA_RIG[:1]
+# The four-camera rig of the Pictura paper (Tab. 3), modelled on nuPlan. Shared
+# intrinsics: 1920x1080 sensor, 1545 px focal length, 63.7 x 38.5 degree FOV,
+# rendered at 96x54. Only yaw varies between cameras; there is no pitch or roll.
+# Positions are as published, i.e. in nuPlan's own rear-axle frame; they are not
+# shifted to box centre, so this rig reproduces the paper rather than the sim.
+NUPLAN_RIG: list[Camera] = [
+    Camera("front", (1.66, -0.01, 1.49), yaw_deg=0.0, focal_px=1545.0, width=96, height=54),
+    Camera("front_left", (1.63, 0.12, 1.48), yaw_deg=55.0, focal_px=1545.0, width=96, height=54),
+    Camera("front_right", (1.62, -0.16, 1.49), yaw_deg=-55.0, focal_px=1545.0, width=96, height=54),
+    Camera("back", (-0.47, 0.02, 1.43), yaw_deg=180.0, focal_px=1545.0, width=96, height=54),
+]
+
+# Default rig: Waymo's front camera alone. PufferDrive drives WOMD layouts, so
+# rendering them through the sensor that recorded them is what keeps a later
+# sim-to-real alignment against Waymo camera data from having to absorb a change
+# of projection on top of the appearance gap. Adding the other two is a config
+# change, not a kernel change.
+DEFAULT_RIG: list[Camera] = WAYMO_RIG[:1]
 
 
 def rig_from_config(spec) -> list[Camera]:
@@ -161,14 +198,17 @@ def rig_from_config(spec) -> list[Camera]:
 
     Accepts the form written in drive_cam.ini, e.g.
         [{"name": "front", "pos": [1.66, -0.01, 1.49], "yaw_deg": 0.0}]
-    Named presets "pictura" (all four cameras) and "front" are also accepted.
+    Named presets "waymo" (all three Waymo cameras), "nuplan" (Pictura's four)
+    and "front" (the default, Waymo's front camera alone) are also accepted.
     """
     if spec is None:
         return list(DEFAULT_RIG)
     if isinstance(spec, str):
         text = spec.strip().strip('"').strip("'")
-        if text.lower() == "pictura":
-            return list(PICTURA_RIG)
+        if text.lower() == "waymo":
+            return list(WAYMO_RIG)
+        if text.lower() == "nuplan":
+            return list(NUPLAN_RIG)
         if text.lower() == "front":
             return list(DEFAULT_RIG)
         spec = json.loads(text)
