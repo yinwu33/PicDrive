@@ -123,6 +123,32 @@
 #define GOAL_GENERATE_NEW 1
 #define GOAL_STOP 2
 
+// Observation mode. VECTOR is the legacy privileged entity-set observation.
+// RENDER_STATE writes only the ego vector to the observation buffer and emits the
+// scene into a separate world-frame RenderState buffer, which the perspective
+// rasterizer consumes on the GPU. The policy never sees the scene buffer.
+#define OBS_MODE_VECTOR 0
+#define OBS_MODE_RENDER_STATE 1
+
+// RenderState layout. All primitives are world-frame; the rasterizer transforms
+// them per ego. Agents and egos are rewritten every step; roads are static for
+// the lifetime of a map and are filled once at init.
+#define RENDER_AGENT_FEATURES 8 // x, y, cos_h, sin_h, length, width, height, type
+#define RENDER_ROAD_FEATURES 6  // x0, y0, x1, y1, width, type
+// x, y, cos_h, sin_h, self_index. `self_index` points at this ego's own entry in
+// the agent array so the rasterizer can skip it: a camera does not see the car it
+// is mounted on, and the paper renders the surroundings only.
+#define RENDER_EGO_FEATURES 5
+
+// Painted-marking width in meters, used for road primitives that carry no width.
+#define RENDER_ROAD_MARKING_WIDTH 0.15f
+
+// Which road entity types are drawn into the perspective view, as a type bitmask.
+// Lane centerlines (ROAD_LANE) are a map abstraction with no painted counterpart
+// on real asphalt, so drawing them would put privileged structure into the image.
+// They are off by default. STOP_SIGN is a point feature, not a polyline.
+#define RENDER_ROAD_TYPES_DEFAULT ((1 << ROAD_LINE) | (1 << ROAD_EDGE) | (1 << CROSSWALK) | (1 << SPEED_BUMP))
+
 // Jerk action space (for JERK dynamics model)
 static const float JERK_LONG[4] = {-15.0f, -4.0f, 0.0f, 4.0f};
 static const float JERK_LAT[3] = {-4.0f, 0.0f, 4.0f};
@@ -358,7 +384,40 @@ struct Drive {
     int control_mode;
     int max_controlled_agents;
     int render_mode;
+
+    // Perspective rendering (Pictura). Buffers are owned by Python and handed in
+    // through the binding, so the rasterizer reads them without a copy.
+    int obs_mode;
+    int render_road_types;  // bitmask over entity types; see render_type_enabled()
+    float *render_agents;   // [render_max_agents * RENDER_AGENT_FEATURES]
+    float *render_egos;     // [active_agent_count * RENDER_EGO_FEATURES]
+    float *render_roads;    // [render_max_roads * RENDER_ROAD_FEATURES]
+    int *render_counts;     // [2] = {agents written this step, roads written at init}
+    int render_max_agents;
+    int render_max_roads;
+
+    // Rendered camera views for the selected agent, so the viewer can show what
+    // the policy actually sees. Laid out as [num_cameras * height, width, 3],
+    // i.e. the views stacked vertically. Owned by Python and filled from the
+    // rasterizer; NULL when perspective rendering is off.
+    unsigned char *render_camera_rgb;
+    int render_camera_count;
+    int render_camera_width;
+    int render_camera_height;
 };
+
+// Single source of truth for the observation stride. In RENDER_STATE mode the
+// observation carries only the ego vector; the scene leaves through RenderState.
+static inline int drive_ego_dim(Drive *env) {
+    return (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
+}
+
+static inline int drive_obs_size(Drive *env) {
+    int ego_dim = drive_ego_dim(env);
+    if (env->obs_mode == OBS_MODE_RENDER_STATE)
+        return ego_dim;
+    return ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+}
 
 void add_log(Drive *env) {
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -1456,6 +1515,8 @@ void init_goal_positions(Drive *env) {
 void init(Drive *env) {
     env->human_agent_idx = 0;
     env->timestep = 0;
+    if (env->render_road_types == 0)
+        env->render_road_types = RENDER_ROAD_TYPES_DEFAULT;
     env->entities = load_map_binary(env->map_name, env);
     set_means(env);
     init_grid_map(env);
@@ -1508,8 +1569,7 @@ void c_close(Drive *env) {
 
 void allocate(Drive *env) {
     init(env);
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
-    int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int max_obs = drive_obs_size(env);
     env->observations = (float *)calloc(env->active_agent_count * max_obs, sizeof(float));
     env->actions = (float *)calloc(env->active_agent_count * 2, sizeof(float));
     env->rewards = (float *)calloc(env->active_agent_count, sizeof(float));
@@ -1806,9 +1866,140 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
     }
 }
 
+// ---------------------------------------------------------------------------
+// RenderState: world-frame scene primitives for the perspective rasterizer.
+//
+// This buffer is privileged and never reaches the policy. The vecenv wrapper
+// consumes it on the GPU, produces camera images, and discards it; only the
+// rendered images and the ego vector are handed to the network.
+// ---------------------------------------------------------------------------
+
+static inline int render_type_enabled(Drive *env, int type) {
+    if (type < 0 || type > 31)
+        return 0;
+    return (env->render_road_types >> type) & 1;
+}
+
+// Painted width in meters per road feature. Perspective alone makes near markings
+// read thicker than far ones; this only sets the world-space width.
+static inline float render_road_width(int type) {
+    switch (type) {
+    case ROAD_EDGE:
+        return 0.25f;
+    case CROSSWALK:
+        return 0.50f;
+    case SPEED_BUMP:
+        return 0.40f;
+    default:
+        return RENDER_ROAD_MARKING_WIDTH;
+    }
+}
+
+// Number of road segments the enabled types would emit. Python calls this to size
+// the road buffer before handing it back through the binding.
+int count_render_roads(Drive *env) {
+    int n = 0;
+    for (int i = 0; i < env->num_entities; i++) {
+        Entity *e = &env->entities[i];
+        if (e->type < ROAD_LANE || !render_type_enabled(env, e->type))
+            continue;
+        if (e->array_size > 1)
+            n += e->array_size - 1;
+    }
+    return n;
+}
+
+// Static road geometry. Filled once per map, not per step.
+void fill_render_roads(Drive *env) {
+    if (env->render_roads == NULL)
+        return;
+    int n = 0;
+    int cap = env->render_max_roads;
+    for (int i = 0; i < env->num_entities && n < cap; i++) {
+        Entity *e = &env->entities[i];
+        if (e->type < ROAD_LANE || !render_type_enabled(env, e->type))
+            continue;
+        float width = render_road_width(e->type);
+        for (int j = 0; j + 1 < e->array_size && n < cap; j++) {
+            float *out = &env->render_roads[n * RENDER_ROAD_FEATURES];
+            out[0] = e->traj_x[j];
+            out[1] = e->traj_y[j];
+            out[2] = e->traj_x[j + 1];
+            out[3] = e->traj_y[j + 1];
+            out[4] = width;
+            out[5] = (float)e->type;
+            n++;
+        }
+    }
+    if (env->render_counts != NULL)
+        env->render_counts[1] = n;
+}
+
+// Dynamic scene: every drawable agent, plus the pose of each controlled ego.
+// Called every step from compute_observations.
+void fill_render_state(Drive *env) {
+    if (env->render_agents == NULL || env->render_egos == NULL)
+        return;
+
+    int n = 0;
+    int cap = env->render_max_agents;
+    // Entity index behind each primitive, so each ego can find its own box below.
+    int prim_entity[MAX_AGENTS];
+    // Same iteration and validity rules as the partner observations above, so the
+    // vectorized and perspective modalities see the same set of agents.
+    for (int j = 0; j < MAX_AGENTS && n < cap; j++) {
+        int index = -1;
+        if (j < env->active_agent_count) {
+            index = env->active_agent_indices[j];
+        } else if (j < env->num_actors && env->static_agent_count > 0) {
+            index = env->static_agent_indices[j - env->active_agent_count];
+        }
+        if (index == -1)
+            continue;
+        Entity *e = &env->entities[index];
+        if (e->type > CYCLIST || e->type == NONE)
+            continue;
+        if (e->removed || e->respawn_timestep != -1)
+            continue;
+
+        float *out = &env->render_agents[n * RENDER_AGENT_FEATURES];
+        out[0] = e->x;
+        out[1] = e->y;
+        out[2] = e->heading_x;
+        out[3] = e->heading_y;
+        out[4] = e->length;
+        out[5] = e->width;
+        out[6] = e->height;
+        out[7] = (float)e->type;
+        prim_entity[n] = index;
+        n++;
+    }
+    if (env->render_counts != NULL)
+        env->render_counts[0] = n;
+
+    for (int i = 0; i < env->active_agent_count; i++) {
+        int index = env->active_agent_indices[i];
+        Entity *e = &env->entities[index];
+        float *out = &env->render_egos[i * RENDER_EGO_FEATURES];
+        out[0] = e->x;
+        out[1] = e->y;
+        out[2] = e->heading_x;
+        out[3] = e->heading_y;
+        // -1 when this ego has no primitive this step (removed or respawning),
+        // in which case there is nothing to skip.
+        out[4] = -1.0f;
+        for (int k = 0; k < n; k++) {
+            if (prim_entity[k] == index) {
+                out[4] = (float)k;
+                break;
+            }
+        }
+    }
+}
+
 void compute_observations(Drive *env) {
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
-    int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    int ego_dim = drive_ego_dim(env);
+    int max_obs = drive_obs_size(env);
     memset(env->observations, 0, max_obs * env->active_agent_count * sizeof(float));
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     for (int i = 0; i < env->active_agent_count; i++) {
@@ -1851,6 +2042,11 @@ void compute_observations(Drive *env) {
             obs[6] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
             obs[7] = ego_entity->type / 3.0f;
         }
+
+        // In perspective mode the ego vector is the whole observation: the scene
+        // reaches the policy only as rendered pixels, never as entity sets.
+        if (env->obs_mode == OBS_MODE_RENDER_STATE)
+            continue;
 
         // Relative Pos of other cars
         int obs_idx = ego_dim;
@@ -1973,6 +2169,9 @@ void compute_observations(Drive *env) {
         // Set the entire block to 0 at once
         memset(&obs[obs_idx], 0, remaining_obs * sizeof(float));
     }
+
+    if (env->obs_mode == OBS_MODE_RENDER_STATE)
+        fill_render_state(env);
 }
 
 void sample_new_goal(Drive *env, int agent_idx) {
@@ -2240,6 +2439,10 @@ struct Client {
     Vector3 default_camera_target;
     int recorder_pipefd[2];
     pid_t recorder_pid;
+    // Lazily created texture holding the stacked camera views.
+    Texture2D camera_tex;
+    int camera_tex_w;
+    int camera_tex_h;
     pid_t xvfb_pid;
     int xvfb_display_num;
 };
@@ -2463,8 +2666,13 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         return;
     }
 
-    int ego_dim = (env->dynamics_model == JERK) ? EGO_FEATURES_JERK : EGO_FEATURES_CLASSIC;
-    int max_obs = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1) + ROAD_FEATURES * MAX_ROAD_SEGMENT_OBSERVATIONS;
+    // This overlay visualizes the vectorized entity sets, which do not exist in
+    // perspective mode -- the observation there is the ego vector alone.
+    if (env->obs_mode == OBS_MODE_RENDER_STATE)
+        return;
+
+    int ego_dim = drive_ego_dim(env);
+    int max_obs = drive_obs_size(env);
     float (*observations)[max_obs] = (float (*)[max_obs])env->observations;
     float *agent_obs = &observations[agent_index][0];
     // self
@@ -2998,6 +3206,65 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
     }
 }
 
+// Draw the selected agent's camera views as a strip down the right edge.
+//
+// These are the exact pixels handed to the policy, blitted from the rasterizer's
+// output rather than redrawn with raylib, so what you see is the observation and
+// not an approximation of it. Must be called in 2D space, after EndMode3D.
+static void draw_camera_panels(Drive *env, Client *client) {
+    if (env->render_camera_rgb == NULL || env->render_camera_count <= 0)
+        return;
+
+    int cam_w = env->render_camera_width;
+    int cam_h = env->render_camera_height;
+    int n = env->render_camera_count;
+    int tex_h = cam_h * n;
+
+    if (client->camera_tex.id == 0 || client->camera_tex_w != cam_w || client->camera_tex_h != tex_h) {
+        if (client->camera_tex.id != 0)
+            UnloadTexture(client->camera_tex);
+        Image img = {.data = env->render_camera_rgb,
+                     .width = cam_w,
+                     .height = tex_h,
+                     .mipmaps = 1,
+                     .format = PIXELFORMAT_UNCOMPRESSED_R8G8B8};
+        client->camera_tex = LoadTextureFromImage(img);
+        client->camera_tex_w = cam_w;
+        client->camera_tex_h = tex_h;
+    } else {
+        UpdateTexture(client->camera_tex, env->render_camera_rgb);
+    }
+    // Nearest-neighbour keeps the low-resolution pixels legible when scaled up.
+    SetTextureFilter(client->camera_tex, TEXTURE_FILTER_POINT);
+
+    const int margin = 12;
+    const int label_h = 18;
+    int panel_w = (int)(client->width * 0.28f);
+    if (panel_w > 384)
+        panel_w = 384;
+    float scale = (float)panel_w / cam_w;
+    int panel_h = (int)(cam_h * scale);
+
+    int total_h = n * (panel_h + label_h + margin) - margin;
+    int x = (int)client->width - panel_w - margin;
+    int y = margin;
+    if (total_h < (int)client->height)
+        y = ((int)client->height - total_h) / 2;
+
+    DrawRectangle(x - 6, y - 6, panel_w + 12, total_h + 12, (Color){0, 0, 0, 140});
+    for (int i = 0; i < n; i++) {
+        Rectangle src = {0.0f, (float)(i * cam_h), (float)cam_w, (float)cam_h};
+        Rectangle dst = {(float)x, (float)(y + label_h), (float)panel_w, (float)panel_h};
+        DrawTexturePro(client->camera_tex, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
+        DrawRectangleLines(x, y + label_h, panel_w, panel_h, PUFF_CYAN);
+
+        char label[64];
+        snprintf(label, sizeof(label), "cam %d  %dx%d", i, cam_w, cam_h);
+        DrawText(label, x, y + 2, 14, PUFF_WHITE);
+        y += panel_h + label_h + margin;
+    }
+}
+
 void c_render(Drive *env, int view_mode, int draw_traces) {
 
     // Create client on first render call
@@ -3091,6 +3358,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             draw_scene(env, client, 0, 0, 0, 1);
         }
 
+        draw_camera_panels(env, client);
         EndDrawing();
 
         unsigned char *screen_data = rlReadScreenPixels((int)client->width, (int)client->height);
@@ -3163,11 +3431,16 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
                  client->height - 30, 20, PUFF_WHITE);
         DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
         DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
+        draw_camera_panels(env, client);
         EndDrawing();
     }
 }
 
 void close_client(Client *client) {
+    if (client->camera_tex.id != 0) {
+        UnloadTexture(client->camera_tex);
+        client->camera_tex.id = 0;
+    }
     if (client->recorder_pid > 0) {
         close(client->recorder_pipefd[1]);
         waitpid(client->recorder_pid, NULL, 0);

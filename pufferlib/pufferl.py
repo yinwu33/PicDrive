@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import argparse
 import importlib
+import inspect
 import configparser
 from threading import Thread
 from collections import defaultdict, deque
@@ -174,6 +175,14 @@ class PuffeRL:
                 lr=config["learning_rate"],
                 betas=(config["adam_beta1"], config["adam_beta2"]),
                 eps=config["adam_eps"],
+            )
+        elif config["optimizer"] == "adamw":
+            optimizer = torch.optim.AdamW(
+                self.policy.parameters(),
+                lr=config["learning_rate"],
+                betas=(config["adam_beta1"], config["adam_beta2"]),
+                eps=config["adam_eps"],
+                weight_decay=config.get("weight_decay", 0.01),
             )
         elif config["optimizer"] == "muon":
             from heavyball import ForeachMuon
@@ -521,13 +530,17 @@ class PuffeRL:
             self_play_eval = self.config["eval"]["self_play_eval"]
 
             self.evaluator = Evaluator(self.full_args, self.logger)
+            # Build the eval envs from the env actually being trained. Hardcoding
+            # "puffer_drive" here skips any observation pipeline the training env
+            # layers on, which hands the policy the wrong observation entirely.
+            eval_env_name = self.full_args.get("env_name", "puffer_drive")
             if human_replay_eval:
-                self.evaluator.hr_env = load_env("puffer_drive", self.evaluator.hr_eval_config)
+                self.evaluator.hr_env = load_env(eval_env_name, self.evaluator.hr_eval_config)
                 self.evaluator.rollout(self.uncompiled_policy, mode="human_replay")
                 self.evaluator.hr_env.close()
                 self.evaluator.log_videos(eval_mode="human_replay", epoch=self.epoch)
             if self_play_eval:
-                self.evaluator.sp_env = load_env("puffer_drive", self.evaluator.sp_eval_config)
+                self.evaluator.sp_env = load_env(eval_env_name, self.evaluator.sp_eval_config)
                 self.evaluator.rollout(self.uncompiled_policy, mode="self_play")
                 self.evaluator.sp_env.close()
                 self.evaluator.log_videos(eval_mode="self_play", epoch=self.epoch)
@@ -1345,12 +1358,35 @@ def autotune(args=None, env_name=None, vecenv=None, policy=None):
     pufferlib.vector.autotune(make_env, batch_size=args["train"]["env_batch_size"])
 
 
+# Config keys consumed by the vecenv wrapper rather than by the env constructor.
+ENV_KWARG_BLOCKLIST = {"cameras"}
+
+# Some Ocean envs re-parse the config in C for settings the Python constructor does
+# not forward. They take the path as this kwarg; hand them the file this run was
+# actually configured from, so the two halves cannot drift apart.
+ENV_CONFIG_PATH_KWARG = "ini_file"
+
+
 def load_env(env_name, args):
     package = args["package"]
     module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
-    return pufferlib.vector.make(make_env, env_kwargs=args["env"], **args["vec"])
+    env_kwargs = {k: v for k, v in args["env"].items() if k not in ENV_KWARG_BLOCKLIST}
+    config_path = args.get("config_path")
+    if config_path is not None and ENV_CONFIG_PATH_KWARG not in env_kwargs:
+        try:
+            accepts = ENV_CONFIG_PATH_KWARG in inspect.signature(make_env).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        if accepts:
+            env_kwargs[ENV_CONFIG_PATH_KWARG] = config_path
+    vecenv = pufferlib.vector.make(make_env, env_kwargs=env_kwargs, **args["vec"])
+    # Environments may layer an observation pipeline on top of the raw vecenv.
+    wrapper = getattr(env_module, "vecenv_wrapper", None)
+    if wrapper is not None:
+        vecenv = wrapper(env_name, vecenv, args)
+    return vecenv
 
 
 def load_policy(args, vecenv, env_name=""):
@@ -1438,11 +1474,13 @@ def load_config(env_name, config_dir=None):
     if env_name == "default":
         p = configparser.ConfigParser()
         p.read(puffer_default_config)
+        config_path = puffer_default_config
     else:
         for path in glob.glob(puffer_config_dir, recursive=True):
             p = configparser.ConfigParser()
             p.read([puffer_default_config, path])
             if env_name in p["base"]["env_name"].split():
+                config_path = path
                 break
         else:
             raise pufferlib.APIUsageError("No config for env_name {}".format(env_name))
@@ -1475,6 +1513,9 @@ def load_config(env_name, config_dir=None):
         prev[subkey] = value
 
     args["train"]["use_rnn"] = args["rnn_name"] is not None
+    # Envs whose C side parses the config itself need the file this came from, not
+    # a guess at it. See ENV_CONFIG_PATH_KWARG in load_env.
+    args["config_path"] = os.path.realpath(config_path)
     return args
 
 

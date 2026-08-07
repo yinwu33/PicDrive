@@ -10,6 +10,15 @@ from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
 
+# The C environment parses its own copy of the config. Anything Python does not
+# forward as an explicit kwarg comes from here, so this must be the same file the
+# trainer loaded -- `load_env` passes the resolved path down as `ini_file`. The
+# default is the packaged drive.ini, resolved against the package rather than the
+# working directory so a direct Drive(...) works from anywhere.
+_PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+DEFAULT_INI_FILE = os.path.join(_PACKAGE_DIR, "config", "ocean", "drive.ini")
+
+
 class RenderView(IntEnum):
     FULL_SIM_STATE = 0  # Orthographic top-down, fully observable simulator state
     BEV_AGENT_OBS = 1  # Orthographic top-down, only show what the selected agent can observe
@@ -49,6 +58,9 @@ class Drive(pufferlib.PufferEnv):
         control_mode="control_vehicles",
         max_controlled_agents=32,
         map_dir="resources/drive/binaries/training",
+        obs_mode="vector",
+        render_road_types=0,
+        ini_file=None,
     ):
         # env
         self.dt = dt
@@ -84,11 +96,23 @@ class Drive(pufferlib.PufferEnv):
         self.partner_features = binding.PARTNER_FEATURES
         self.road_features = binding.ROAD_FEATURES
 
-        self.num_obs = (
-            self.ego_features
-            + self.max_partner_objects * self.partner_features
-            + self.max_road_objects * self.road_features
-        )
+        # In "render_state" mode the observation is the ego vector alone. The scene
+        # leaves the env through the separate RenderState buffers, which the
+        # perspective rasterizer consumes on the GPU and the policy never sees.
+        if obs_mode not in ("vector", "render_state"):
+            raise ValueError(f"obs_mode must be 'vector' or 'render_state'. Got: {obs_mode}")
+        self.obs_mode = obs_mode
+        self.render_road_types = render_road_types
+        self._obs_mode_flag = binding.OBS_MODE_VECTOR if obs_mode == "vector" else binding.OBS_MODE_RENDER_STATE
+
+        if obs_mode == "render_state":
+            self.num_obs = self.ego_features
+        else:
+            self.num_obs = (
+                self.ego_features
+                + self.max_partner_objects * self.partner_features
+                + self.max_road_objects * self.road_features
+            )
         self.single_observation_space = gymnasium.spaces.Box(low=-1, high=1, shape=(self.num_obs,), dtype=np.float32)
 
         self.init_steps = init_steps
@@ -136,6 +160,19 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(f"action_space must be 'discrete' or 'continuous'. Got: {action_type}")
 
         self._action_type_flag = 0 if action_type == "discrete" else 1
+        # Also forwarded explicitly: the kwarg wins over the ini, so a programmatic
+        # Drive(dynamics_model=...) is honoured even against a config that disagrees.
+        # A mismatch here desyncs both the action decoding and the observation
+        # stride between C and Python, and does so silently.
+        self._dynamics_model_flag = 0 if dynamics_model == "classic" else 1
+
+        self.ini_file = os.path.abspath(ini_file or DEFAULT_INI_FILE)
+        if not os.path.exists(self.ini_file):
+            raise FileNotFoundError(
+                f"Drive config {self.ini_file} not found. The C environment reads its "
+                "settings from this file; passing the wrong one silently changes the "
+                "simulator out from under the Python-side spaces."
+            )
 
         # Check if resources directory exists
         binary_path = f"{map_dir}/map_000.bin"
@@ -181,6 +218,7 @@ class Drive(pufferlib.PufferEnv):
                 self.truncations[cur:nxt],
                 seed,
                 action_type=self._action_type_flag,
+                dynamics_model=self._dynamics_model_flag,
                 human_agent_idx=human_agent_idx,
                 reward_vehicle_collision=reward_vehicle_collision,
                 reward_offroad_collision=reward_offroad_collision,
@@ -197,17 +235,55 @@ class Drive(pufferlib.PufferEnv):
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 map_id=map_ids[i],
                 max_agents=nxt - cur,
-                ini_file="pufferlib/config/ocean/drive.ini",
+                ini_file=self.ini_file,
                 init_steps=init_steps,
                 init_mode=self.init_mode,
                 control_mode=self.control_mode,
                 map_dir=map_dir,
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=render_mode,
+                obs_mode=self._obs_mode_flag,
+                render_road_types=self.render_road_types,
             )
             self.env_ids.append(env_id)
 
         self.c_envs = binding.vectorize(*self.env_ids)
+        self._alloc_render_state()
+
+    def _alloc_render_state(self):
+        """Allocate the world-frame RenderState buffers and bind them to the C envs.
+
+        These hold privileged scene primitives (agent boxes, road polylines, ego
+        poses) for the perspective rasterizer. They are deliberately kept out of
+        the observation buffer: the rasterizer consumes them on the GPU and the
+        policy only ever receives the rendered pixels plus the ego vector.
+
+        Road geometry is static for the lifetime of a map, so the C side fills it
+        once when the buffer is bound. Agents and ego poses are rewritten by
+        `fill_render_state` on every step.
+        """
+        if self.obs_mode != "render_state":
+            self.render_state = None
+            return
+
+        sizes = binding.vec_render_state_sizes(self.c_envs)
+        self.render_state = []
+        for env_id, (num_roads, num_actors, num_egos) in zip(self.env_ids, sizes):
+            # numpy rejects zero-length buffers downstream; keep at least one slot.
+            roads = np.zeros((max(num_roads, 1), binding.RENDER_ROAD_FEATURES), dtype=np.float32)
+            agents = np.zeros((max(num_actors, 1), binding.RENDER_AGENT_FEATURES), dtype=np.float32)
+            egos = np.zeros((max(num_egos, 1), binding.RENDER_EGO_FEATURES), dtype=np.float32)
+            counts = np.zeros(2, dtype=np.int32)  # [agents written this step, roads]
+            binding.env_put(
+                env_id,
+                render_counts=counts,
+                render_agents=agents,
+                render_egos=egos,
+                render_roads=roads,
+            )
+            self.render_state.append(
+                dict(agents=agents, egos=egos, roads=roads, counts=counts, num_roads=int(counts[1]))
+            )
 
     def reset(self, seed=0):
         binding.vec_reset(self.c_envs, seed)
@@ -247,6 +323,7 @@ class Drive(pufferlib.PufferEnv):
                 self.truncations[cur:nxt],
                 seed,
                 action_type=self._action_type_flag,
+                dynamics_model=self._dynamics_model_flag,
                 human_agent_idx=self.human_agent_idx,
                 reward_vehicle_collision=self.reward_vehicle_collision,
                 reward_offroad_collision=self.reward_offroad_collision,
@@ -262,7 +339,7 @@ class Drive(pufferlib.PufferEnv):
                 episode_length=(int(self.episode_length) if self.episode_length is not None else None),
                 map_id=map_ids[i],
                 max_agents=nxt - cur,
-                ini_file="pufferlib/config/ocean/drive.ini",
+                ini_file=self.ini_file,
                 init_steps=self.init_steps,
                 init_mode=self.init_mode,
                 control_mode=self.control_mode,
@@ -270,9 +347,13 @@ class Drive(pufferlib.PufferEnv):
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 max_controlled_agents=self.max_controlled_agents,
                 render_mode=self.render_mode,
+                obs_mode=self._obs_mode_flag,
+                render_road_types=self.render_road_types,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)
+        # New maps mean new road geometry, so the RenderState buffers are resized.
+        self._alloc_render_state()
 
         binding.vec_reset(self.c_envs, seed)
         self.terminals[:] = 1

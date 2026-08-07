@@ -181,9 +181,15 @@ def make_multiagent(buf=None, **kwargs):
 
 MAKE_FUNCTIONS = {
     "drive": "Drive",
+    # Same simulator as `drive`, configured for perspective observations and
+    # wrapped by PerspectiveVecEnv below.
+    "drive_cam": "Drive",
     "spaces": make_spaces,
     "multiagent": make_multiagent,
 }
+
+# Environments that reuse another environment's module.
+MODULE_ALIASES = {"drive_cam": "drive"}
 
 
 def env_creator(name="squared", *args, **kwargs):
@@ -192,8 +198,27 @@ def env_creator(name="squared", *args, **kwargs):
 
     # TODO: Robust sanity / ocean imports
     name = name.replace("puffer_", "")
+    module_name = MODULE_ALIASES.get(name, name)
     try:
-        module = importlib.import_module(f"pufferlib.ocean.{name}.{name}")
+        module = importlib.import_module(f"pufferlib.ocean.{module_name}.{module_name}")
         return getattr(module, MAKE_FUNCTIONS[name])
     except ModuleNotFoundError:
         return MAKE_FUNCTIONS[name]
+
+
+def vecenv_wrapper(env_name, vecenv, args):
+    """Insert the perspective observation pipeline for camera-driven envs.
+
+    The rasterizer belongs to the observation pipeline rather than to the policy:
+    wrapping here is what keeps the privileged scene out of the network's inputs.
+    """
+    if "drive_cam" not in env_name:
+        return vecenv
+
+    from pufferlib.ocean.drive.perspective import PerspectiveVecEnv
+
+    return PerspectiveVecEnv(
+        vecenv,
+        cameras=args["env"].get("cameras"),
+        device=args["train"]["device"],
+    )

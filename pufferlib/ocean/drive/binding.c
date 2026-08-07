@@ -4,8 +4,97 @@
 #define MY_PUT
 #include "../env_binding.h"
 
+// Fetch an optional contiguous float32 array from kwargs and hand back its data
+// pointer and element count. Returns 0 when the key is absent, 1 on success,
+// -1 with a Python error set on a malformed argument.
+static int unpack_optional_f32(PyObject *kwargs, const char *key, float **data_out, int *count_out) {
+    PyObject *obj = PyDict_GetItemString(kwargs, key);
+    if (obj == NULL) {
+        return 0;
+    }
+    if (!PyObject_TypeCheck(obj, &PyArray_Type)) {
+        PyErr_Format(PyExc_TypeError, "%s must be a NumPy array", key);
+        return -1;
+    }
+    PyArrayObject *arr = (PyArrayObject *)obj;
+    if (!PyArray_ISCONTIGUOUS(arr)) {
+        PyErr_Format(PyExc_ValueError, "%s must be contiguous", key);
+        return -1;
+    }
+    if (PyArray_TYPE(arr) != NPY_FLOAT32) {
+        PyErr_Format(PyExc_ValueError, "%s must be float32", key);
+        return -1;
+    }
+    *data_out = (float *)PyArray_DATA(arr);
+    *count_out = (int)PyArray_SIZE(arr);
+    return 1;
+}
+
 static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
+    // Perspective-rendering buffers (Pictura). Optional: absent in vectorized mode.
+    // These are written by the env and read by the CUDA rasterizer; they never
+    // reach the policy.
+    // Bind the counts array first so the road fill below can record its size.
+    PyObject *counts = PyDict_GetItemString(kwargs, "render_counts");
+    if (counts != NULL) {
+        if (!PyObject_TypeCheck(counts, &PyArray_Type) || PyArray_TYPE((PyArrayObject *)counts) != NPY_INT32 ||
+            !PyArray_ISCONTIGUOUS((PyArrayObject *)counts) || PyArray_SIZE((PyArrayObject *)counts) < 2) {
+            PyErr_SetString(PyExc_ValueError, "render_counts must be a contiguous int32 array of size >= 2");
+            return 1;
+        }
+        env->render_counts = (int *)PyArray_DATA((PyArrayObject *)counts);
+    }
+
+    float *data = NULL;
+    int count = 0;
+    int found = unpack_optional_f32(kwargs, "render_agents", &data, &count);
+    if (found < 0)
+        return 1;
+    if (found) {
+        env->render_agents = data;
+        env->render_max_agents = count / RENDER_AGENT_FEATURES;
+    }
+    found = unpack_optional_f32(kwargs, "render_egos", &data, &count);
+    if (found < 0)
+        return 1;
+    if (found) {
+        env->render_egos = data;
+    }
+    found = unpack_optional_f32(kwargs, "render_roads", &data, &count);
+    if (found < 0)
+        return 1;
+    if (found) {
+        env->render_roads = data;
+        env->render_max_roads = count / RENDER_ROAD_FEATURES;
+        // Road geometry is static for the lifetime of the map, so fill it once here
+        // rather than on every step.
+        fill_render_roads(env);
+    }
+
+    PyObject *cam = PyDict_GetItemString(kwargs, "render_camera_rgb");
+    if (cam != NULL) {
+        if (!PyObject_TypeCheck(cam, &PyArray_Type) || PyArray_TYPE((PyArrayObject *)cam) != NPY_UINT8 ||
+            !PyArray_ISCONTIGUOUS((PyArrayObject *)cam) || PyArray_NDIM((PyArrayObject *)cam) != 4) {
+            PyErr_SetString(PyExc_ValueError,
+                            "render_camera_rgb must be a contiguous uint8 array [num_cameras, h, w, 3]");
+            return 1;
+        }
+        PyArrayObject *arr = (PyArrayObject *)cam;
+        if (PyArray_DIM(arr, 3) != 3) {
+            PyErr_SetString(PyExc_ValueError, "render_camera_rgb must have 3 channels");
+            return 1;
+        }
+        env->render_camera_rgb = (unsigned char *)PyArray_DATA(arr);
+        env->render_camera_count = (int)PyArray_DIM(arr, 0);
+        env->render_camera_height = (int)PyArray_DIM(arr, 1);
+        env->render_camera_width = (int)PyArray_DIM(arr, 2);
+    }
+
     PyObject *obs = PyDict_GetItemString(kwargs, "observations");
+    if (obs == NULL) {
+        // Nothing else to bind. Used when only the render buffers are handed over.
+        return 0;
+    }
     if (!PyObject_TypeCheck(obs, &PyArray_Type)) {
         PyErr_SetString(PyExc_TypeError, "Observations must be a NumPy array");
         return 1;
@@ -226,6 +315,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(goal_radius);
     OVERRIDE_FLOAT(goal_speed);
     OVERRIDE_INT(max_controlled_agents);
+    OVERRIDE_INT(obs_mode);
+    OVERRIDE_INT(render_road_types);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
@@ -249,6 +340,10 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->goal_radius = (float)unpack(kwargs, "goal_radius");
     env->goal_speed = (float)unpack(kwargs, "goal_speed");
     env->render_mode = (int)unpack(kwargs, "render_mode");
+    // Must be set before init(): it decides the observation stride and seeds the
+    // default road-type mask.
+    env->obs_mode = conf.obs_mode;
+    env->render_road_types = conf.render_road_types;
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");

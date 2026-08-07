@@ -982,6 +982,30 @@ static PyObject *vec_get_road_edge_polylines(PyObject *self, PyObject *args) {
     Py_RETURN_NONE;
 }
 
+// Per-env sizes needed to allocate the perspective RenderState buffers on the
+// Python side: the number of road segments the enabled types will emit, and the
+// number of agents that can appear in the scene.
+static PyObject *vec_render_state_sizes(PyObject *self, PyObject *args) {
+    VecEnv *vec = unpack_vecenv(args);
+    if (!vec)
+        return NULL;
+
+    PyObject *out = PyList_New(vec->num_envs);
+    if (!out)
+        return NULL;
+    for (int i = 0; i < vec->num_envs; i++) {
+        Drive *drive = (Drive *)vec->envs[i];
+        PyObject *entry = Py_BuildValue("(iii)", count_render_roads(drive), drive->num_actors,
+                                        drive->active_agent_count);
+        if (!entry) {
+            Py_DECREF(out);
+            return NULL;
+        }
+        PyList_SetItem(out, i, entry);
+    }
+    return out;
+}
+
 static double unpack(PyObject *kwargs, char *key) {
     PyObject *val = PyDict_GetItemString(kwargs, key);
     if (val == NULL) {
@@ -1065,6 +1089,8 @@ static PyMethodDef methods[] = {
      "Get road edge polyline counts from vectorized env"},
     {"vec_get_road_edge_polylines", vec_get_road_edge_polylines, METH_VARARGS,
      "Get road edge polylines from vectorized env"},
+    {"vec_render_state_sizes", vec_render_state_sizes, METH_VARARGS,
+     "Per-env (num_road_segments, num_actors, num_egos) for sizing RenderState buffers"},
     MY_METHODS,
     {NULL, NULL, 0, NULL}};
 
@@ -1089,6 +1115,13 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "PARTNER_FEATURES", PARTNER_FEATURES);
     PyModule_AddIntConstant(m, "EGO_FEATURES_CLASSIC", EGO_FEATURES_CLASSIC);
     PyModule_AddIntConstant(m, "EGO_FEATURES_JERK", EGO_FEATURES_JERK);
+
+    PyModule_AddIntConstant(m, "RENDER_AGENT_FEATURES", RENDER_AGENT_FEATURES);
+    PyModule_AddIntConstant(m, "RENDER_ROAD_FEATURES", RENDER_ROAD_FEATURES);
+    PyModule_AddIntConstant(m, "RENDER_EGO_FEATURES", RENDER_EGO_FEATURES);
+    PyModule_AddIntConstant(m, "OBS_MODE_VECTOR", OBS_MODE_VECTOR);
+    PyModule_AddIntConstant(m, "OBS_MODE_RENDER_STATE", OBS_MODE_RENDER_STATE);
+    PyModule_AddIntConstant(m, "RENDER_ROAD_TYPES_DEFAULT", RENDER_ROAD_TYPES_DEFAULT);
 
     return m;
 }

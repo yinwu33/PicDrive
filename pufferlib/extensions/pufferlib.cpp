@@ -86,6 +86,9 @@ void compute_puff_advantage_cpu(torch::Tensor values, torch::Tensor rewards,
 
 TORCH_LIBRARY(pufferlib, m) {
    m.def("compute_puff_advantage(Tensor(a!) values, Tensor(b!) rewards, Tensor(c!) dones, Tensor(d!) importance, Tensor(e!) advantages, float gamma, float lambda, float rho_clip, float c_clip) -> ()");
+   // Perspective rasterizer for PufferDrive. CUDA only; see
+   // pufferlib/extensions/cuda/raster.cu and pufferlib/ocean/drive/raster_ref.py.
+   m.def("drive_raster(Tensor agents, Tensor roads, Tensor egos, Tensor rig, Tensor ego_scene, Tensor agent_ranges, Tensor road_ranges, Tensor(h!) out) -> ()");
  }
 
 TORCH_LIBRARY_IMPL(pufferlib, CPU, m) {

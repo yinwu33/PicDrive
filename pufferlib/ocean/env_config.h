@@ -30,6 +30,8 @@ typedef struct {
     int init_mode;
     int control_mode;
     int max_controlled_agents;
+    int obs_mode;
+    int render_road_types;
     char map_dir[256];
 } env_init_config;
 
@@ -56,6 +58,18 @@ static int handler(void *config, const char *section, const char *name, const ch
             printf("Warning: Unknown dynamics_model value '%s', defaulting to JERK\n", value);
             env_config->dynamics_model = 1; // Default to JERK
         }
+    } else if (MATCH("env", "obs_mode")) {
+        if (strcmp(value, "\"vector\"") == 0 || strcmp(value, "vector") == 0) {
+            env_config->obs_mode = 0; // OBS_MODE_VECTOR
+        } else if (strcmp(value, "\"render_state\"") == 0 || strcmp(value, "render_state") == 0) {
+            env_config->obs_mode = 1; // OBS_MODE_RENDER_STATE
+        } else {
+            printf("Warning: Unknown obs_mode value '%s', defaulting to VECTOR\n", value);
+            env_config->obs_mode = 0;
+        }
+    } else if (MATCH("env", "render_road_types")) {
+        // Bitmask over entity types. 0 means "use the built-in default".
+        env_config->render_road_types = atoi(value);
     } else if (MATCH("env", "goal_behavior")) {
         env_config->goal_behavior = atoi(value);
     } else if (MATCH("env", "goal_target_distance")) {
