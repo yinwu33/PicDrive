@@ -1,0 +1,186 @@
+#ifndef ENV_CONFIG_H
+#define ENV_CONFIG_H
+
+#include <../../inih-r62/ini.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
+
+// Config struct for parsing INI files - contains all environment configuration
+typedef struct {
+    int render_mode;
+    int action_type;
+    int dynamics_model;
+    float reward_vehicle_collision;
+    float reward_offroad_collision;
+    float reward_goal;
+    float reward_goal_post_respawn;
+    float reward_vehicle_collision_post_respawn;
+    float goal_radius;
+    float goal_speed;
+    int collision_behavior;
+    int offroad_behavior;
+    int spawn_immunity_timer;
+    float dt;
+    int goal_behavior;
+    float goal_target_distance;
+    int episode_length;
+    int termination_mode;
+    int init_steps;
+    int init_mode;
+    int control_mode;
+    int max_controlled_agents;
+    int obs_mode;
+    int render_road_types;
+    char map_dir[256];
+
+    // Gigaflow random initialization.
+    int agents_per_map_min;
+    int agents_per_map_max;
+    float spawn_speed_max;
+    float spawn_heading_jitter_deg;
+    float wrong_way_frac;
+    int num_waypoints_max;
+    float waypoint_min_dist;
+    float waypoint_max_dist;
+} env_init_config;
+
+// The caller zero-initializes env_init_config, so every field the INI omits reads
+// back as 0. That is a fine default for the ocean-era knobs but not for these: 0
+// agents per map, or a 0 m waypoint spacing, is a silently broken scene rather than
+// a conservative one. Call this before ini_parse so the INI overrides real values.
+static void env_config_set_giga_defaults(env_init_config *c) {
+    c->agents_per_map_min = 1;
+    c->agents_per_map_max = 120;
+    c->spawn_speed_max = 12.0f;
+    c->spawn_heading_jitter_deg = 3.0f;
+    c->wrong_way_frac = 0.0f;
+    c->num_waypoints_max = 3;
+    c->waypoint_min_dist = 20.0f;
+    c->waypoint_max_dist = 80.0f;
+}
+
+// INI file parser handler - parses all environment configuration from drive.ini
+static int handler(void *config, const char *section, const char *name, const char *value) {
+    env_init_config *env_config = (env_init_config *)config;
+#define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
+
+    if (MATCH("env", "action_type")) {
+        if (strcmp(value, "\"discrete\"") == 0 || strcmp(value, "discrete") == 0) {
+            env_config->action_type = 0; // DISCRETE
+        } else if (strcmp(value, "\"continuous\"") == 0 || strcmp(value, "continuous") == 0) {
+            env_config->action_type = 1; // CONTINUOUS
+        } else {
+            printf("Warning: Unknown action_type value '%s', defaulting to DISCRETE\n", value);
+            env_config->action_type = 0; // Default to DISCRETE
+        }
+    } else if (MATCH("env", "dynamics_model")) {
+        if (strcmp(value, "\"classic\"") == 0 || strcmp(value, "classic") == 0) {
+            env_config->dynamics_model = 0; // CLASSIC
+        } else if (strcmp(value, "\"jerk\"") == 0 || strcmp(value, "jerk") == 0) {
+            env_config->dynamics_model = 1; // JERK
+        } else {
+            printf("Warning: Unknown dynamics_model value '%s', defaulting to JERK\n", value);
+            env_config->dynamics_model = 1; // Default to JERK
+        }
+    } else if (MATCH("env", "obs_mode")) {
+        if (strcmp(value, "\"vector\"") == 0 || strcmp(value, "vector") == 0) {
+            env_config->obs_mode = 0; // OBS_MODE_VECTOR
+        } else if (strcmp(value, "\"render_state\"") == 0 || strcmp(value, "render_state") == 0) {
+            env_config->obs_mode = 1; // OBS_MODE_RENDER_STATE
+        } else {
+            printf("Warning: Unknown obs_mode value '%s', defaulting to VECTOR\n", value);
+            env_config->obs_mode = 0;
+        }
+    } else if (MATCH("env", "render_road_types")) {
+        // Bitmask over entity types. 0 means "use the built-in default".
+        env_config->render_road_types = atoi(value);
+    } else if (MATCH("env", "goal_behavior")) {
+        env_config->goal_behavior = atoi(value);
+    } else if (MATCH("env", "goal_target_distance")) {
+        env_config->goal_target_distance = atof(value);
+    } else if (MATCH("env", "reward_vehicle_collision")) {
+        env_config->reward_vehicle_collision = atof(value);
+    } else if (MATCH("env", "reward_offroad_collision")) {
+        env_config->reward_offroad_collision = atof(value);
+    } else if (MATCH("env", "reward_goal")) {
+        env_config->reward_goal = atof(value);
+    } else if (MATCH("env", "reward_goal_post_respawn")) {
+        env_config->reward_goal_post_respawn = atof(value);
+    } else if (MATCH("env", "reward_vehicle_collision_post_respawn")) {
+        env_config->reward_vehicle_collision_post_respawn = atof(value);
+    } else if (MATCH("env", "goal_radius")) {
+        env_config->goal_radius = atof(value);
+    } else if (MATCH("env", "goal_speed")) {
+        env_config->goal_speed = atof(value);
+    } else if (MATCH("env", "collision_behavior")) {
+        env_config->collision_behavior = atoi(value);
+    } else if (MATCH("env", "offroad_behavior")) {
+        env_config->offroad_behavior = atoi(value);
+    } else if (MATCH("env", "spawn_immunity_timer")) {
+        env_config->spawn_immunity_timer = atoi(value);
+    } else if (MATCH("env", "dt")) {
+        env_config->dt = atof(value);
+    } else if (MATCH("env", "episode_length")) {
+        env_config->episode_length = atoi(value);
+    } else if (MATCH("env", "termination_mode")) {
+        env_config->termination_mode = atoi(value);
+    } else if (MATCH("env", "init_steps")) {
+        env_config->init_steps = atoi(value);
+    } else if (MATCH("env", "init_mode")) {
+        if (strcmp(value, "\"create_all_valid\"") == 0 || strcmp(value, "create_all_valid") == 0) {
+            env_config->init_mode = 0;
+        } else if (strcmp(value, "\"create_only_controlled\"") == 0 || strcmp(value, "create_only_controlled") == 0) {
+            env_config->init_mode = 1;
+        } else {
+            printf("Warning: Unknown init_mode value '%s', defaulting to CREATE_ALL_VALID\n", value);
+            env_config->init_mode = 0; // Default to CREATE_ALL_VALID
+        }
+    } else if (MATCH("env", "control_mode")) {
+        if (strcmp(value, "\"control_vehicles\"") == 0 || strcmp(value, "control_vehicles") == 0) {
+            env_config->control_mode = 0;
+        } else if (strcmp(value, "\"control_agents\"") == 0 || strcmp(value, "control_agents") == 0) {
+            env_config->control_mode = 1;
+        } else if (strcmp(value, "\"control_wosac\"") == 0 || strcmp(value, "control_wosac") == 0) {
+            env_config->control_mode = 2;
+        } else if (strcmp(value, "\"control_sdc_only\"") == 0 || strcmp(value, "control_sdc_only") == 0) {
+            env_config->control_mode = 3;
+        } else if (strcmp(value, "\"control_mixed_play\"") == 0 || strcmp(value, "control_mixed_play") == 0) {
+            env_config->control_mode = 4;
+        } else {
+            printf("Warning: Unknown control_mode value '%s', defaulting to CONTROL_VEHICLES\n", value);
+            env_config->control_mode = 0; // Default to CONTROL_VEHICLES
+        }
+    } else if (MATCH("env", "map_dir")) {
+        if (sscanf(value, "\"%255[^\"]\"", env_config->map_dir) != 1) {
+            strncpy(env_config->map_dir, value, sizeof(env_config->map_dir) - 1);
+            env_config->map_dir[sizeof(env_config->map_dir) - 1] = '\0';
+        }
+        // printf("Parsed map_dir: '%s'\n", env_config->map_dir);
+    } else if (MATCH("env", "max_controlled_agents")) {
+        env_config->max_controlled_agents = atoi(value);
+    } else if (MATCH("env", "agents_per_map_min")) {
+        env_config->agents_per_map_min = atoi(value);
+    } else if (MATCH("env", "agents_per_map_max")) {
+        env_config->agents_per_map_max = atoi(value);
+    } else if (MATCH("env", "spawn_speed_max")) {
+        env_config->spawn_speed_max = atof(value);
+    } else if (MATCH("env", "spawn_heading_jitter_deg")) {
+        env_config->spawn_heading_jitter_deg = atof(value);
+    } else if (MATCH("env", "wrong_way_frac")) {
+        env_config->wrong_way_frac = atof(value);
+    } else if (MATCH("env", "num_waypoints_max")) {
+        env_config->num_waypoints_max = atoi(value);
+    } else if (MATCH("env", "waypoint_min_dist")) {
+        env_config->waypoint_min_dist = atof(value);
+    } else if (MATCH("env", "waypoint_max_dist")) {
+        env_config->waypoint_max_dist = atof(value);
+    } else {
+        return 0; // Unknown section/name, indicate failure to handle
+    }
+
+#undef MATCH
+    return 1;
+}
+
+#endif // ENV_CONFIG_H
