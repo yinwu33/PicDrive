@@ -1,3 +1,5 @@
+import math
+
 from torch import nn
 import torch
 import torch.nn.functional as F
@@ -143,6 +145,7 @@ class DriveCam(nn.Module):
         scene_dim=256,
         ego_dim=64,
         backbone_layers=4,
+        cnn_norm_groups=8,
         **kwargs,
     ):
         super().__init__()
@@ -155,18 +158,44 @@ class DriveCam(nn.Module):
 
         # Five convolutions to 128 channels, shared across cameras, trained from
         # scratch (paper Tab. 4).
+        #
+        # The GroupNorm after each convolution is not in the paper's table. Without
+        # it this stack has no bound on its output scale, because the LayerNorm in
+        # `cam_proj` below is scale-invariant in the forward -- nothing penalises the
+        # features growing -- while its backward scales as 1/sigma, so the larger they
+        # grow the weaker the only gradient that could pull them back. Two runs died
+        # of exactly that: mean |feature| drifted 1.5 -> 992 while every forward
+        # tensor and every loss still looked healthy, and the backward finally
+        # produced NaN. Weight decay does not reach it -- the conv weight norms moved
+        # by 3-13% over the same window, so the blow-up is layer-to-layer alignment
+        # rather than weight magnitude, and only normalising the activations helps.
+        # GroupNorm rather than BatchNorm: rollout and minibatch see different batch
+        # compositions, so batch statistics are not comparable between them.
+        # Set cnn_norm_groups = 0 to recover the unnormalised stack for an ablation.
+        def conv_block(in_channels, out_channels, kernel, stride, padding):
+            block = [
+                pufferlib.pytorch.layer_init(
+                    nn.Conv2d(in_channels, out_channels, kernel, stride=stride, padding=padding)
+                )
+            ]
+            if cnn_norm_groups:
+                # gcd keeps the group count legal for any channel width.
+                block.append(nn.GroupNorm(math.gcd(cnn_norm_groups, out_channels), out_channels))
+            block.append(nn.GELU())
+            return block
+
         self.cnn = nn.Sequential(
-            pufferlib.pytorch.layer_init(nn.Conv2d(3, 32, 4, stride=2, padding=1)),
-            nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(32, 64, 4, stride=2, padding=1)),
-            nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(64, cnn_channels, 3, stride=2, padding=1)),
-            nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(cnn_channels, cnn_channels, 3, stride=2, padding=1)),
-            nn.GELU(),
-            pufferlib.pytorch.layer_init(nn.Conv2d(cnn_channels, cnn_channels, 3, stride=1, padding=1)),
-            nn.GELU(),
+            *conv_block(3, 32, 4, 2, 1),
+            *conv_block(32, 64, 4, 2, 1),
+            *conv_block(64, cnn_channels, 3, 2, 1),
+            *conv_block(cnn_channels, cnn_channels, 3, 2, 1),
+            *conv_block(cnn_channels, cnn_channels, 3, 1, 1),
         )
+        # Leading indicator for the scale runaway described above. Healthy is ~1.5;
+        # the two runs that died were at 37 and 992 by the time they failed.
+        # `nonfinite_minibatches` only moves once the network is already dead, this
+        # moves while it is still fixable.
+        self.feat_scale = None
         with torch.no_grad():
             probe = torch.zeros(1, 3, self.cam_height, self.cam_width)
             self.cnn_out = self.cnn(probe).flatten(1).shape[1]
@@ -220,6 +249,7 @@ class DriveCam(nn.Module):
         batch = ego.shape[0]
 
         features = self.cnn(images.float() / 255.0).flatten(1)
+        self.feat_scale = features.detach().abs().mean()
         features = self.cam_proj(features).view(batch, -1)
         scene = self.scene_encoder(features)
 
@@ -236,6 +266,12 @@ class DriveCam(nn.Module):
             action = self.actor(hidden)
             action = torch.split(action, self.atn_dim, dim=1)
         return action, self.value_fn(hidden)
+
+    def metrics(self):
+        """Optional hook: the trainer logs whatever this returns, if it exists."""
+        if self.feat_scale is None:
+            return {}
+        return {"cnn_feat_scale": float(self.feat_scale)}
 
     def forward(self, observations, state=None):
         hidden = self.encode_observations(observations, state=state)

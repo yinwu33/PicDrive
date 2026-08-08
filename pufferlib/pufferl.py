@@ -153,6 +153,7 @@ class PuffeRL:
         self.accumulate_minibatches = max(1, minibatch_size // max_minibatch_size)
         self.total_minibatches = int(config["update_epochs"] * batch_size / self.minibatch_size)
         self.minibatch_segments = self.minibatch_size // rollout_horizon
+        self.stall_patience = 2 * self.total_minibatches
         if self.minibatch_segments * rollout_horizon != self.minibatch_size:
             raise pufferlib.APIUsageError(
                 f"minibatch_size {self.minibatch_size} must be divisible by bptt_horizon {rollout_horizon}"
@@ -232,6 +233,14 @@ class PuffeRL:
         # dropped instead and the first occurrence is dumped for diagnosis.
         self.nonfinite_updates = 0
         self.nonfinite_dumped = False
+        # Skipping is only the right answer for a transient outlier. When the
+        # non-finite gradient is a deterministic function of the weights, skipping
+        # freezes those weights, which reproduces the same gradient forever -- a
+        # previous run sat in that deadlock for 1376 epochs while the dashboard
+        # still showed plausible losses. Two full epochs of nothing but skips is
+        # not a hiccup, so stop instead of burning the GPU silently.
+        self.consecutive_skips = 0
+        self.stop_reason = None
         self.last_log_step = 0
         self.last_log_time = time.time()
         self.start_time = time.time()
@@ -526,8 +535,16 @@ class PuffeRL:
                 if torch.isfinite(grad_norm):
                     torch.nn.utils.clip_grad_norm_(self.policy.parameters(), config["max_grad_norm"])
                     self.optimizer.step()
+                    self.consecutive_skips = 0
                 else:
                     self.nonfinite_updates += 1
+                    self.consecutive_skips += 1
+                    if self.consecutive_skips >= self.stall_patience and self.stop_reason is None:
+                        self.stop_reason = (
+                            f"{self.consecutive_skips} consecutive non-finite updates at epoch "
+                            f"{self.epoch}: the policy has stopped changing. This is a deadlock, "
+                            f"not a hiccup -- see the nonfinite_* dump in the run directory."
+                        )
                     if not self.nonfinite_dumped:
                         self.nonfinite_dumped = True
                         dump_path = self.dump_nonfinite(mb, grad_norm, mb_losses, dict(
@@ -560,6 +577,11 @@ class PuffeRL:
         explained_var = torch.nan if var_y == 0 else 1 - (y_true - y_pred).var() / var_y
         losses["explained_variance"] = explained_var.item()
         losses["nonfinite_minibatches"] = float(self.nonfinite_updates)
+        # Optional policy-side diagnostics. DriveCam reports its conv activation
+        # scale here, which is the leading indicator for the failure that
+        # nonfinite_minibatches only reports after the fact.
+        if hasattr(self.uncompiled_policy, "metrics"):
+            losses.update(self.uncompiled_policy.metrics())
 
         profile.end()
         logs = None
@@ -1152,7 +1174,7 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
     pufferl = PuffeRL(train_config, vecenv, policy, logger, full_args=args)
 
     all_logs = []
-    while pufferl.global_step < train_config["total_timesteps"]:
+    while pufferl.stop_reason is None and pufferl.global_step < train_config["total_timesteps"]:
         if train_config["device"] == "cuda":
             torch.compiler.cudagraph_mark_step_begin()
         pufferl.evaluate()
@@ -1163,6 +1185,9 @@ def train(env_name, args=None, vecenv=None, policy=None, logger=None):
         if logs is not None:
             if pufferl.global_step > 0.20 * train_config["total_timesteps"]:
                 all_logs.append(logs)
+
+    if pufferl.stop_reason is not None:
+        print(f"\n[pufferl] training stopped early: {pufferl.stop_reason}\n")
 
     # Final eval. You can reset the env here, but depending on
     # your env, this can skew data (i.e. you only collect the shortest

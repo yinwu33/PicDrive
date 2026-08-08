@@ -689,3 +689,47 @@ ckpt 800/1000/…/2000 的 CNN 权重**逐位相同**，实际空转了 1376+ �
 3. 守卫补一条：连续 N 次全跳 → 报警并中止，不要静默空转。
 4. B2（`mb_prio` 按 max 归一化）/ B3（补论文 Tab. 5 的 advantage 过滤）仍然值得做，
    但它们与本次故障无关，别再把它们当成 NaN 的修复。
+
+#### session 2 收尾 —— 修复已落地
+
+**改动**
+
+1. `ocean/torch.py` — `DriveCam` 的 conv stack 每层卷积后加 `GroupNorm`，由新 kwarg
+   `cnn_norm_groups`（默认 8，`0` = 恢复论文 Tab. 4 的无归一化版本做消融）控制。
+   组数用 `math.gcd(cnn_norm_groups, out_channels)`，对任意通道宽度都合法（32/64/128 → 均为 8 组）。
+   选 GroupNorm 不选 BatchNorm：rollout 和 minibatch 的 batch 构成不同，batch 统计量不可比。
+   `cnn_out` 仍是 3072，网络其余部分一字未动；参数量 1.79M → 1.80M（+960 个 GN 仿射参数）。
+2. `ocean/torch.py` — `DriveCam.feat_scale` 记录每次前向的 `mean|cnn feat|`，
+   经新增的 `metrics()` 钩子暴露；`pufferl.py` 若策略有 `metrics()` 就并入 losses 上报，
+   于是 wandb 多出 **`losses/cnn_feat_scale`** —— 这就是**前瞻**指标（健康 ~1.5，
+   死掉的两个 run 分别是 37 和 992）。钩子是通用的，其他策略没有 `metrics()` 也不受影响。
+3. `pufferl.py` — 守卫加**死锁检测**：`consecutive_skips` 连续达到 `stall_patience`
+   （= 2 个 epoch 的 minibatch 数，本配置为 64）就置 `stop_reason`，外层 while 循环退出并打印原因。
+   仍然走 `close()`，checkpoint 和 wandb 正常收尾。修掉上一条记录里那个"静默空转 1376 epoch"的缺陷。
+4. `config/ocean/drive_cam.ini` — `[policy]` 增加 `cnn_norm_groups = 8`。
+
+**验证**
+
+- 接线：`cnn_norm_groups=8` → 5 个 GroupNorm 层，`cnn_out` 不变（3072），参数量 +960。
+- **失控路径已封死**（关键验证）：把所有 conv 权重乘以同一个增益 k 来模拟层间对齐，
+  测 `mean|cnn feat|`：
+
+  | 每层增益 k | 无归一化 | groups=8 |
+  |---|---|---|
+  | 1.0 | 0.0365 | 0.391745 |
+  | 1.5 | 0.481 | 0.391746 |
+  | 2.0 | 2.600 | 0.391747 |
+  | 4.0 | **92.94** | 0.391747 |
+
+  k=4 时无归一化版本放大 2550 倍（5 层复利），GroupNorm 版本**六位有效数字不变**。
+- 端到端：`--env.num-maps 200 --train.total-timesteps 1200000` 跑通，见下方 session 记录。
+
+**旧 checkpoint 全部作废**：state_dict 的键和层索引都变了（`cnn.0/2/4/6/8` → `cnn.0/3/6/9/12`），
+而且旧权重本来就已被污染（`mean|feat|` 37 起步）。**必须从头训**，不要 `--load-model-path`。
+
+**重训时盯什么**（按优先级）
+
+1. `losses/cnn_feat_scale` —— 应当稳定，不应单调上升。持续爬升说明归一化没拦住，回来查。
+2. `losses/nonfinite_minibatches` —— 应当恒为 0。偶发几次是瞬时离群（守卫会跳过，无害）；
+   连续 64 次会自动停并打印原因。
+3. 仍然待办、与本次故障无关：B2（`mb_prio` 按 max 归一化）、B3（补论文 Tab. 5 的 advantage 过滤）。
