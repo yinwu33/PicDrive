@@ -733,3 +733,133 @@ ckpt 800/1000/…/2000 的 CNN 权重**逐位相同**，实际空转了 1376+ �
 2. `losses/nonfinite_minibatches` —— 应当恒为 0。偶发几次是瞬时离群（守卫会跳过，无害）；
    连续 64 次会自动停并打印原因。
 3. 仍然待办、与本次故障无关：B2（`mb_prio` 按 max 归一化）、B3（补论文 Tab. 5 的 advantage 过滤）。
+
+---
+
+## session 3 —— 相机 rig 从单路切到 Waymo 三路
+
+**改动**（只动 `config/ocean/drive_cam.ini`，没有代码改动）
+
+1. `[env] cameras` 从内联 JSON 单路改成预设名 **`waymo`**，即 WOD 的 front / front_left /
+   front_right 三路。front 一路的内外参与切换前**逐位相同**（`pos=(0.104, -0.0237, 2.1157)`,
+   `yaw=0`），另外两路是新增，所以这是"加相机"不是"换相机"。
+2. `[train] max_minibatch_size` 8192 → **4096**，`minibatch_size` 保持 8192。
+   `pufferl.py:153` 的语义是 `accumulate_minibatches = minibatch_size // max_minibatch_size`，
+   所以这是把一次优化步拆成 2 个 chunk 累积，**梯度统计量与单相机 run 完全一致**——
+   rig 是两次 run 之间唯一的变量。不要改成 `minibatch_size = 4096`，那会把每轮
+   优化步数从 32 翻到 64。
+
+**为什么整条链路不用改代码**：`environment.py:222` → `rig_from_config` → `rig_tensor` →
+`raster.cu` 的 `image = ego_i*num_cams + cam_i` → `perspective.py` 的
+`image_bytes = num_cameras*3*H*W` → `torch.py:209` 的 `Linear(input_size*num_cameras, scene_dim)`
+→ `drive.h:3213` 的 n 路 panel，全部已经是 N 相机泛化的。
+`tests/test_raster.py:448` 的 CUDA/reference 一致性测试本来就对 `front`/`waymo`/`nuplan`
+三种 rig 参数化跑过。
+
+**标定来源（本次实测复核）**：直接解析 `perception_1_4_3/training` 36 个 segment 的
+`Frame.context.camera_calibrations`（venv 里没有 `waymo_open_dataset`，写了个最小 protobuf
+reader，脚本在 session scratchpad），取中位数：
+
+| 相机 | W×H | fu=fv | cu | cv | x | y | z | yaw |
+|---|---|---|---|---|---|---|---|---|
+| FRONT | 1920×1280 | 2066.7 | 954.5 | 641.9 | 1.544 | −0.024 | 2.116 | 0.15° |
+| FRONT_LEFT | 1920×1280 | 2065.4 | 970.5 | 639.9 | 1.496 | 0.094 | 2.115 | 44.56° |
+| FRONT_RIGHT | 1920×1280 | 2062.4 | 953.6 | 649.8 | 1.494 | −0.096 | 2.116 | −44.68° |
+| SIDE_LEFT | **1920×886** | 2068.2 | 978.8 | **245.1** | 1.432 | 0.116 | 2.115 | 89.86° |
+| SIDE_RIGHT | **1920×886** | 2064.9 | 969.1 | **242.4** | 1.429 | −0.116 | 2.116 | −89.95° |
+
+与 `raster_ref.py:154` `WAYMO_RIG` 里存的数字逐位吻合（那三路已按 rear-axle → box-center
+平移 1.44 m）。pitch/roll 全部 <1°，是标定抖动不是安装角。
+
+**覆盖角**（HFOV 49.8°）
+
+| rig | 覆盖弧 | 覆盖角 | 盲区 |
+|---|---|---|---|
+| 单路（切换前） | [−24.9, 24.9] | 49.8° | 310.2° |
+| **waymo 三路（现在）** | [−69.6, 69.5] 连续 | **139.1°** | 220.9° |
+| waymo 五路（未采用） | [−114.9, 114.8] 连续 | 229.7° | 130.3° |
+| nuplan 四路（论文） | [−86.8, 86.8] + [148.2, 211.8] | 237.4° | 122.6°，**分成两块侧向缺口** |
+
+相邻视场重叠 5.2°，三路无缝。这正好解掉第 3 节记的那个"单路 49.8° 看不见路口横向来车"的
+已知取舍。**后方仍然完全看不见，而且拿不到**——WOD 没有后视相机，这是 rig 的固有边界。
+
+**为什么没上五路**（想加的时候看这条，别重新推一遍）
+
+侧视有两个硬障碍，都不在 kernel 的相机循环里：
+
+1. **分辨率**。侧视 1920×886，按 96 宽算原生是 96×**44** 而非 96×64。
+   `raster.cu:452` 的输出偏移是 `plane = c.width*c.height`，写死了"每张图平面等大"，
+   `raster_cuda.py:73` 和 `perspective.py` 因此都要求 rig 内共用一个分辨率。
+2. **主点不在中心**。`raster_ref.py:104` `Camera.intrinsics()` 把 cx/cy 写死成 W/2、H/2。
+   前三路对（cv/H = 0.501），侧视 cv/H = **0.277**，实际视场是轴上 −6.8° 到轴下 +17.2°，
+   严重不对称。用 W/2,H/2 渲出来的不是那个传感器。
+
+三条路：(a) 侧视按 96×64 渲，几行 Python，但垂直视场变 34.4°，多出来的是真实传感器看不到的
+天空/地面，**破坏 sim2real 配对**，不要走；(b) letterbox —— `Camera` 加 cx/cy 覆盖，侧视声明
+96×44，输出 buffer 仍 96×64，44 行以下填背景色，kernel 把 `plane` 改成用 out tensor 的 H/W、
+`c.height` 退化为有效行数、越界像素写常量而非 `continue`（`raster.cu:392`），几何精确，
+浪费 31% 像素；(c) 真正的变分辨率 —— 输出改扁平 buffer + 每相机 offset 表，这时各相机 CNN
+展平维度不同，正好是论文 Tab. 4 那个 16 learned query + cross-attention 池化要解决的问题
+（`torch.py:132-136` 的 docstring 已经把它标成"rig 变大时再做的消融"）。
+
+**代价（实测，卡上同时跑着单相机 run，看倍率不看绝对值）**
+
+| | 单路 | waymo 三路 | 倍率 |
+|---|---|---|---|
+| obs bytes/agent | 18,476 | 55,340 | 3.00× |
+| CNN fwd+bwd 峰值（4096 chunk） | 4.89 GiB | 14.60 GiB | 2.99× |
+| CNN fwd+bwd 时间/样本 | 47.6 µs | 138.2 µs | 2.90× |
+| rollout obs buffer（`batch_size=131072`，常驻 GPU） | 2.26 GiB | 6.76 GiB | 3.00× |
+| 端到端 µs/agent-step（含 sim，256 ego） | 25.9 | 46.6 | 1.80× |
+
+即 `max_minibatch_size=4096` 下峰值约 14.6 + 6.8 = **21 GiB**（allocated），
+nvidia-smi 上的 reserved 会更高。48 GiB 卡上**必须独占**：和另一个 18.5 GiB 的 run 并存
+只剩 29.5 GiB，边界太窄。
+
+**旧 checkpoint 全部作废**：`scene_encoder` 从 `Linear(128,256)` 变成 `Linear(384,256)`，
+参数量 1.80M → 1.9M。**必须从头训**，不要 `--load-model-path`。
+
+**重训时盯什么**：与 session 2 相同（`losses/cnn_feat_scale` 稳定不上爬、
+`losses/nonfinite_minibatches` 恒 0），三路上冒烟测得 `cnn_feat_scale ≈ 0.40`，与单路同量级。
+
+**对照基线（单相机 run，切换前）**：`experiments/puffer_drive_cam_cqz6szxv`，
+wandb `cqz6szxv`（project `pufferdrive-cam`, group `waymo-rig`, tag `waymo-front-96x64-gn8`）。
+跑到 epoch 9506 / 1.2B steps / 21h22m 后停止（日志里没有 traceback、没有 OOM、
+`nonfinite_minibatches` 恒 0，属于外部终止而非训练发散）。最后一帧指标：
+score 0.800、completion_rate 0.803、collision_rate 0.051、offroad_rate 0.018、
+`cnn_feat_scale` 0.144。最后落盘的 ckpt 是 `model_puffer_drive_cam_009400.pt`。
+三相机 run 与它对比时，注意除 rig 外唯一的差别是 `max_minibatch_size`（梯度统计量不变）。
+
+#### 相机可视化改成横排、放到地图下方
+
+**问题**：panel 竖排在右边缘，压在 BEV 上，三路之后遮挡更明显；而且标签是 `cam 0/1/2`，
+配置里 `WAYMO_RIG` 存的顺序是 front, front_left, front_right，竖排读出来不是左中右。
+
+**改法**（`drive.h` / `binding.c` / `perspective.py`）
+
+1. `camera_strip_layout(window_w, n, cam_w, cam_h)` —— 纯函数，`make_client` 在 `InitWindow`
+   之前就要知道条带高度，好把窗口**加高**这么多。于是 BEV 区域尺寸与没有相机时**逐像素相同**，
+   条带是纯粹多出来的空间，不是从地图里挖的。条带高度取偶数，h264 不接受奇数边长。
+2. `Client` 加 `cam_strip_h` / `view_h` / `sim_view`。有条带时 3D 场景先画进
+   `sim_view`（`LoadRenderTexture(width, view_h)`），再 blit 到窗口顶部；
+   `begin_sim_view` / `end_sim_view` 在 `cam_strip_h == 0` 时是 no-op，
+   所以**无相机路径一行行为都没变**。
+   用 RenderTexture 而不是 scissor：scissor 是把地图裁掉，RenderTexture 才是让投影
+   按 `view_h` 算 aspect，地图完整缩进去。
+3. `draw_camera_panels` 改成横排，读同一个 `camera_strip_layout`，画在
+   `y ∈ [view_h, height)` 的 `PUFF_BACKGROUND` 底色带上。
+4. 顺序与标签：`perspective.py` 的 `display_order()` 按 **yaw 降序**排（yaw 正为左），
+   Waymo 三路即 front_left / front / front_right；`_camera_rgb` 按这个顺序填。
+   标签经新增的 `render_camera_names`（uint8 `[n, 16]`，NUL 补齐）传进 C，
+   binding 里与 `render_camera_rgb` 同样按裸指针绑定，Python 侧持有保活。
+   `draw_scene` 的 2D overlay 和窗口模式底部那行 HUD 从 `client->height` 改成 `client->view_h`。
+
+**验证**（同一张地图 `num_maps=1`，同 seed，绑/不绑 rig 各渲一遍）
+
+- 不绑 rig：1234×1706（原尺寸）；绑 rig：1234×1988。差值 282 = `2*12 + 18 + 240`，与公式一致。
+- 地图区域**几何完全对齐**：亮像素 mask 的最佳对齐偏移是 (0,0)，bbox 逐位相同。
+  残差只在细线边缘（IoU 0.953），来自 h264 —— 同尺寸重复渲染两遍是 **bit-identical**，
+  所以渲染本身确定，差异只随编码帧高变化。
+- panel 内容：逐 panel 断言 `_camera_rgb[row]` 就是 `_images[agent, display_order[row]]`，
+  标签与相机名一致，三路两两之间 mean|Δ| 分别 5.2 / 9.8（不是同一张图复制）。
+- `tests/test_raster.py` 新增 `test_viewer_panel_order_is_left_to_right`，33 passed。

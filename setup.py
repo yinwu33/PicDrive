@@ -238,7 +238,10 @@ extension_kwargs = dict(
 # Find C extensions
 c_extensions = []
 if not NO_OCEAN:
-    c_extension_paths = glob.glob("pufferlib/ocean/**/binding.c", recursive=True)
+    # `giga` is a fork of the ocean drive env; its binding builds the same way.
+    c_extension_paths = glob.glob("pufferlib/ocean/**/binding.c", recursive=True) + glob.glob(
+        "pufferlib/giga/**/binding.c", recursive=True
+    )
     c_extensions = [
         Extension(
             path.rstrip(".c").replace("/", "."),

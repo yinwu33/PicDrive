@@ -89,6 +89,24 @@ class TestDriveConfig(unittest.TestCase):
             self.assertEqual(args["env"]["reward_offroad_collision"], -0.5)
             self.assertEqual(args["env"]["num_maps"], 10000)
 
+    @patch("sys.argv", ["pufferl.py"])
+    def test_camera_configs_are_independently_selectable(self):
+        from pufferlib.ocean import environment
+
+        single = load_config("puffer_drive_cam")
+        triple = load_config("puffer_drive_3cam")
+
+        self.assertTrue(single["config_path"].endswith("drive_cam.ini"))
+        self.assertTrue(triple["config_path"].endswith("drive_3cam.ini"))
+        self.assertEqual(len(single["env"]["cameras"]), 1)
+        self.assertEqual(triple["env"]["cameras"], "waymo")
+        self.assertEqual(single["train"]["max_minibatch_size"], 8192)
+        self.assertEqual(triple["train"]["max_minibatch_size"], 4096)
+        self.assertIs(
+            environment.env_creator("puffer_drive_cam"),
+            environment.env_creator("puffer_drive_3cam"),
+        )
+
     @patch("sys.argv", ["pufferl.py", "--train.learning-rate=0.5"])
     def test_cli_override(self):
         """Test that command-line arguments override INI file values."""

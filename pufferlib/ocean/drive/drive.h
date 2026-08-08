@@ -398,12 +398,19 @@ struct Drive {
 
     // Rendered camera views for the selected agent, so the viewer can show what
     // the policy actually sees. Laid out as [num_cameras * height, width, 3],
-    // i.e. the views stacked vertically. Owned by Python and filled from the
-    // rasterizer; NULL when perspective rendering is off.
+    // i.e. the views stacked vertically, in the order they should be displayed
+    // left to right. Python sorts the rig by mounting yaw before filling this, so
+    // a three-camera Waymo rig arrives as front_left, front, front_right. Owned by
+    // Python and filled from the rasterizer; NULL when perspective rendering is off.
     unsigned char *render_camera_rgb;
     int render_camera_count;
     int render_camera_width;
     int render_camera_height;
+    // Camera names for the panel labels, NUL-padded to a fixed stride and in the
+    // same order as the views above. NULL when Python did not supply them, in
+    // which case the panels fall back to an index.
+    char *render_camera_names;
+    int render_camera_name_stride;
 };
 
 // Single source of truth for the observation stride. In RENDER_STATE mode the
@@ -2423,6 +2430,53 @@ void c_step(Drive *env) {
 
 typedef struct Client Client;
 
+// Geometry of the camera strip drawn under the simulator view: panels side by
+// side, in the order Python packed them, which is left to right across the rig.
+//
+// A pure function of the window width and the rig because make_client has to
+// know the strip's height before InitWindow, in order to make the window that
+// much taller and keep the simulator view its full size.
+typedef struct {
+    int panel_w;
+    int panel_h;
+    int label_h;
+    int margin;
+    int gap;
+    int strip_h; // total height reserved along the bottom edge
+    int x0;      // left edge of the first panel
+} CameraStrip;
+
+static CameraStrip camera_strip_layout(int window_w, int n, int cam_w, int cam_h) {
+    CameraStrip s = {0};
+    if (n <= 0 || cam_w <= 0 || cam_h <= 0)
+        return s;
+
+    s.margin = 12;
+    s.gap = 10;
+    s.label_h = 18;
+
+    int avail = window_w - 2 * s.margin - (n - 1) * s.gap;
+    s.panel_w = avail / n;
+    // Cap the panel width so a one- or two-camera rig does not swallow the
+    // window. The views are 96 px wide, so beyond this it is mostly upscaling.
+    if (s.panel_w > 360)
+        s.panel_w = 360;
+    if (s.panel_w < 16)
+        s.panel_w = 16;
+    s.panel_h = (int)((float)s.panel_w * (float)cam_h / (float)cam_w + 0.5f);
+
+    s.strip_h = 2 * s.margin + s.label_h + s.panel_h;
+    // The strip is added to the recorded frame height and h264 rejects odd
+    // dimensions, so keep it even.
+    s.strip_h += s.strip_h & 1;
+
+    int total_w = n * s.panel_w + (n - 1) * s.gap;
+    s.x0 = (window_w - total_w) / 2;
+    if (s.x0 < s.margin)
+        s.x0 = s.margin;
+    return s;
+}
+
 struct Client {
     float width;
     float height;
@@ -2443,6 +2497,14 @@ struct Client {
     Texture2D camera_tex;
     int camera_tex_w;
     int camera_tex_h;
+    // Band reserved along the bottom edge for the camera panels, and the height
+    // left over above it for the simulator view. `cam_strip_h` is 0 when no rig
+    // is bound, and then `view_h` is the full window height.
+    int cam_strip_h;
+    int view_h;
+    // Off-screen target the simulator view is drawn into when the strip is
+    // present, so the panels sit beside the view rather than on top of it.
+    RenderTexture2D sim_view;
     pid_t xvfb_pid;
     int xvfb_display_num;
 };
@@ -2524,8 +2586,22 @@ Client *make_client(Drive *env) {
         client->height = img_height;
     }
 
+    // Reserve a band along the bottom for the policy's camera views. The rig is
+    // bound before the first render call, so its size is known here, and growing
+    // the window rather than carving into it leaves the simulator view exactly the
+    // size it had without cameras.
+    CameraStrip strip = camera_strip_layout((int)client->width, env->render_camera_count,
+                                            env->render_camera_width, env->render_camera_height);
+    client->cam_strip_h = strip.strip_h;
+    client->height += (float)client->cam_strip_h;
+    client->view_h = (int)client->height - client->cam_strip_h;
+
     SetTraceLogLevel(LOG_WARNING); // Only show warnings and errors
     InitWindow(client->width, client->height, "PufferDrive");
+
+    // Needs the GL context, so it cannot be folded into the sizing above.
+    if (client->cam_strip_h > 0)
+        client->sim_view = LoadRenderTexture((int)client->width, client->view_h);
 
     // Load assets
     client->cars[0] = LoadModel("resources/drive/RedCar.glb");
@@ -3180,7 +3256,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
     // Draw track indices for the tracks to predict
     if (mode == 1 && env->control_mode == CONTROL_WOSAC) {
         float map_height = env->grid_map->top_left_y - env->grid_map->bottom_right_y;
-        float pixels_per_world_unit = client->height / map_height;
+        float pixels_per_world_unit = client->view_h / map_height;
 
         for (int i = 0; i < env->active_agent_count; i++) {
             // Ignore respawned agents
@@ -3194,9 +3270,9 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
             float raw_y = env->entities[agent_idx].y * pixels_per_world_unit;
 
             int screen_x = (int)raw_x + client->width / 2 + 20;
-            int screen_y = (int)raw_y + client->height / 2 - 25;
+            int screen_y = (int)raw_y + client->view_h / 2 - 25;
 
-            if (screen_x >= 0 && screen_x <= client->width && screen_y >= 0 && screen_y <= client->height) {
+            if (screen_x >= 0 && screen_x <= client->width && screen_y >= 0 && screen_y <= client->view_h) {
                 char text[32];
                 snprintf(text, sizeof(text), "%d", womd_track_idx);
                 int text_width = MeasureText(text, 20);
@@ -3206,13 +3282,35 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
     }
 }
 
-// Draw the selected agent's camera views as a strip down the right edge.
+// The simulator view is drawn off screen whenever a camera strip is reserved,
+// then blitted to the top of the window. Rendering into a target of exactly the
+// view's size is what keeps the projection's aspect ratio correct; clipping a
+// full-window render would crop the map instead of fitting it.
+static void begin_sim_view(Client *client) {
+    if (client->cam_strip_h <= 0)
+        return;
+    BeginTextureMode(client->sim_view);
+    ClearBackground(ROAD_COLOR);
+}
+
+static void end_sim_view(Client *client) {
+    if (client->cam_strip_h <= 0)
+        return;
+    EndTextureMode();
+    // Render textures come out y-flipped, hence the negative source height.
+    Rectangle src = {0.0f, 0.0f, (float)client->sim_view.texture.width,
+                     -(float)client->sim_view.texture.height};
+    DrawTextureRec(client->sim_view.texture, src, (Vector2){0.0f, 0.0f}, WHITE);
+}
+
+// Draw the selected agent's camera views as a horizontal strip under the
+// simulator view, in the rig's left-to-right order.
 //
 // These are the exact pixels handed to the policy, blitted from the rasterizer's
 // output rather than redrawn with raylib, so what you see is the observation and
-// not an approximation of it. Must be called in 2D space, after EndMode3D.
+// not an approximation of it. Must be called in 2D space, after end_sim_view.
 static void draw_camera_panels(Drive *env, Client *client) {
-    if (env->render_camera_rgb == NULL || env->render_camera_count <= 0)
+    if (env->render_camera_rgb == NULL || env->render_camera_count <= 0 || client->cam_strip_h <= 0)
         return;
 
     int cam_w = env->render_camera_width;
@@ -3237,31 +3335,31 @@ static void draw_camera_panels(Drive *env, Client *client) {
     // Nearest-neighbour keeps the low-resolution pixels legible when scaled up.
     SetTextureFilter(client->camera_tex, TEXTURE_FILTER_POINT);
 
-    const int margin = 12;
-    const int label_h = 18;
-    int panel_w = (int)(client->width * 0.28f);
-    if (panel_w > 384)
-        panel_w = 384;
-    float scale = (float)panel_w / cam_w;
-    int panel_h = (int)(cam_h * scale);
+    // Same layout make_client sized the window with, so the strip fits the band
+    // exactly.
+    CameraStrip s = camera_strip_layout((int)client->width, n, cam_w, cam_h);
+    int strip_top = client->view_h;
 
-    int total_h = n * (panel_h + label_h + margin) - margin;
-    int x = (int)client->width - panel_w - margin;
-    int y = margin;
-    if (total_h < (int)client->height)
-        y = ((int)client->height - total_h) / 2;
+    DrawRectangle(0, strip_top, (int)client->width, client->cam_strip_h, PUFF_BACKGROUND);
+    // A hairline against the view above, so the strip reads as its own area.
+    DrawRectangle(0, strip_top, (int)client->width, 1, PUFF_BACKGROUND2);
 
-    DrawRectangle(x - 6, y - 6, panel_w + 12, total_h + 12, (Color){0, 0, 0, 140});
+    int y = strip_top + s.margin;
     for (int i = 0; i < n; i++) {
+        int x = s.x0 + i * (s.panel_w + s.gap);
         Rectangle src = {0.0f, (float)(i * cam_h), (float)cam_w, (float)cam_h};
-        Rectangle dst = {(float)x, (float)(y + label_h), (float)panel_w, (float)panel_h};
+        Rectangle dst = {(float)x, (float)(y + s.label_h), (float)s.panel_w, (float)s.panel_h};
         DrawTexturePro(client->camera_tex, src, dst, (Vector2){0, 0}, 0.0f, WHITE);
-        DrawRectangleLines(x, y + label_h, panel_w, panel_h, PUFF_CYAN);
+        DrawRectangleLines(x, y + s.label_h, s.panel_w, s.panel_h, PUFF_CYAN);
 
         char label[64];
-        snprintf(label, sizeof(label), "cam %d  %dx%d", i, cam_w, cam_h);
+        if (env->render_camera_names != NULL) {
+            const char *name = env->render_camera_names + (size_t)i * env->render_camera_name_stride;
+            snprintf(label, sizeof(label), "%s  %dx%d", name, cam_w, cam_h);
+        } else {
+            snprintf(label, sizeof(label), "cam %d  %dx%d", i, cam_w, cam_h);
+        }
         DrawText(label, x, y + 2, 14, PUFF_WHITE);
-        y += panel_h + label_h + margin;
     }
 }
 
@@ -3290,6 +3388,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
 
             BeginDrawing();
             ClearBackground(ROAD_COLOR);
+            begin_sim_view(client);
             BeginMode3D(camera);
 
             if (draw_traces) { // Show logged trajectories of active agents and expert static agents
@@ -3335,6 +3434,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
 
             BeginDrawing();
             ClearBackground(ROAD_COLOR);
+            begin_sim_view(client);
             BeginMode3D(camera);
             draw_scene(env, client, 1, 1, 0, 0);
 
@@ -3354,10 +3454,12 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
 
             BeginDrawing();
             ClearBackground(ROAD_COLOR);
+            begin_sim_view(client);
             BeginMode3D(camera);
             draw_scene(env, client, 0, 0, 0, 1);
         }
 
+        end_sim_view(client);
         draw_camera_panels(env, client);
         EndDrawing();
 
@@ -3369,9 +3471,11 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
     } else { // Pop-up window
         BeginDrawing();
         ClearBackground(ROAD_COLOR);
+        begin_sim_view(client);
         BeginMode3D(client->camera);
         handle_camera_controls(env->client);
         draw_scene(env, client, 0, 0, 0, 0);
+        end_sim_view(client);
 
         if (IsKeyPressed(KEY_TAB) && env->active_agent_count > 0) {
             env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
@@ -3428,7 +3532,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
         }
 
         DrawText("Controls: SHIFT + W/S - Accelerate/Brake, SHIFT + A/D - Steer, TAB - Switch Agent", 10,
-                 client->height - 30, 20, PUFF_WHITE);
+                 client->view_h - 30, 20, PUFF_WHITE);
         DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
         DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
         draw_camera_panels(env, client);
@@ -3437,6 +3541,10 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
 }
 
 void close_client(Client *client) {
+    if (client->sim_view.id != 0) {
+        UnloadRenderTexture(client->sim_view);
+        client->sim_view.id = 0;
+    }
     if (client->camera_tex.id != 0) {
         UnloadTexture(client->camera_tex);
         client->camera_tex.id = 0;

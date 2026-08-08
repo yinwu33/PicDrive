@@ -184,12 +184,13 @@ MAKE_FUNCTIONS = {
     # Same simulator as `drive`, configured for perspective observations and
     # wrapped by PerspectiveVecEnv below.
     "drive_cam": "Drive",
+    "drive_3cam": "Drive",
     "spaces": make_spaces,
     "multiagent": make_multiagent,
 }
 
 # Environments that reuse another environment's module.
-MODULE_ALIASES = {"drive_cam": "drive"}
+MODULE_ALIASES = {"drive_cam": "drive", "drive_3cam": "drive"}
 
 
 def env_creator(name="squared", *args, **kwargs):
@@ -212,7 +213,7 @@ def vecenv_wrapper(env_name, vecenv, args):
     The rasterizer belongs to the observation pipeline rather than to the policy:
     wrapping here is what keeps the privileged scene out of the network's inputs.
     """
-    if "drive_cam" not in env_name:
+    if env_name not in {"puffer_drive_cam", "puffer_drive_3cam"}:
         return vecenv
 
     from pufferlib.ocean.drive.perspective import PerspectiveVecEnv

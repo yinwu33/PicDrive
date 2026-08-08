@@ -1502,9 +1502,21 @@ def export(args=None, env_name=None, vecenv=None, policy=None, path=None, silent
         print(f"Saved {len(weights)} weights to {path}")
 
 
+# Maps a config's `[base] package` onto the module that provides `env_creator`,
+# `vecenv_wrapper` and `torch`. `ocean` and `giga` are in-tree sibling packages --
+# `giga` is a fork of ocean's drive env with Gigaflow-style random initialization.
+# Anything else is looked up under `pufferlib.environments`, which is the path used
+# by external env plugins.
+_IN_TREE_PACKAGES = {"ocean": "pufferlib.ocean", "giga": "pufferlib.giga"}
+
+
+def _env_module_name(package):
+    return _IN_TREE_PACKAGES.get(package, f"pufferlib.environments.{package}")
+
+
 def autotune(args=None, env_name=None, vecenv=None, policy=None):
     package = args["package"]
-    module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
+    module_name = _env_module_name(package)
     env_module = importlib.import_module(module_name)
     env_name = args["env_name"]
     make_env = env_module.env_creator(env_name)
@@ -1522,7 +1534,7 @@ ENV_CONFIG_PATH_KWARG = "ini_file"
 
 def load_env(env_name, args):
     package = args["package"]
-    module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
+    module_name = _env_module_name(package)
     env_module = importlib.import_module(module_name)
     make_env = env_module.env_creator(env_name)
     env_kwargs = {k: v for k, v in args["env"].items() if k not in ENV_KWARG_BLOCKLIST}
@@ -1544,7 +1556,7 @@ def load_env(env_name, args):
 
 def load_policy(args, vecenv, env_name=""):
     package = args["package"]
-    module_name = "pufferlib.ocean" if package == "ocean" else f"pufferlib.environments.{package}"
+    module_name = _env_module_name(package)
     env_module = importlib.import_module(module_name)
 
     device = args["train"]["device"]

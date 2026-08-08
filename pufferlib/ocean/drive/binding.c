@@ -90,6 +90,28 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
         env->render_camera_width = (int)PyArray_DIM(arr, 2);
     }
 
+    // Panel labels, as fixed-stride NUL-padded ASCII rather than a list of
+    // Python strings, so the viewer reads them straight out of the array Python
+    // keeps alive alongside render_camera_rgb.
+    PyObject *cam_names = PyDict_GetItemString(kwargs, "render_camera_names");
+    if (cam_names != NULL) {
+        if (!PyObject_TypeCheck(cam_names, &PyArray_Type) ||
+            PyArray_TYPE((PyArrayObject *)cam_names) != NPY_UINT8 ||
+            !PyArray_ISCONTIGUOUS((PyArrayObject *)cam_names) ||
+            PyArray_NDIM((PyArrayObject *)cam_names) != 2) {
+            PyErr_SetString(PyExc_ValueError,
+                            "render_camera_names must be a contiguous uint8 array [num_cameras, stride]");
+            return 1;
+        }
+        PyArrayObject *names = (PyArrayObject *)cam_names;
+        if ((int)PyArray_DIM(names, 0) != env->render_camera_count) {
+            PyErr_SetString(PyExc_ValueError, "render_camera_names must have one row per camera");
+            return 1;
+        }
+        env->render_camera_names = (char *)PyArray_DATA(names);
+        env->render_camera_name_stride = (int)PyArray_DIM(names, 1);
+    }
+
     PyObject *obs = PyDict_GetItemString(kwargs, "observations");
     if (obs == NULL) {
         // Nothing else to bind. Used when only the render buffers are handed over.

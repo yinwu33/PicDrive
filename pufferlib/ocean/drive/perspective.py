@@ -30,6 +30,22 @@ import pufferlib
 from pufferlib.ocean.drive import binding, raster_cuda
 from pufferlib.ocean.drive.raster_ref import DEFAULT_RIG, Camera, rig_from_config, rig_tensor
 
+# Bytes per panel label handed to the viewer, NUL-padded. Long enough for the
+# names in the rigs plus a terminator.
+_NAME_STRIDE = 16
+
+
+def display_order(cameras: list[Camera]) -> list[int]:
+    """Panel order for the viewer: left to right across the rig.
+
+    That is descending mounting yaw, since positive yaw turns left, so the Waymo
+    rig comes out front_left, front, front_right. This only orders what the
+    viewer blits -- the policy sees the rig in config order either way. A rear
+    camera has nowhere natural to go in a left-to-right strip and lands at the
+    left end; the rigs in use have none.
+    """
+    return sorted(range(len(cameras)), key=lambda i: -cameras[i].yaw_deg)
+
 
 class PerspectiveVecEnv:
     """Wraps a Drive vecenv running in `render_state` mode.
@@ -92,7 +108,9 @@ class PerspectiveVecEnv:
         # Host-side staging for the viewer's camera panels, bound to the C env on
         # first use so raylib can upload it as a texture.
         self._camera_rgb = None
+        self._camera_names = None
         self._camera_env_id = None
+        self._display_order = display_order(self.cameras)
 
     @staticmethod
     def _collect_envs(vecenv):
@@ -271,12 +289,22 @@ class PerspectiveVecEnv:
             self._camera_rgb = np.zeros(
                 (self.num_cameras, self.height, self.width, 3), dtype=np.uint8
             )
-            binding.env_put(env.env_ids[0], render_camera_rgb=self._camera_rgb)
+            self._camera_names = np.zeros((self.num_cameras, _NAME_STRIDE), dtype=np.uint8)
+            for row, cam in enumerate(self._display_order):
+                name = self.cameras[cam].name.encode("ascii", "replace")[: _NAME_STRIDE - 1]
+                self._camera_names[row, : len(name)] = np.frombuffer(name, dtype=np.uint8)
+            binding.env_put(
+                env.env_ids[0],
+                render_camera_rgb=self._camera_rgb,
+                render_camera_names=self._camera_names,
+            )
             self._camera_env_id = env.env_ids[0]
 
-        # [cameras, 3, H, W] on device -> [cameras, H, W, 3] on host, which is the
-        # layout raylib uploads.
-        views = self._images[agent].permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        # [cameras, 3, H, W] on device -> [cameras, H, W, 3] on host in panel
+        # order, which is the layout raylib uploads.
+        views = (
+            self._images[agent, self._display_order].permute(0, 2, 3, 1).contiguous().cpu().numpy()
+        )
         np.copyto(self._camera_rgb, views)
         return env.render(*args, **kwargs)
 

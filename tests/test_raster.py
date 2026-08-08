@@ -144,6 +144,24 @@ def test_rig_from_config_json_and_presets():
     assert len(rig) == 1 and rig[0].pos == pytest.approx((1.66, -0.01, 1.49))
 
 
+def test_viewer_panel_order_is_left_to_right():
+    """The viewer lays the rig out left to right, whatever order the config used.
+
+    WAYMO_RIG is stored front, front_left, front_right because the front camera is
+    also the single-camera default; the strip under the map has to read
+    front_left | front | front_right instead.
+    """
+    from pufferlib.ocean.drive.perspective import display_order
+
+    order = display_order(R.WAYMO_RIG)
+    assert [R.WAYMO_RIG[i].name for i in order] == ["front_left", "front", "front_right"]
+    # Sorted by mounting yaw, so it holds for any rig rather than by name.
+    yaws = [R.WAYMO_RIG[i].yaw_deg for i in order]
+    assert yaws == sorted(yaws, reverse=True)
+    assert display_order(R.DEFAULT_RIG) == [0]
+    assert sorted(display_order(R.NUPLAN_RIG)) == list(range(len(R.NUPLAN_RIG)))
+
+
 # ---------------------------------------------------------------------------
 # Projection geometry
 # ---------------------------------------------------------------------------
