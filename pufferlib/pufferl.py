@@ -1295,7 +1295,13 @@ def eval(env_name, args=None, vecenv=None, policy=None):
             )
 
         if driver.render_mode == 1:
-            max_frames = 91
+            # Record the whole episode. 91 was the WOMD scene length hardcoded when
+            # every env was dataset-driven; a giga episode runs 1280 steps, so the
+            # constant cut the video off after 7% of it. ffmpeg encodes at a fixed
+            # 30 fps (drive.h), so a 10 Hz sim still plays back at 3x real time.
+            # episode_length = driver["episode_length"] 
+            episode_length = driver.episode_length
+            max_frames = int(episode_length) if episode_length else 91
             frame_count = 0
 
         while True:

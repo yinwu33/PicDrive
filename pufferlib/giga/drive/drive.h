@@ -267,6 +267,11 @@ struct Entity {
     float heading_y;
     int current_lane_idx;
     int valid;
+    // The step a recycled agent was re-placed on, or -1 if it never was. In `giga`
+    // this is a record, not a state: unlike `ocean`, nothing gates visibility or
+    // collision on it, because a respawned agent here is a full road user from the
+    // next step onward. Its only reader is the ego observation, which raises a flag
+    // for exactly the one step on which the pose jumped.
     int respawn_timestep;
     int respawn_count;
     int collided_before_goal;
@@ -1120,9 +1125,6 @@ int collision_check(Drive *env, int agent_idx) {
 
     int car_collided_with_index = -1;
 
-    if (agent->respawn_timestep != -1)
-        return car_collided_with_index; // Skip respawning entities
-
     for (int i = 0; i < env->num_actors; i++) {
         int index = -1;
         if (i < env->active_agent_count) {
@@ -1135,8 +1137,6 @@ int collision_check(Drive *env, int agent_idx) {
         if (index == agent_idx)
             continue;
         Entity *entity = &env->entities[index];
-        if (entity->respawn_timestep != -1)
-            continue; // Skip respawning entities
         float x1 = entity->x;
         float y1 = entity->y;
         float dist = ((x1 - agent->x) * (x1 - agent->x) + (y1 - agent->y) * (y1 - agent->y));
@@ -2503,7 +2503,7 @@ void fill_render_state(Drive *env) {
         Entity *e = &env->entities[index];
         if (e->type > CYCLIST || e->type == NONE)
             continue;
-        if (e->removed || e->respawn_timestep != -1)
+        if (e->removed)
             continue;
 
         float *out = &env->render_agents[n * RENDER_AGENT_FEATURES];
@@ -2579,11 +2579,11 @@ void compute_observations(Drive *env) {
             obs[7] =
                 (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
             obs[8] = ego_entity->a_lat / JERK_LAT[2];
-            obs[9] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
+            obs[9] = (ego_entity->respawn_timestep == env->timestep) ? 1 : 0;
             // Add normalized entity type (VEHICLE=1, PEDESTRIAN=2, CYCLIST=3)
             obs[10] = ego_entity->type / 3.0f;
         } else {
-            obs[6] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
+            obs[6] = (ego_entity->respawn_timestep == env->timestep) ? 1 : 0;
             obs[7] = ego_entity->type / 3.0f;
         }
 
@@ -2618,10 +2618,6 @@ void compute_observations(Drive *env) {
             if (index == env->active_agent_indices[i])
                 continue; // Skip self, but don't increment obs_idx
             Entity *other_entity = &env->entities[index];
-            if (ego_entity->respawn_timestep != -1)
-                continue;
-            if (other_entity->respawn_timestep != -1)
-                continue;
             // Store original relative positions
             float dx = other_entity->x - ego_entity->x;
             float dy = other_entity->y - ego_entity->y;
@@ -2817,6 +2813,11 @@ void respawn_agent(Drive *env, int agent_idx) {
     // scene is already populated and moving.
     giga_place_agent(env, agent_idx, env->num_objects);
 
+    // Stamped, not latched: `giga_place_agent` already cleared this to -1, and every
+    // consumer other than the ego flag treats the recycled agent as an ordinary one.
+    // Gigaflow keeps agent density constant by recycling, so an agent that is invisible
+    // to the cameras and inert in collision after its first goal would drain the very
+    // traffic the self-play is meant to produce.
     env->entities[agent_idx].respawn_timestep = env->timestep;
     env->entities[agent_idx].collided_before_goal = 0;
     env->entities[agent_idx].stopped = 0;
@@ -3625,7 +3626,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 }
             }
 
-            if ((!is_active_agent && !is_static_agent) || env->entities[i].respawn_timestep != -1) {
+            if (!is_active_agent && !is_static_agent) {
                 continue;
             }
             Vector3 position;
@@ -3946,6 +3947,9 @@ static void draw_camera_panels(Drive *env, Client *client) {
 }
 
 void c_render(Drive *env, int view_mode, int draw_traces) {
+    // Kept in the signature so the binding stays call-compatible with ocean's, but a
+    // synthetic scene has nothing to trace. See the sim-state branch below.
+    (void)draw_traces;
 
     // Create client on first render call
     if (env->client == NULL) {
@@ -3973,31 +3977,13 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             begin_sim_view(client);
             BeginMode3D(camera);
 
-            if (draw_traces) { // Show logged trajectories of active agents and expert static agents
-                for (int i = 0; i < env->active_agent_count; i++) {
-                    int idx = env->active_agent_indices[i];
-                    for (int t = env->init_steps; t < env->episode_length; t++) {
-                        Color agent_color = LIGHTBLUE;
-                        if (env->entities[idx].type == PEDESTRIAN) {
-                            agent_color = LIGHT_ORANGE;
-                        } else if (env->entities[idx].type == CYCLIST) {
-                            agent_color = LIGHT_PURPLE;
-                        }
-                        DrawSphere(
-                            (Vector3){env->entities[idx].traj_x[t], env->entities[idx].traj_y[t], Z_AGENT_DETAILS},
-                            0.15f, agent_color);
-                    }
-                }
-
-                for (int i = 0; i < env->expert_static_agent_count; i++) {
-                    int idx = env->expert_static_agent_indices[i];
-                    for (int t = env->init_steps; t < env->episode_length; t++) {
-                        DrawSphere(
-                            (Vector3){env->entities[idx].traj_x[t], env->entities[idx].traj_y[t], Z_AGENT_DETAILS},
-                            0.15f, EXPERT_REPLAY);
-                    }
-                }
-            }
+            // ocean draws the logged trajectory of every agent here as one sphere per
+            // timestep. A Gigaflow scene has no logged trajectory to draw: the agents
+            // are synthesised, giga_build_agents gives each a length-1 traj_* array
+            // holding only the spawn pose, and there are no expert-replay agents at
+            // all. Running the loop anyway read `episode_length` (1280) floats out of
+            // a 1-element allocation and drew ~77k spheres of heap garbage per frame,
+            // which is what made eval rendering ~27x slower than ocean's.
 
             draw_scene(env, client, 1, 0, 0, 0);
 
