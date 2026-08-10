@@ -518,8 +518,11 @@ void add_log(Drive *env) {
         if (!offroad && !collided && frac_goal_reached < 1.0f) {
             env->log.dnf_rate += 1.0f;
         }
-        int lane_aligned = env->logs[i].lane_alignment_rate;
-        env->log.lane_alignment_rate += lane_aligned;
+        // Time average over the agent's own step count, which is the episode length
+        // for every agent here (respawn recycles an agent, it does not end it).
+        float steps = env->logs[i].episode_length;
+        if (steps > 0.0f)
+            env->log.lane_alignment_rate += env->logs[i].lane_alignment_rate / steps;
         env->log.speed_at_goal += env->logs[i].speed_at_goal;
         env->log.episode_length += env->logs[i].episode_length;
         env->log.episode_return += env->logs[i].episode_return;
@@ -1118,10 +1121,14 @@ int collision_check(Drive *env, int agent_idx) {
     if (agent->x == INVALID_POSITION)
         return -1;
 
-    // Skip collision checking for pedestrians because they are often too
-    // close to other entities at initialization.
-    if (agent->type == PEDESTRIAN)
-        return -1;
+    // ocean skips pedestrians here because dataset-driven init drops them onto
+    // sidewalks already overlapping other entities. Gigaflow init has no such
+    // pedestrians: every controlled agent is rejection-sampled onto the lane graph,
+    // routed over it and driven with the same bicycle model, so the type only
+    // selects a silhouette. Exempting it produced ~15% of traffic that could drive
+    // through cars and off the road for free while still collecting the lane and
+    // goal rewards -- and, because pedestrians stayed valid collision *targets*,
+    // charging the vehicles they hit for it.
 
     int car_collided_with_index = -1;
 
@@ -1268,8 +1275,9 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         Entity *entity;
         entity = &env->entities[entity_list[i].entity_idx];
 
-        // Check for offroad collision with road edges (only for vehicles and cyclists)
-        if (entity->type == ROAD_EDGE && agent->type != PEDESTRIAN) {
+        // Check for offroad collision with road edges. Applies to every controlled
+        // agent, pedestrians included: see the note in collision_check.
+        if (entity->type == ROAD_EDGE) {
             int geometry_idx = entity_list[i].geometry_idx;
             float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
@@ -1353,13 +1361,10 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         }
     }
 
-    // Check for vehicle collisions (skip for pedestrians)
-    int car_collided_with_index = -1;
-    if (agent->type != PEDESTRIAN) {
-        car_collided_with_index = collision_check(env, agent_idx);
-        if (car_collided_with_index != -1)
-            collided = VEHICLE_COLLISION;
-    }
+    // Check for vehicle collisions
+    int car_collided_with_index = collision_check(env, agent_idx);
+    if (car_collided_with_index != -1)
+        collided = VEHICLE_COLLISION;
 
     agent->collision_state = collided;
 
@@ -1763,6 +1768,11 @@ static void giga_spawn_all(Drive *env) {
         giga_place_agent(env, i, i);
 }
 
+// DEAD IN GIGA. Reached only from set_active_agents below, which nothing calls:
+// giga_set_active_agents replaces it and makes every synthesised entity active
+// regardless of type. Kept so the file still reads against ocean's, but note the
+// consequence -- `control_mode` selects nothing here, so CONTROL_VEHICLES does NOT
+// restrict giga to type == VEHICLE the way it does in ocean.
 bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
     // Check if we have room for more agents or are already at capacity
     if (env->active_agent_count >= control_limit) {
@@ -1812,6 +1822,9 @@ bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
     return distance_to_goal >= MIN_DISTANCE_TO_GOAL;
 }
 
+// DEAD IN GIGA: superseded by giga_set_active_agents. This is the dataset-driven
+// selector; it reads traj_valid and the SDC index, neither of which a synthesised
+// Gigaflow scene has.
 void set_active_agents(Drive *env) {
 
     // Initialize
@@ -1916,6 +1929,8 @@ void set_active_agents(Drive *env) {
     return;
 }
 
+// DEAD IN GIGA: no caller, and it returns immediately unless control_mode is
+// CONTROL_WOSAC, which giga never uses.
 void remove_bad_trajectories(Drive *env) {
 
     if (env->control_mode != CONTROL_WOSAC) {
@@ -2110,6 +2125,16 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
             steering = STEERING_VALUES[steering_index];
         }
 
+        // Per-agent actuation response, mirroring the jerk branch: without this the
+        // three dynamics conditioning values are sampled, written into the
+        // observation and then never read, so the policy learns to ignore a
+        // thirteenth of its conditioning block.
+        acceleration *= agent->cond[COND_C_THROTTLE];
+        steering *= agent->cond[COND_C_STEER];
+        // Braking authority is shared; forward acceleration is the randomized part
+        // (paper: max forward acceleration = 2.5 * C_acc).
+        acceleration = clip(acceleration, -5.0f, 2.5f * agent->cond[COND_C_ACC]);
+
         // Current state
         float x = agent->x;
         float y = agent->y;
@@ -2139,6 +2164,18 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         x = x + (new_vx * env->dt);
         y = y + (new_vy * env->dt);
         heading = heading + yaw_rate * env->dt;
+
+        // Realized accelerations. The classic model commands acceleration directly
+        // rather than integrating it, but R_comfort reads a_long/a_lat/jerk_* the
+        // same way in both models, so they have to be maintained here too -- left at
+        // zero the comfort term is identically zero and alpha_comfort is dead.
+        // a_lat is the centripetal term v * yaw_rate, the classic-model counterpart
+        // of the jerk model's v^2 * curvature.
+        float a_lat_new = signed_speed * yaw_rate;
+        agent->jerk_long = (acceleration - agent->a_long) / env->dt;
+        agent->jerk_lat = (a_lat_new - agent->a_lat) / env->dt;
+        agent->a_long = acceleration;
+        agent->a_lat = a_lat_new;
 
         // Apply updates to the agent's state
         agent->x = x;
@@ -2962,8 +2999,11 @@ void c_step(Drive *env) {
         env->rewards[i] += r;
         env->logs[i].episode_return += r;
 
-        int lane_aligned = env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX];
-        env->logs[i].lane_alignment_rate = lane_aligned;
+        // Accumulated, not assigned: this is the fraction of the episode spent
+        // aligned, normalized by episode_length in add_log. Assigning here made it a
+        // snapshot of the final step, which over a 1280-step episode says almost
+        // nothing about how the agent drove.
+        env->logs[i].lane_alignment_rate += env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX];
     }
 
     if (env->goal_behavior == GOAL_RESPAWN) {
@@ -2988,7 +3028,9 @@ void c_step(Drive *env) {
     }
 
     // Episode boundary after this step: treat time-limit and early-termination as truncation.
-    // `timestep` is incremented at step start, so truncate when `(timestep + 1) >= episode_length`.
+    // `timestep` is incremented at the top of c_step, so after the k-th step it
+    // equals init_steps + k. Truncating at `timestep + 1 >= episode_length` ran one
+    // step short (1279 of a configured 1280); compare `timestep` itself.
     int originals_remaining = 0;
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
@@ -2997,7 +3039,7 @@ void c_step(Drive *env) {
             break;
         }
     }
-    int reached_time_limit = (env->timestep + 1) >= env->episode_length;
+    int reached_time_limit = env->timestep >= env->episode_length;
     int reached_early_termination = (!originals_remaining && env->termination_mode == 1);
     if (reached_time_limit || reached_early_termination) {
         for (int i = 0; i < env->active_agent_count; i++) {
