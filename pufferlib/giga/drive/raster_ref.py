@@ -270,9 +270,18 @@ class Palette:
         }
     )
     # Per-face multipliers, indexed by the face order used in `_agent_triangles`:
-    # front, back, left, right, top, bottom. Left and right differ so that a box
-    # seen side-on still reveals which way it points.
-    face_shade: tuple[float, ...] = (1.00, 0.42, 0.86, 0.62, 0.95, 0.32)
+    # front, back, left, right, top, bottom. These are not a light model -- they
+    # rotate with the object -- but a code that lets the policy read another
+    # agent's heading off its faces, so all six only have to stay distinguishable
+    # from one another.
+    #
+    # `back` is the face you look at for the whole of car-following, which makes it
+    # the most-seen face in the rig; at 0.42 a red vehicle's rear rendered darker
+    # than the asphalt it stood on and its class colour was gone. It sits at 0.72
+    # rather than lower because 0.6 would collide with `right`. The tightest
+    # remaining pair is back/right at 0.10, wider than the front/top pair this
+    # palette already shipped with.
+    face_shade: tuple[float, ...] = (1.00, 0.72, 0.86, 0.62, 0.95, 0.32)
 
     road: dict[int, tuple[float, float, float]] = field(
         default_factory=lambda: {
@@ -285,8 +294,9 @@ class Palette:
         }
     )
 
-    # Depth-aware brightness: brightness falls linearly from 1 at the camera to
-    # `depth_min_scale` at `depth_falloff` metres.
+    # Aerial perspective: every surface blends toward `sky` with distance, from no
+    # blend at the camera to `1 - depth_min_scale` at `depth_falloff` metres. See
+    # `_haze`.
     depth_falloff: float = 60.0
     depth_min_scale: float = 0.30
 
@@ -564,7 +574,7 @@ def _background(rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dt
 
     # Fade the asphalt with distance so the horizon does not read as a hard edge.
     scale = _depth_scale(depth, palette).unsqueeze(-1)
-    color = torch.where(hit, color * scale + sky * (1.0 - scale), color)
+    color = torch.where(hit, _haze(color, scale, sky), color)
     return color, depth
 
 
@@ -572,6 +582,21 @@ def _depth_scale(depth, palette):
     """Depth-aware brightness: near is bright, far fades toward the horizon."""
     s = 1.0 - depth.clamp(min=0.0) / palette.depth_falloff
     return s.clamp(palette.depth_min_scale, 1.0)
+
+
+def _haze(color, scale, sky):
+    """Fade a surface toward the horizon with distance (aerial perspective).
+
+    Every layer has to fade the same way, or contrast between two of them does not
+    merely weaken with range -- it crosses zero and inverts. Fading fragments
+    toward black while the ground faded toward `sky` did exactly that: the two met
+    at 24 m for a road edge and 32 m for a lane line, where the marking took the
+    asphalt's own colour and vanished, and past that markings read as dark lines
+    on bright asphalt. Blending both toward `sky` leaves the difference between
+    any two surfaces at `(a - b) * scale`, which decays to `depth_min_scale` but
+    keeps its sign at every range.
+    """
+    return color * scale + sky * (1.0 - scale)
 
 
 # ---------------------------------------------------------------------------
@@ -645,6 +670,7 @@ def render(
             bg_color, bg_depth = _background(
                 rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dtype
             )
+            sky = torch.tensor(palette.sky, device=device, dtype=dtype)
 
             layers = []
             for tris_ego, cols in ((road_tris, road_cols), (agent_tris, agent_cols)):
@@ -673,7 +699,9 @@ def render(
                         else depth_limit
                     )
                     scale = _depth_scale(zbuf, palette)
-                    weighted = _composite_shaded(cov, zbuf, shaded, scale, acc, limit, cam.far)
+                    weighted = _composite_shaded(
+                        cov, zbuf, shaded, scale, sky, acc, limit, cam.far
+                    )
                     acc = weighted
                 image[start:stop] = acc
 
@@ -683,10 +711,10 @@ def render(
     return out
 
 
-def _composite_shaded(cov, depth, colors, depth_scale, background, background_depth, far):
-    """`_composite`, with per-fragment depth-aware brightness applied.
+def _composite_shaded(cov, depth, colors, depth_scale, sky, background, background_depth, far):
+    """`_composite`, with per-fragment aerial perspective applied.
 
-    Brightness varies per pixel (it depends on interpolated depth), so the colour
+    The haze varies per pixel (it depends on interpolated depth), so the colour
     cannot be folded into the per-triangle table beforehand.
     """
     if cov.shape[0] == 0:
@@ -707,7 +735,7 @@ def _composite_shaded(cov, depth, colors, depth_scale, background, background_de
         order = order[:MAX_FRAGMENTS]
     cov_s = torch.gather(cov, 0, order)
     scale_s = torch.gather(depth_scale, 0, order).unsqueeze(-1)
-    col_s = colors[order] * scale_s
+    col_s = _haze(colors[order], scale_s, sky)
 
     # Transmittance reaching each layer: the product of (1 - alpha) over all
     # strictly nearer layers, i.e. an exclusive prefix product. Computing it as

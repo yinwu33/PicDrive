@@ -56,6 +56,10 @@ __device__ __forceinline__ float depth_scale(float depth) {
     return fminf(fmaxf(s, PALETTE_DEPTH_MIN_SCALE), 1.0f);
 }
 
+// Horizon colour. Both the background and every fragment fade toward it with
+// distance; see raster_ref._haze for why the two cannot fade differently.
+__constant__ float PALETTE_SKY[3] = {0.62f, 0.70f, 0.80f};
+
 // Flat-shaded palette, mirroring raster_ref.Palette.
 __device__ __forceinline__ void agent_color(int type_id, float *out) {
     if (type_id == 2) {  // PEDESTRIAN
@@ -79,8 +83,10 @@ __device__ __forceinline__ void road_color(int type_id, float *out) {
 }
 
 // Per-face brightness of an agent box: front, back, left, right, top, bottom.
-// Left and right differ so a box seen side-on still reveals which way it points.
-__constant__ float FACE_SHADE[6] = {1.00f, 0.42f, 0.86f, 0.62f, 0.95f, 0.32f};
+// A heading code rather than a light model, so the six only have to stay mutually
+// distinguishable; `back` is raised off the floor because car-following looks at
+// it constantly. See raster_ref.Palette.face_shade.
+__constant__ float FACE_SHADE[6] = {1.00f, 0.72f, 0.86f, 0.62f, 0.95f, 0.32f};
 
 // Cuboid faces as indices into the 8 corners, ordered (front/back, left/right,
 // bottom/top) with bit weights 4/2/1. Two triangles per face.
@@ -319,7 +325,7 @@ __device__ __forceinline__ void insert_fragment(float *fd, float *fc, int *fi, i
     if (count < MAX_FRAGS) count++;
 }
 
-// Front-to-back "over" compositing, with depth-aware brightness per fragment.
+// Front-to-back "over" compositing, with aerial perspective per fragment.
 // Writes premultiplied colour into acc[0..2] and the surviving transmittance into
 // acc[3], so the caller finishes with `colour = acc.rgb + background * acc[3]`.
 __device__ __forceinline__ void composite(const float *fd, const float *fc, int count, float *acc) {
@@ -330,7 +336,8 @@ __device__ __forceinline__ void composite(const float *fd, const float *fc, int 
         float w = cov * trans;
         float scale = depth_scale(fd[i]);
 #pragma unroll
-        for (int k = 0; k < 3; k++) acc[k] += w * fc[i * 4 + k] * scale;
+        for (int k = 0; k < 3; k++)
+            acc[k] += w * (fc[i * 4 + k] * scale + PALETTE_SKY[k] * (1.0f - scale));
         trans *= (1.0f - cov);
     }
     acc[3] = trans;
@@ -399,16 +406,15 @@ __global__ void raster_kernel(const float *egos, int ego_stride, const float *ri
         float dez = c.rot[2] * dcx + c.rot[5] * dcy + c.rot[8];
         float ground_depth = INFINITY;
         float rgb[4];
-        const float sky[3] = {0.62f, 0.70f, 0.80f};
         if (dez < -1e-6f) {
             ground_depth = -c.pos[2] / dez;  // dcz is 1, so the ray parameter is the depth
             float s = depth_scale(ground_depth);
             const float ground[3] = {0.16f, 0.16f, 0.17f};
 #pragma unroll
-            for (int k = 0; k < 3; k++) rgb[k] = ground[k] * s + sky[k] * (1.0f - s);
+            for (int k = 0; k < 3; k++) rgb[k] = ground[k] * s + PALETTE_SKY[k] * (1.0f - s);
         } else {
 #pragma unroll
-            for (int k = 0; k < 3; k++) rgb[k] = sky[k];
+            for (int k = 0; k < 3; k++) rgb[k] = PALETTE_SKY[k];
         }
 
         float fd[MAX_FRAGS];
