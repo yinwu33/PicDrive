@@ -776,10 +776,17 @@ class Evaluator:
     RENDER_WORST_SCORE = "worst_score"
     RENDER_WORST_COLLISION = "worst_collision"
 
+    # WOMD scenario length. The rollout loop has to be able to reach the env's own
+    # truncation step, because that is the only place the env calls add_log: stop one
+    # step short and the rollout returns no stats at all. These were two independent
+    # literals (91 here, 90 in the loop) that happened to line up only while the env
+    # truncated a step early.
+    EVAL_EPISODE_LENGTH = 91
+
     def __init__(self, configs, logger=None):
         self.configs = configs
         self.logger = logger
-        self.sim_steps = 90
+        self.sim_steps = self.EVAL_EPISODE_LENGTH
         self.self_play_stats = None
         self.human_replay_stats = None
         self.sp_env = None
@@ -794,7 +801,7 @@ class Evaluator:
         backend = eval_config["eval"].get("backend", "PufferEnv")
         eval_config["env"]["map_dir"] = eval_config["eval"]["map_dir"]
         eval_config["env"]["num_agents"] = eval_config["eval"]["num_eval_agents"]
-        eval_config["env"]["episode_length"] = 91  # WOMD scenario length
+        eval_config["env"]["episode_length"] = self.EVAL_EPISODE_LENGTH
         eval_config["vec"] = dict(backend=backend, num_envs=1)
 
         self.hr_eval_config = copy.deepcopy(eval_config)
@@ -932,14 +939,18 @@ class Evaluator:
 
         eval_stats = {}
 
-        if self.human_replay_stats is not None:
+        if self.human_replay_stats is not None and "collision_rate" in self.human_replay_stats:
             eval_stats["eval/hr_collision_rate"] = self.human_replay_stats["collision_rate"]
             eval_stats["eval/hr_score"] = self.human_replay_stats["score"]
-        if self.self_play_stats is not None:
-            eval_stats["eval/sp_collision_rate"] = self.self_play_stats["collision_rate"]
-            eval_stats["eval/sp_score"] = self.self_play_stats["score"]
-            eval_stats["eval/num_agents"] = self.self_play_stats["n"]
-        else:
+        # `rollout` stores {} when the rollout finished no episode -- the env only
+        # aggregates logs at its truncation step -- and then adds render_env_idx, so
+        # the dict is non-None but empty of stats. Skip the log instead of taking the
+        # whole training run down with a KeyError at eval_interval.
+        if self.self_play_stats is None or "collision_rate" not in self.self_play_stats:
+            print("Warning: self-play eval produced no episode statistics; skipping eval log")
             return
+        eval_stats["eval/sp_collision_rate"] = self.self_play_stats["collision_rate"]
+        eval_stats["eval/sp_score"] = self.self_play_stats["score"]
+        eval_stats["eval/num_agents"] = self.self_play_stats["n"]
 
         self.logger.wandb.log(eval_stats)

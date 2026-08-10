@@ -17,7 +17,7 @@ both parts without paying float32 for the images:
 
     [ num_cameras * 3 * H * W image bytes | ego_dim float32 ego values ]
 
-`DriveCam` in pufferlib/ocean/torch.py unpacks it.
+`GigaDriveCam` in pufferlib/giga/torch.py unpacks it.
 """
 
 from __future__ import annotations

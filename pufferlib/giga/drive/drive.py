@@ -1,5 +1,6 @@
 import numpy as np
 import gymnasium
+import configparser
 import json
 import struct
 import os
@@ -16,7 +17,7 @@ from tqdm import tqdm
 # default is the packaged drive.ini, resolved against the package rather than the
 # working directory so a direct Drive(...) works from anywhere.
 _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_INI_FILE = os.path.join(_PACKAGE_DIR, "config", "ocean", "drive.ini")
+DEFAULT_INI_FILE = os.path.join(_PACKAGE_DIR, "config", "giga", "drive.ini")
 
 
 class RenderView(IntEnum):
@@ -33,29 +34,35 @@ class Drive(pufferlib.PufferEnv):
         width=1280,
         height=1024,
         human_agent_idx=0,
-        reward_vehicle_collision=-0.1,
-        reward_offroad_collision=-0.1,
+        # These mirror config/giga/drive.ini, not config/ocean/drive.ini. The trainer
+        # passes every [env] key as a kwarg, so these only apply to a direct
+        # Drive(...) -- but that is what validate_init.py, viz.py and any ad-hoc
+        # check use, and the ocean-era values silently gave those a different
+        # simulator: classic dynamics, dataset-style control_mode, and a
+        # resample_frequency of 91 that resampled the maps mid-episode.
+        reward_vehicle_collision=-0.5,
+        reward_offroad_collision=-0.5,
         reward_goal=1.0,
-        reward_goal_post_respawn=0.5,
+        reward_goal_post_respawn=0.25,
         goal_behavior=0,
-        goal_target_distance=10.0,
+        goal_target_distance=30.0,
         goal_radius=2.0,
-        goal_speed=20.0,
+        goal_speed=100.0,
         collision_behavior=0,
         offroad_behavior=0,
         dt=0.1,
         episode_length=None,
         termination_mode=None,
-        resample_frequency=91,
-        num_maps=100,
-        num_agents=512,
+        resample_frequency=2560,
+        num_maps=10000,
+        num_agents=1024,
         action_type="discrete",
-        dynamics_model="classic",
+        dynamics_model="jerk",
         buf=None,
         seed=1,
         init_steps=0,
         init_mode="create_all_valid",
-        control_mode="control_vehicles",
+        control_mode="control_agents",
         max_controlled_agents=32,
         map_dir="resources/drive/binaries/training",
         obs_mode="vector",
@@ -194,6 +201,10 @@ class Drive(pufferlib.PufferEnv):
                 "simulator out from under the Python-side spaces."
             )
 
+        assert episode_length is not None and episode_length > 0, "episode_length must be a positive integer"
+        episode_length = int(episode_length)
+        self.episode_length = episode_length
+
         # Check if resources directory exists
         binary_path = f"{map_dir}/map_000.bin"
         if not os.path.exists(binary_path):
@@ -247,7 +258,7 @@ class Drive(pufferlib.PufferEnv):
                 collision_behavior=self.collision_behavior,
                 offroad_behavior=self.offroad_behavior,
                 dt=dt,
-                episode_length=(int(episode_length) if episode_length is not None else None),
+                episode_length=episode_length,
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 map_id=map_ids[i],
                 max_agents=nxt - cur,
@@ -823,10 +834,10 @@ def test_performance(timeout=10, atn_cache=1024, num_agents=1024):
     env = Drive(
         num_agents=num_agents,
         num_maps=1,
-        control_mode="control_vehicles",
+        control_mode="control_agents",
         init_mode="create_all_valid",
         init_steps=0,
-        episode_length=91,
+        episode_length=1280,
     )
 
     env.reset()
