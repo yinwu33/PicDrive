@@ -17,6 +17,10 @@ import numpy as np
 from pufferlib.giga.drive.drive import Drive
 
 VEHICLE, PEDESTRIAN, CYCLIST = 1, 2, 3
+GIGA_NUM_COND = 13
+COND_DELTA_GOAL = 0
+COND_NAMES = ["delta_goal", "v_goal", "a_collision", "a_boundary", "a_comfort", "a_l_align",
+              "a_vel_align", "a_l_center", "a_center_bias", "a_reverse", "C_throttle", "C_steer", "C_acc"]
 NAMES = {VEHICLE: "vehicle", PEDESTRIAN: "pedestrian", CYCLIST: "cyclist"}
 
 
@@ -176,6 +180,35 @@ def main():
             print(f"      corr({a},{bkey}) {c_obs:.3f}  ref {c_ref:.3f}   z={z:.2f} {'ok' if z < 4 else 'MISMATCH'}")
             if z >= 4:
                 fails.append(f"{NAMES.get(t,t)} corr({a},{bkey}) {c_obs:.3f} != reference {c_ref:.3f} (z={z:.1f})")
+
+    # -- conditioning ---------------------------------------------------------
+    # Read from the observation rather than a debug channel: this is exactly what the
+    # policy receives, so a normalization mistake shows up here and nowhere else.
+    print("\n-- conditioning (from the ego observation) --")
+    obs = np.asarray(env.observations)
+    base = obs.shape[1] - GIGA_NUM_COND
+    cond = obs[:, base:]
+    print(f"  ego observation width {obs.shape[1]} = {base} state + {GIGA_NUM_COND} conditioning")
+    bad_range = [COND_NAMES[k] for k in range(GIGA_NUM_COND)
+                 if cond[:, k].min() < -1e-3 or cond[:, k].max() > 1 + 1e-3]
+    if bad_range:
+        fails.append(f"conditioning outside [0,1]: {bad_range}")
+    # The first ten are plain uniforms; the last three are the X(a) dynamics mixture,
+    # which is centred near 1 but not uniform, so only the uniforms get a mean test.
+    off = [f"{COND_NAMES[k]} {cond[:, k].mean():.3f}" for k in range(10)
+           if abs(cond[:, k].mean() - 0.5) > 0.05]
+    if off:
+        fails.append(f"conditioning not uniform: {off}")
+    distinct = len(np.unique(np.round(cond[:, COND_DELTA_GOAL], 6)))
+    print(f"  range ok: {not bad_range}   uniform ok: {not off}   distinct delta_goal: {distinct}/{len(cond)}")
+    if distinct < 0.9 * len(cond):
+        fails.append(f"conditioning is not per-agent ({distinct} distinct of {len(cond)})")
+
+    # -- waypoint chain integrity --------------------------------------------
+    cw = agents[:, 10]
+    if not np.all(cw < np.maximum(n_wp, 1)):
+        fails.append("current_waypoint index runs past num_waypoints")
+    print(f"  current_waypoint within num_waypoints: {bool(np.all(cw < np.maximum(n_wp, 1)))}")
 
     env.close()
     print()

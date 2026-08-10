@@ -6,22 +6,22 @@ import subprocess
 import json
 
 
-def run_wosac_eval_in_subprocess(config, logger, global_step):
+def run_wosac_eval_in_subprocess(config, logger, global_step, run_name):
     """
     Run WOSAC evaluation in a subprocess and log metrics to wandb.
 
     Args:
         config: Configuration dictionary containing data_dir, env, and wosac settings
-        logger: Logger object with run_id and optional wandb attribute
+        logger: Logger object with an optional wandb attribute
         epoch: Current training epoch
         global_step: Current global training step
+        run_name: Name of this run's directory under data_dir
 
     Returns:
         None. Prints error messages if evaluation fails.
     """
     try:
-        run_id = logger.run_id
-        model_dir = os.path.join(config["data_dir"], f"{config['env']}_{run_id}")
+        model_dir = os.path.join(config["data_dir"], run_name)
         model_files = glob.glob(os.path.join(model_dir, "model_*.pt"))
 
         # Prepare evaluation command

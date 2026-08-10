@@ -5,9 +5,11 @@ the Gigaflow-style random initialization can diverge from the dataset-driven env
 `pufferlib/ocean/` without touching it. The two are independent: `ocean` keeps
 serving WOSAC and human-replay evaluation, which need logged trajectories.
 
-Env names are `puffer_giga_drive` (privileged vector observations) and
-`puffer_giga_drive_cam` (perspective camera observations). Both are the same C
-simulator in different observation modes, exactly as in `ocean`.
+Env names are `puffer_giga` (privileged vector observations), `puffer_giga_cam`
+(a single front camera) and `puffer_giga_3cam` (Waymo's three front-facing
+cameras). All three are the same C simulator in different observation modes,
+exactly as in `ocean`, where the counterparts are `puffer_drive`,
+`puffer_drive_cam` and `puffer_drive_3cam`.
 """
 
 import importlib
@@ -15,17 +17,24 @@ import importlib
 import pufferlib
 
 MAKE_FUNCTIONS = {
-    "giga_drive": "Drive",
+    "giga": "Drive",
     # Same simulator, configured for perspective observations and wrapped by
-    # PerspectiveVecEnv below.
-    "giga_drive_cam": "Drive",
+    # PerspectiveVecEnv below. These two differ only in the camera rig named by
+    # their config, so they share this entry point.
+    "giga_cam": "Drive",
+    "giga_3cam": "Drive",
 }
 
 # Environments that reuse another environment's module.
-MODULE_ALIASES = {"giga_drive": "drive", "giga_drive_cam": "drive"}
+MODULE_ALIASES = {name: "drive" for name in MAKE_FUNCTIONS}
+
+# Envs whose observations are rendered rather than privileged. Matched exactly:
+# every name here starts with "giga", so a substring test would wrap the
+# vector-observation env too.
+CAMERA_ENVS = {"puffer_giga_cam", "puffer_giga_3cam"}
 
 
-def env_creator(name="giga_drive", *args, **kwargs):
+def env_creator(name="giga", *args, **kwargs):
     if "puffer_" not in name:
         raise pufferlib.APIUsageError(f"Invalid environment name: {name}")
 
@@ -49,7 +58,7 @@ def vecenv_wrapper(env_name, vecenv, args):
     The rasterizer belongs to the observation pipeline rather than to the policy:
     wrapping here is what keeps the privileged scene out of the network's inputs.
     """
-    if "giga_drive_cam" not in env_name:
+    if env_name not in CAMERA_ENVS:
         return vecenv
 
     from pufferlib.giga.drive.perspective import PerspectiveVecEnv

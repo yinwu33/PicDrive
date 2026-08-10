@@ -208,6 +208,11 @@ class PuffeRL:
         if logger is None:
             self.logger = NoLogger(config)
 
+        # Name of this run's output dir, fixed for its lifetime. Wandb/Neptune run
+        # ids are random codes, so the start time goes in front to keep experiments/
+        # sortable and make the latest run obvious. Do not recompute per checkpoint.
+        self.run_name = f"{config['env']}_{time.strftime('%Y%m%d_%H%M%S')}_{self.logger.run_id}"
+
         # Learning rate scheduler
         epochs = config["total_timesteps"] // config["batch_size"]
         self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
@@ -625,7 +630,9 @@ class PuffeRL:
             del self.evaluator
 
         if self.config["eval"]["wosac_realism_eval"]:
-            pufferlib.utils.run_wosac_eval_in_subprocess(self.config, self.logger, self.global_step)
+            pufferlib.utils.run_wosac_eval_in_subprocess(
+                self.config, self.logger, self.global_step, self.run_name
+            )
 
     def mean_and_log(self):
         config = self.config
@@ -670,8 +677,7 @@ class PuffeRL:
         self.vecenv.close()
         self.utilization.stop()
         model_path = self.save_checkpoint()
-        run_id = self.logger.run_id
-        path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}.pt")
+        path = os.path.join(self.config["data_dir"], f"{self.run_name}.pt")
         shutil.copy(model_path, path)
         return path
 
@@ -684,8 +690,7 @@ class PuffeRL:
         behind the offending samples. The full minibatch of camera frames is ~130 MB
         and is not evidence, so only the bad rows are kept.
         """
-        run_id = self.logger.run_id
-        path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}")
+        path = os.path.join(self.config["data_dir"], self.run_name)
         os.makedirs(path, exist_ok=True)
         dump_path = os.path.join(path, f"nonfinite_epoch{self.epoch:06d}_mb{mb:03d}.pt")
 
@@ -756,7 +761,7 @@ class PuffeRL:
                 return
 
         run_id = self.logger.run_id
-        path = os.path.join(self.config["data_dir"], f"{self.config['env']}_{run_id}")
+        path = os.path.join(self.config["data_dir"], self.run_name)
         if not os.path.exists(path):
             os.makedirs(path)
 
@@ -1059,7 +1064,7 @@ def downsample(arr, m):
 
 class NoLogger:
     def __init__(self, args):
-        self.run_id = str(int(100 * time.time()))
+        self.run_id = f"local{os.getpid()}"
 
     def log(self, logs, step):
         pass
@@ -1616,7 +1621,12 @@ def load_config(env_name, config_dir=None):
     parser.add_argument("--gif-path", type=str, default="eval.gif")
     parser.add_argument("--fps", type=float, default=15)
     parser.add_argument("--max-runs", type=int, default=200, help="Max number of sweep runs")
-    parser.add_argument("--wandb", action="store_true", help="Use wandb for logging")
+    parser.add_argument(
+        "--wandb",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use wandb for logging (on by default; pass --no-wandb to disable)",
+    )
     parser.add_argument("--wandb-project", type=str, default="pufferlib")
     parser.add_argument("--wandb-group", type=str, default="debug")
     parser.add_argument("--neptune", action="store_true", help="Use neptune for logging")

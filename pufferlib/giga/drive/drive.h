@@ -13,6 +13,8 @@
 #include "rlgl.h"
 #include <time.h>
 #include "error.h"
+#include "giga_random.h"
+#include "conditioning.h"
 
 // Render modes
 #define RENDER_WINDOW 0
@@ -99,7 +101,7 @@
 // below the scene population on purpose (N_o = 20 << N_a = 150): it is the paper's
 // stated mechanism for partial observability, and it keeps the observation width
 // independent of how dense the traffic is. The camera env observes no partners at
-// all, so this only affects puffer_giga_drive.
+// all, so this only affects puffer_giga.
 #ifndef MAX_PARTNER_OBS
 #define MAX_PARTNER_OBS 20
 #endif
@@ -111,8 +113,8 @@
 #define PARTNER_FEATURES 7
 
 // Ego features depend on dynamics model
-#define EGO_FEATURES_CLASSIC 8
-#define EGO_FEATURES_JERK 11
+#define EGO_FEATURES_CLASSIC (8 + GIGA_NUM_COND)
+#define EGO_FEATURES_JERK (11 + GIGA_NUM_COND)
 
 // Observation normalization constants
 #define MAX_SPEED 100.0f
@@ -274,6 +276,18 @@ struct Entity {
     int active_agent;
     int stopped;
     int removed;
+
+    // Per-agent reward weights and dynamics coefficients. Observed by this agent
+    // only; deliberately absent from the partner observation and the RenderState, so
+    // other agents' intentions stay hidden.
+    float cond[GIGA_NUM_COND];
+    // Frenet state against the nearest lane centerline, filled by
+    // compute_agent_metrics: signed heading error and signed lateral offset (positive
+    // to the left of travel). The lane-alignment and lane-centering rewards need
+    // these, and nothing computed them before.
+    float lane_heading_error;
+    float lane_lateral_offset;
+    int lane_valid;
 
     // Gigaflow route: waypoints[0..num_waypoints-1] are visited in order, the last
     // one being the final goal. goal_position_x/y always mirrors the *current*
@@ -1303,11 +1317,40 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     if (min_distance > 4.0f || closest_lane_entity_idx == -1) {
         agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f;
         agent->current_lane_idx = -1;
+        agent->lane_valid = 0;
+        agent->lane_heading_error = 0.0f;
+        agent->lane_lateral_offset = 0.0f;
     } else {
         agent->current_lane_idx = closest_lane_entity_idx;
         int lane_aligned =
             check_lane_aligned(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
         agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
+
+        // Frenet frame of the closest segment: heading error wrapped to [-pi, pi] and
+        // lateral offset signed by which side of the lane the agent sits on (positive
+        // left). The sign matters -- alpha_center_bias picks a side, so an unsigned
+        // offset would make the left and right halves of the lane indistinguishable.
+        Entity *lane = &env->entities[closest_lane_entity_idx];
+        int g = closest_lane_geometry_idx;
+        float sx = lane->traj_x[g], sy = lane->traj_y[g];
+        float dx = lane->traj_x[g + 1] - sx, dy = lane->traj_y[g + 1] - sy;
+        float seg_len = sqrtf(dx * dx + dy * dy);
+        if (seg_len > 1e-6f) {
+            dx /= seg_len;
+            dy /= seg_len;
+            float err = agent->heading - atan2f(dy, dx);
+            while (err > (float)M_PI)
+                err -= 2.0f * (float)M_PI;
+            while (err < -(float)M_PI)
+                err += 2.0f * (float)M_PI;
+            agent->lane_heading_error = err;
+            agent->lane_lateral_offset = -dy * (agent->x - sx) + dx * (agent->y - sy);
+            agent->lane_valid = 1;
+        } else {
+            agent->lane_valid = 0;
+            agent->lane_heading_error = 0.0f;
+            agent->lane_lateral_offset = 0.0f;
+        }
     }
 
     // Check for vehicle collisions (skip for pedestrians)
@@ -1354,7 +1397,7 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
 // rejection sampling along the lane graph, and routed over it.
 // ---------------------------------------------------------------------------
 
-#define GIGA_SPAWN_ATTEMPTS 32
+#define GIGA_SPAWN_ATTEMPTS 48
 #define GIGA_SPAWN_GAP 1.5f // metres of clear space required between footprints
 
 // True if the agent's box crosses a road edge. Spawning happens on lane centerlines,
@@ -1412,6 +1455,34 @@ static float giga_clearance(Drive *env, int agent_idx, float x, float y, int cou
             best = slack;
     }
     return best;
+}
+
+// True if this agent's box, at its current pose, intersects any already-placed one.
+//
+// giga_clearance uses circumscribed circles, which is the right thing to *rank*
+// candidates by but the wrong thing to accept on: two cars abreast in neighbouring
+// lanes have intersecting circles and perfectly disjoint boxes. Accepting on circles
+// makes dense maps unplaceable and forces the best-effort fallback, which is where the
+// real overlaps came from. The circle test survives as a cheap reject in front of the
+// same oriented-box check the simulator's own collision detection uses.
+static int giga_overlaps_any(Drive *env, int agent_idx, int count) {
+    Entity *a = &env->entities[agent_idx];
+    float ra = 0.5f * sqrtf(a->length * a->length + a->width * a->width);
+    for (int j = 0; j < count; j++) {
+        if (j == agent_idx)
+            continue;
+        Entity *o = &env->entities[j];
+        if (o->removed)
+            continue;
+        float dx = o->x - a->x, dy = o->y - a->y;
+        float ro = 0.5f * sqrtf(o->length * o->length + o->width * o->width);
+        float reach = ra + ro;
+        if (dx * dx + dy * dy > reach * reach)
+            continue;
+        if (check_aabb_collision(a, o))
+            return 1;
+    }
+    return 0;
 }
 
 // Waypoint chain: N_wp ~ U{0, num_waypoints_max} intermediate points plus a final
@@ -1497,6 +1568,10 @@ static void giga_place_agent(Drive *env, int agent_idx, int count) {
 
     // Size first: the clearance test needs the footprint.
     agent_dist_sample(&env->rng, &a->type, &a->length, &a->width, &a->height);
+    giga_sample_conditioning(&env->rng, a->cond);
+    a->lane_valid = 0;
+    a->lane_heading_error = 0.0f;
+    a->lane_lateral_offset = 0.0f;
     a->wheelbase = 0.6f * a->length;
     a->removed = 0;
     a->stopped = 0;
@@ -1541,7 +1616,15 @@ static void giga_place_agent(Drive *env, int agent_idx, int count) {
         a->heading = h;
         a->heading_x = cosf(h);
         a->heading_y = sinf(h);
-        float score = clear - (giga_is_offroad(env, a) ? 1000.0f : 0.0f) - (dead_end ? 500.0f : 0.0f);
+        // Ranking for the fallback, when no attempt turns out fully legal. The
+        // penalties are ordered by how bad the outcome actually is: starting inside a
+        // wall is unrecoverable, starting inside another car costs an immediate
+        // collision, and a dead-end spawn merely yields a goal that has to be sampled
+        // elsewhere. They are far larger than any clearance value (bounded by a few
+        // metres) so the ordering is strict and clearance only breaks ties.
+        int offroad = giga_is_offroad(env, a);
+        int overlap = giga_overlaps_any(env, agent_idx, count);
+        float score = clear - (offroad ? 1000.0f : 0.0f) - (overlap ? 200.0f : 0.0f) - (dead_end ? 50.0f : 0.0f);
 
         if (score > best_score) {
             best_score = score;
@@ -1551,8 +1634,10 @@ static void giga_place_agent(Drive *env, int agent_idx, int count) {
             best_lane = lane;
             best_s = s;
         }
-        if (score >= 0.0f)
-            break; // on-road and clear of everyone: take it
+        // Accept as soon as the pose is legal: on the road, with road ahead, and not
+        // inside anyone.
+        if (!offroad && !overlap && !dead_end)
+            break;
     }
 
     // The agent count per scene is fixed by my_shared before any map is read, and
@@ -2092,6 +2177,11 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
             a_lat = JERK_LAT[a_lat_idx];
         }
 
+        // Per-agent actuation response, so identical actions do not produce identical
+        // motion across the fleet.
+        a_long *= agent->cond[COND_C_THROTTLE];
+        a_lat *= agent->cond[COND_C_STEER];
+
         // Calculate new acceleration
         float a_long_new = agent->a_long + a_long * env->dt;
         float a_lat_new = agent->a_lat + a_lat * env->dt;
@@ -2100,7 +2190,9 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         if (agent->a_long * a_long_new < 0) {
             a_long_new = 0.0f;
         } else {
-            a_long_new = clip(a_long_new, -5.0f, 2.5f);
+            // Braking authority is shared; forward acceleration is the randomized part
+            // (paper: max forward acceleration = 2.5 * C_acc).
+            a_long_new = clip(a_long_new, -5.0f, 2.5f * agent->cond[COND_C_ACC]);
         }
 
         if (agent->a_lat * a_lat_new < 0) {
@@ -2495,6 +2587,13 @@ void compute_observations(Drive *env) {
             obs[7] = ego_entity->type / 3.0f;
         }
 
+        // This agent's own conditioning, normalized to [0, 1]. Only its own: the
+        // partner observation and the RenderState carry no conditioning, so the policy
+        // cannot read anyone else's intentions. That asymmetry is the point.
+        int cond_base = (env->dynamics_model == JERK) ? 11 : 8;
+        for (int k = 0; k < GIGA_NUM_COND; k++)
+            obs[cond_base + k] = giga_cond_norm(k, ego_entity->cond[k]);
+
         // In perspective mode the ego vector is the whole observation: the scene
         // reaches the policy only as rendered pixels, never as entity sets.
         if (env->obs_mode == OBS_MODE_RENDER_STATE)
@@ -2771,54 +2870,96 @@ void c_step(Drive *env) {
         compute_agent_metrics(env, agent_idx);
         int collision_state = env->entities[agent_idx].collision_state;
 
-        if (collision_state > 0) {
-            if (collision_state == VEHICLE_COLLISION) {
-                env->rewards[i] += env->reward_vehicle_collision;
-                env->logs[i].episode_return += env->reward_vehicle_collision;
-                env->logs[i].collision_rate = 1.0f;
-                env->logs[i].collisions_per_agent += 1.0f;
-            } else if (collision_state == OFFROAD) {
-                env->rewards[i] += env->reward_offroad_collision;
-                env->logs[i].episode_return += env->reward_offroad_collision;
-                env->logs[i].offroad_rate = 1.0f;
-                env->logs[i].offroad_per_agent += 1.0f;
-            }
+        // Gigaflow Eq. 3/4 (Table A2), nine of the eleven terms. R_stop-line and the
+        // Pictura R_overspeed are absent because stop lines and lane speed limits do
+        // not exist in the WOMD map format -- implementing them against absent data
+        // would just be a constant.
+        Entity *a = &env->entities[agent_idx];
+        const float *cond = a->cond;
+        const float dt = env->dt;
+        float speed = sqrtf(a->vx * a->vx + a->vy * a->vy);
+        float signed_v = copysignf(speed, a->vx * a->heading_x + a->vy * a->heading_y);
+        float r = 0.0f;
 
-            env->entities[agent_idx].collided_before_goal = 1;
+        // R_collision: the speed term is what makes a fast collision worse than a
+        // nudge, and alpha_collision is what makes one driver more willing to risk it
+        // than another.
+        if (collision_state == VEHICLE_COLLISION) {
+            r -= (cond[COND_ALPHA_COLLISION] + 0.1f * speed);
+            env->logs[i].collision_rate = 1.0f;
+            env->logs[i].collisions_per_agent += 1.0f;
+            a->collided_before_goal = 1;
+        } else if (collision_state == OFFROAD) {
+            r -= cond[COND_ALPHA_BOUNDARY];
+            env->logs[i].offroad_rate = 1.0f;
+            env->logs[i].offroad_per_agent += 1.0f;
+            a->collided_before_goal = 1;
         }
 
-        float distance_to_goal =
-            relative_distance_2d(env->entities[agent_idx].x, env->entities[agent_idx].y,
-                                 env->entities[agent_idx].goal_position_x, env->entities[agent_idx].goal_position_y);
-
-        float current_speed = sqrtf(env->entities[agent_idx].vx * env->entities[agent_idx].vx +
-                                    env->entities[agent_idx].vy * env->entities[agent_idx].vy);
-
-        // Reward agent if it is within X meters of goal and speed is below threshold
-        bool within_distance = distance_to_goal < env->goal_radius;
-        bool within_speed = current_speed <= env->goal_speed;
-
-        if (within_distance && within_speed && !env->entities[agent_idx].current_goal_reached) {
-            if (env->goal_behavior == GOAL_RESPAWN && env->entities[agent_idx].respawn_timestep != -1) {
-                env->rewards[i] += env->reward_goal_post_respawn;
-                env->logs[i].episode_return += env->reward_goal_post_respawn;
-                env->entities[agent_idx].current_goal_reached = 1;
-            } else if (env->goal_behavior == GOAL_GENERATE_NEW && (!env->entities[agent_idx].current_goal_reached)) {
-                env->rewards[i] += env->reward_goal;
-                env->logs[i].episode_return += env->reward_goal;
-                sample_new_goal(env, agent_idx);
-                env->entities[agent_idx].current_goal_reached = 0;
-                env->entities[agent_idx].goals_reached_this_episode += 1.0f;
-            } else { // Zero out the velocity so that the agent stops at the goal
-                env->rewards[i] = env->reward_goal;
-                env->logs[i].episode_return = env->reward_goal;
-                env->entities[agent_idx].stopped = 1;
-                env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
-                env->entities[agent_idx].goals_reached_this_episode += 1.0f;
-            }
-            env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
-            env->logs[i].speed_at_goal = current_speed;
+        // R_comfort: three independent indicators, not a magnitude, so it does not
+        // fight the goal reward inside the comfortable envelope.
+        if (cond[COND_ALPHA_COMFORT] > 0.0f) {
+            int n = (fabsf(a->a_long) > 3.0f) + (fabsf(a->a_lat) > 3.0f) +
+                    ((fabsf(a->jerk_long) > 5.0f || fabsf(a->jerk_lat) > 5.0f) ? 1 : 0);
+            r -= cond[COND_ALPHA_COMFORT] * (float)n;
         }
+
+        // The lane-relative terms need a lane to be relative to. Off the lane graph
+        // they are simply absent rather than zero-substituted, which would otherwise
+        // read as "perfectly aligned".
+        if (a->lane_valid) {
+            float th = a->lane_heading_error;
+            float cos_t = cosf(th);
+            // R_l-align: penalises facing against the lane, penalises *moving* against
+            // it separately (alpha_vel_align), and pays a small bonus for being
+            // straight. Randomizing alpha_l_align across a two-order-of-magnitude
+            // range is what occasionally produces agents willing to drive the wrong way.
+            r += cond[COND_ALPHA_L_ALIGN] * dt *
+                 (fminf(cos_t, 0.0f) + cond[COND_ALPHA_VEL_ALIGN] * fminf(cos_t * signed_v, 0.0f) +
+                  0.0025f * (1.0f - fabsf(th) / (float)(M_PI / 2.0)));
+            // R_l-center, offset by alpha_center_bias so agents prefer different parts
+            // of the lane (the strongest behavioural knob in the paper's Sec. F.1
+            // mutual-information ranking).
+            float d = fabsf(a->lane_lateral_offset - cond[COND_ALPHA_CENTER_BIAS]);
+            r -= cond[COND_ALPHA_L_CENTER] * dt * ((cos_t > 0.5f ? d : 0.0f) - 0.05f / expf(d - 0.5f));
+            // R_velocity: forward progress along the lane. Fixed weight; the paper
+            // credits it with avoiding gridlock in self-play.
+            if (fabsf(signed_v) > 2.5f)
+                r += GIGA_ALPHA_VELOCITY * dt * fmaxf(cos_t, 0.0f);
+        }
+
+        if (signed_v < 0.0f)
+            r -= cond[COND_ALPHA_REVERSE] * dt; // R_reverse
+
+        // R_timestep, disabled while stationary: an agent waiting at an intersection
+        // should not be paying for the privilege, which is what makes it patient.
+        if (fabsf(signed_v) > 0.0f || fabsf(a->a_long) > 0.0f)
+            r -= GIGA_ALPHA_TIMESTEP * dt;
+
+        // R_goal, over the waypoint chain. Only the final goal has to be reached at
+        // low speed; intermediate waypoints are drive-through (paper's 1_waypoint).
+        float distance_to_goal = relative_distance_2d(a->x, a->y, a->goal_position_x, a->goal_position_y);
+        int is_final = (a->current_waypoint >= a->num_waypoints - 1);
+        if (distance_to_goal < cond[COND_DELTA_GOAL] && !a->current_goal_reached &&
+            (!is_final || speed <= cond[COND_V_GOAL])) {
+            r += env->reward_goal;
+            a->goals_reached_this_episode += 1.0f;
+            env->logs[i].speed_at_goal = speed;
+            if (is_final) {
+                // Flagged for the respawn pass below, which recycles the agent into a
+                // fresh pose, embodiment and route.
+                a->metrics_array[REACHED_GOAL_IDX] = 1.0f;
+                a->current_goal_reached = 1;
+            } else {
+                a->current_waypoint++;
+                a->goal_position_x = a->waypoints[a->current_waypoint][0];
+                a->goal_position_y = a->waypoints[a->current_waypoint][1];
+                a->goals_sampled_this_episode += 1.0f;
+            }
+        }
+
+        env->rewards[i] += r;
+        env->logs[i].episode_return += r;
 
         int lane_aligned = env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX];
         env->logs[i].lane_alignment_rate = lane_aligned;
