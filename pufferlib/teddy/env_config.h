@@ -35,9 +35,34 @@ typedef struct {
     int obs_mode;
     int render_road_types;
     char map_dir[256];
+
+    // Gigaflow random initialization.
+    int agents_per_map_min;
+    int agents_per_map_max;
+    float spawn_speed_max;
+    float spawn_heading_jitter_deg;
+    float wrong_way_frac;
+    int num_waypoints_max;
+    float waypoint_min_dist;
+    float waypoint_max_dist;
 } env_init_config;
 
-// INI file parser handler - parses all environment configuration from drive.ini
+// The caller zero-initializes env_init_config, so every field the INI omits reads
+// back as 0. That is a fine default for the ocean-era knobs but not for these: 0
+// agents per map, or a 0 m waypoint spacing, is a silently broken scene rather than
+// a conservative one. Call this before ini_parse so the INI overrides real values.
+static void env_config_set_teddy_defaults(env_init_config *c) {
+    c->agents_per_map_min = 1;
+    c->agents_per_map_max = 120;
+    c->spawn_speed_max = 12.0f;
+    c->spawn_heading_jitter_deg = 3.0f;
+    c->wrong_way_frac = 0.0f;
+    c->num_waypoints_max = 3;
+    c->waypoint_min_dist = 20.0f;
+    c->waypoint_max_dist = 80.0f;
+}
+
+// INI file parser handler - parses all environment configuration from teddy.ini
 static int handler(void *config, const char *section, const char *name, const char *value) {
     env_init_config *env_config = (env_init_config *)config;
 #define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
@@ -138,6 +163,22 @@ static int handler(void *config, const char *section, const char *name, const ch
         env_config->max_controlled_agents = atoi(value);
     } else if (MATCH("env", "partner_obs_radius")) {
         env_config->partner_obs_radius = atof(value);
+    } else if (MATCH("env", "agents_per_map_min")) {
+        env_config->agents_per_map_min = atoi(value);
+    } else if (MATCH("env", "agents_per_map_max")) {
+        env_config->agents_per_map_max = atoi(value);
+    } else if (MATCH("env", "spawn_speed_max")) {
+        env_config->spawn_speed_max = atof(value);
+    } else if (MATCH("env", "spawn_heading_jitter_deg")) {
+        env_config->spawn_heading_jitter_deg = atof(value);
+    } else if (MATCH("env", "wrong_way_frac")) {
+        env_config->wrong_way_frac = atof(value);
+    } else if (MATCH("env", "num_waypoints_max")) {
+        env_config->num_waypoints_max = atoi(value);
+    } else if (MATCH("env", "waypoint_min_dist")) {
+        env_config->waypoint_min_dist = atof(value);
+    } else if (MATCH("env", "waypoint_max_dist")) {
+        env_config->waypoint_max_dist = atof(value);
     } else {
         return 0; // Unknown section/name, indicate failure to handle
     }

@@ -57,6 +57,11 @@ class Drive(pufferlib.PufferEnv):
         init_mode="create_all_valid",
         control_mode="control_vehicles",
         max_controlled_agents=32,
+        # How far a partner can be and still enter the observation, in metres. Was a
+        # hardcoded 50 m in the C loop; the loop now also ranks candidates by distance,
+        # so shrinking this cleanly narrows what the policy sees instead of silently
+        # changing which cars survive truncation.
+        partner_obs_radius=50.0,
         map_dir="resources/drive/binaries/training",
         obs_mode="vector",
         render_road_types=0,
@@ -83,6 +88,7 @@ class Drive(pufferlib.PufferEnv):
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
         self.max_controlled_agents = max_controlled_agents
+        self.partner_obs_radius = partner_obs_radius
 
         # Observation space calculation
         self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}.get(
@@ -92,7 +98,7 @@ class Drive(pufferlib.PufferEnv):
         # Extract observation shapes from constants
         # These need to be defined in C, since they determine the shape of the arrays
         self.max_road_objects = binding.MAX_ROAD_SEGMENT_OBSERVATIONS
-        self.max_partner_objects = binding.MAX_AGENTS - 1
+        self.max_partner_objects = binding.MAX_PARTNER_OBS
         self.partner_features = binding.PARTNER_FEATURES
         self.road_features = binding.ROAD_FEATURES
 
@@ -241,6 +247,7 @@ class Drive(pufferlib.PufferEnv):
                 control_mode=self.control_mode,
                 map_dir=map_dir,
                 max_controlled_agents=self.max_controlled_agents,
+                partner_obs_radius=self.partner_obs_radius,
                 render_mode=render_mode,
                 obs_mode=self._obs_mode_flag,
                 render_road_types=self.render_road_types,
@@ -346,6 +353,7 @@ class Drive(pufferlib.PufferEnv):
                 map_dir=self.map_dir,
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 max_controlled_agents=self.max_controlled_agents,
+                partner_obs_radius=self.partner_obs_radius,
                 render_mode=self.render_mode,
                 obs_mode=self._obs_mode_flag,
                 render_road_types=self.render_road_types,

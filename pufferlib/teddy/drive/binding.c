@@ -71,6 +71,21 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
         fill_render_roads(env);
     }
 
+    // Per-step reward trace. Optional and off in training; see the TEDDY_DBG_* block
+    // in drive.h for the row layout.
+    found = unpack_optional_f32(kwargs, "debug_terms", &data, &count);
+    if (found < 0)
+        return 1;
+    if (found) {
+        if (count % TEDDY_DEBUG_FEATURES != 0) {
+            PyErr_Format(PyExc_ValueError, "debug_terms must be a multiple of TEDDY_DEBUG_FEATURES (%d) long",
+                         TEDDY_DEBUG_FEATURES);
+            return 1;
+        }
+        env->debug_terms = data;
+        env->debug_max_rows = count / TEDDY_DEBUG_FEATURES;
+    }
+
     PyObject *cam = PyDict_GetItemString(kwargs, "render_camera_rgb");
     if (cam != NULL) {
         if (!PyObject_TypeCheck(cam, &PyArray_Type) || PyArray_TYPE((PyArrayObject *)cam) != NPY_UINT8 ||
@@ -179,114 +194,55 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
 }
 
 static PyObject *my_shared(PyObject *self, PyObject *args, PyObject *kwargs) {
-    char *map_dir = unpack_str(kwargs, "map_dir");
     int num_agents = unpack(kwargs, "num_agents");
     int num_maps = unpack(kwargs, "num_maps");
-    int init_mode = unpack(kwargs, "init_mode");
-    int control_mode = unpack(kwargs, "control_mode");
-    int init_steps = unpack(kwargs, "init_steps");
-    int goal_behavior = unpack(kwargs, "goal_behavior");
-    float goal_target_distance = unpack(kwargs, "goal_target_distance");
-    int max_controlled_agents = unpack(kwargs, "max_controlled_agents");
+    int agents_per_map_min = unpack(kwargs, "agents_per_map_min");
+    int agents_per_map_max = unpack(kwargs, "agents_per_map_max");
+    int seed = unpack(kwargs, "seed");
 
-    clock_gettime(CLOCK_REALTIME, &ts);
-    srand(ts.tv_nsec); // Always use random sampling with replacement
+    // ocean loaded every candidate map here just to count how many logged tracks
+    // were controllable. In a Gigaflow scene the agent count is a free parameter, so
+    // the packing is pure arithmetic: no map is touched, which also makes
+    // resample_maps cheap. The seed is honoured (ocean reseeded from the wall clock
+    // and ignored the argument), so a scene layout is reproducible -- which is what
+    // makes the viz.py acceptance render meaningful.
+    if (agents_per_map_min < 1)
+        agents_per_map_min = 1;
+    if (agents_per_map_max > MAX_AGENTS)
+        agents_per_map_max = MAX_AGENTS;
+    if (agents_per_map_max < agents_per_map_min)
+        agents_per_map_max = agents_per_map_min;
 
-    int total_agent_count = 0;
-    int env_count = 0;
+    TeddyRng rng;
+    teddy_rand_seed(&rng, (uint64_t)seed, 0x9E3779B97F4A7C15ULL);
 
     int max_envs = num_agents;
-
-    int maps_checked = 0;
     PyObject *agent_offsets = PyList_New(max_envs + 1);
     PyObject *map_ids = PyList_New(max_envs);
 
-    // Getting env count
+    int total_agent_count = 0;
+    int env_count = 0;
     while (total_agent_count < num_agents && env_count < max_envs) {
-        char map_file[512];
+        int map_id = teddy_rand_int(&rng, 0, num_maps - 1);
+        int n = teddy_rand_int(&rng, agents_per_map_min, agents_per_map_max);
+        if (total_agent_count + n > num_agents)
+            n = num_agents - total_agent_count; // clamp the last scene to fit the budget
+        if (n < 1)
+            break;
 
-        // Always sample randomly with replacement
-        int map_id = rand() % num_maps;
-
-        // printf("Sampling map_id: %d\n", map_id);
-
-        Drive *env = calloc(1, sizeof(Drive));
-        env->init_mode = init_mode;
-        env->control_mode = control_mode;
-        env->init_steps = init_steps;
-        env->goal_behavior = goal_behavior;
-        env->goal_target_distance = goal_target_distance;
-        env->max_controlled_agents = max_controlled_agents;
-        snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
-        env->entities = load_map_binary(map_file, env);
-        // Count the number of controllable agents in map
-        set_active_agents(env);
-
-        // Skip map if it doesn't contain any controllable agents
-        if (env->active_agent_count == 0) {
-            maps_checked++;
-
-            // Safeguard: if we've checked all available maps and found no active agents, raise an error
-            if (maps_checked >= num_maps) {
-                for (int j = 0; j < env->num_entities; j++) {
-                    free_entity(&env->entities[j]);
-                }
-                free(env->entities);
-                free(env->active_agent_indices);
-                free(env->static_agent_indices);
-                free(env->expert_static_agent_indices);
-                free(env->tracks_to_predict_indices);
-                free(env);
-                Py_DECREF(agent_offsets);
-                Py_DECREF(map_ids);
-                char error_msg[256];
-                sprintf(error_msg, "No controllable agents found in any of the %d available maps", num_maps);
-                PyErr_SetString(PyExc_ValueError, error_msg);
-                return NULL;
-            }
-
-            for (int j = 0; j < env->num_entities; j++) {
-                free_entity(&env->entities[j]);
-            }
-            free(env->entities);
-            free(env->active_agent_indices);
-            free(env->static_agent_indices);
-            free(env->expert_static_agent_indices);
-            free(env->tracks_to_predict_indices);
-            free(env);
-            continue;
-        }
-
-        // Store map_id
-        PyObject *map_id_obj = PyLong_FromLong(map_id);
-        PyList_SetItem(map_ids, env_count, map_id_obj);
-        // Store agent offset
-        PyObject *offset = PyLong_FromLong(total_agent_count);
-        PyList_SetItem(agent_offsets, env_count, offset);
-        total_agent_count += env->active_agent_count;
+        PyList_SetItem(map_ids, env_count, PyLong_FromLong(map_id));
+        PyList_SetItem(agent_offsets, env_count, PyLong_FromLong(total_agent_count));
+        total_agent_count += n;
         env_count++;
-        for (int j = 0; j < env->num_entities; j++) {
-            free_entity(&env->entities[j]);
-        }
-        free(env->entities);
-        free(env->active_agent_indices);
-        free(env->static_agent_indices);
-        free(env->tracks_to_predict_indices);
-        free(env->expert_static_agent_indices);
-        free(env);
     }
 
-    if (total_agent_count >= num_agents) {
-        total_agent_count = num_agents;
-    }
-
-    PyObject *final_total_agent_count = PyLong_FromLong(total_agent_count);
-    PyList_SetItem(agent_offsets, env_count, final_total_agent_count);
+    PyList_SetItem(agent_offsets, env_count, PyLong_FromLong(total_agent_count));
     PyObject *final_env_count = PyLong_FromLong(env_count);
 
-    // resize lists
     PyObject *resized_agent_offsets = PyList_GetSlice(agent_offsets, 0, env_count + 1);
     PyObject *resized_map_ids = PyList_GetSlice(map_ids, 0, env_count);
+    Py_DECREF(agent_offsets);
+    Py_DECREF(map_ids);
     PyObject *tuple = PyTuple_New(3);
     PyTuple_SetItem(tuple, 0, resized_agent_offsets);
     PyTuple_SetItem(tuple, 1, resized_map_ids);
@@ -298,6 +254,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->human_agent_idx = unpack(kwargs, "human_agent_idx");
     env->ini_file = unpack_str(kwargs, "ini_file");
     env_init_config conf = {0};
+    env_config_set_teddy_defaults(&conf);
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s", env->ini_file);
     }
@@ -340,6 +297,14 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(partner_obs_radius);
     OVERRIDE_INT(obs_mode);
     OVERRIDE_INT(render_road_types);
+    OVERRIDE_INT(agents_per_map_min);
+    OVERRIDE_INT(agents_per_map_max);
+    OVERRIDE_FLOAT(spawn_speed_max);
+    OVERRIDE_FLOAT(spawn_heading_jitter_deg);
+    OVERRIDE_FLOAT(wrong_way_frac);
+    OVERRIDE_INT(num_waypoints_max);
+    OVERRIDE_FLOAT(waypoint_min_dist);
+    OVERRIDE_FLOAT(waypoint_max_dist);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
@@ -371,6 +336,26 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     // default road-type mask.
     env->obs_mode = conf.obs_mode;
     env->render_road_types = conf.render_road_types;
+    env->agents_per_map_min = conf.agents_per_map_min;
+    env->agents_per_map_max = conf.agents_per_map_max;
+    env->spawn_speed_max = conf.spawn_speed_max;
+    env->spawn_heading_jitter_deg = conf.spawn_heading_jitter_deg;
+    env->wrong_way_frac = conf.wrong_way_frac;
+    env->num_waypoints_max = conf.num_waypoints_max;
+    env->waypoint_min_dist = conf.waypoint_min_dist;
+    env->waypoint_max_dist = conf.waypoint_max_dist;
+
+    char *agent_dist_path = unpack_str(kwargs, "agent_dist_path");
+    if (!agent_dist_load(agent_dist_path)) {
+        PyErr_Format(PyExc_ValueError,
+                     "could not load the agent state distribution from '%s'. Build it with: "
+                     "python data_utils/womd/build_agent_dist.py",
+                     agent_dist_path);
+        free(agent_dist_path);
+        return -1;
+    }
+    free(agent_dist_path);
+
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
@@ -378,6 +363,12 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     char map_file[512];
     snprintf(map_file, sizeof(map_file), "%s/map_%03d.bin", map_dir, map_id);
     env->num_agents = max_agents;
+    // Seed per env, not per process. Every scene draws its own poses, sizes and
+    // routes, so a shared global stream would make scenes correlated and would make
+    // the viz.py acceptance render irreproducible. `map_id` enters the stream id so
+    // two envs handed the same seed but different maps still diverge.
+    int env_seed = (int)unpack(kwargs, "seed");
+    teddy_rand_seed(&env->rng, (uint64_t)env_seed, (uint64_t)(map_id * 2654435761u + 1u));
     env->map_name = strdup(map_file);
     env->init_steps = init_steps;
     env->timestep = init_steps;

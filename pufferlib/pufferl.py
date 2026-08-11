@@ -1514,11 +1514,16 @@ def export(args=None, env_name=None, vecenv=None, policy=None, path=None, silent
 
 
 # Maps a config's `[base] package` onto the module that provides `env_creator`,
-# `vecenv_wrapper` and `torch`. `ocean` and `giga` are in-tree sibling packages --
-# `giga` is a fork of ocean's drive env with Gigaflow-style random initialization.
-# Anything else is looked up under `pufferlib.environments`, which is the path used
-# by external env plugins.
-_IN_TREE_PACKAGES = {"ocean": "pufferlib.ocean", "giga": "pufferlib.giga"}
+# `vecenv_wrapper` and `torch`. `ocean`, `giga` and `teddy` are in-tree sibling
+# packages: `giga` is a fork of ocean's drive env with Gigaflow-style random
+# initialization and its nine-term conditioned reward, and `teddy` takes giga's
+# random initialization with ocean's fixed four-term reward. Anything else is looked
+# up under `pufferlib.environments`, which is the path used by external env plugins.
+_IN_TREE_PACKAGES = {
+    "ocean": "pufferlib.ocean",
+    "giga": "pufferlib.giga",
+    "teddy": "pufferlib.teddy",
+}
 
 
 def _env_module_name(package):

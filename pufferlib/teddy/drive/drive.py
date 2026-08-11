@@ -6,7 +6,7 @@ import struct
 import os
 import pufferlib
 from enum import IntEnum
-from pufferlib.giga.drive import binding
+from pufferlib.teddy.drive import binding
 from multiprocessing import Pool, cpu_count
 from tqdm import tqdm
 
@@ -14,10 +14,10 @@ from tqdm import tqdm
 # The C environment parses its own copy of the config. Anything Python does not
 # forward as an explicit kwarg comes from here, so this must be the same file the
 # trainer loaded -- `load_env` passes the resolved path down as `ini_file`. The
-# default is the packaged giga.ini, resolved against the package rather than the
+# default is the packaged teddy.ini, resolved against the package rather than the
 # working directory so a direct Drive(...) works from anywhere.
 _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_INI_FILE = os.path.join(_PACKAGE_DIR, "config", "giga", "giga.ini")
+DEFAULT_INI_FILE = os.path.join(_PACKAGE_DIR, "config", "teddy", "teddy.ini")
 
 
 # Column layout of the per-step reward trace, in the order drive.h writes it. The
@@ -27,12 +27,6 @@ DEBUG_FEATURE_NAMES = [
     "reward",
     "r_collision",
     "r_offroad",
-    "r_comfort",
-    "r_align",
-    "r_center",
-    "r_velocity",
-    "r_reverse",
-    "r_timestep",
     "r_goal",
     "r_jerk",
     "x",
@@ -46,6 +40,8 @@ DEBUG_FEATURE_NAMES = [
     "jerk_lat",
     "steering",
     "collision_state",
+    # State, not reward: no teddy term pays for lane discipline, but a trace that
+    # cannot say where in the lane the agent was is not worth reading.
     "lane_valid",
     "lane_heading_err",
     "lane_lateral_offset",
@@ -58,27 +54,13 @@ DEBUG_FEATURE_NAMES = [
     "respawn_count",
     "action",
     "timestep",
-    # conditioning.h, in COND_* order
-    "cond_delta_goal",
-    "cond_v_goal",
-    "cond_alpha_collision",
-    "cond_alpha_boundary",
-    "cond_alpha_comfort",
-    "cond_alpha_l_align",
-    "cond_alpha_vel_align",
-    "cond_alpha_l_center",
-    "cond_alpha_center_bias",
-    "cond_alpha_reverse",
-    "cond_c_throttle",
-    "cond_c_steer",
-    "cond_c_acc",
 ]
-assert len(DEBUG_FEATURE_NAMES) == binding.GIGA_DEBUG_FEATURES, (
+assert len(DEBUG_FEATURE_NAMES) == binding.TEDDY_DEBUG_FEATURES, (
     f"DEBUG_FEATURE_NAMES has {len(DEBUG_FEATURE_NAMES)} entries but the C env writes "
-    f"{binding.GIGA_DEBUG_FEATURES} columns. Rebuild the extension or fix the list."
+    f"{binding.TEDDY_DEBUG_FEATURES} columns. Rebuild the extension or fix the list."
 )
 
-# The nine Gigaflow terms plus the classic-dynamics jerk penalty, i.e. every column
+# The three reward terms plus the classic-dynamics jerk penalty, i.e. every column
 # that is a reward contribution rather than state.
 DEBUG_REWARD_TERMS = [n for n in DEBUG_FEATURE_NAMES if n.startswith("r_")]
 
@@ -97,20 +79,25 @@ class Drive(pufferlib.PufferEnv):
         width=1280,
         height=1024,
         human_agent_idx=0,
-        # These mirror config/giga/giga.ini, not config/ocean/drive.ini. The trainer
-        # passes every [env] key as a kwarg, so these only apply to a direct
-        # Drive(...) -- but that is what validate_init.py, viz.py and any ad-hoc
-        # check use, and the ocean-era values silently gave those a different
-        # simulator: classic dynamics, dataset-style control_mode, and a
-        # resample_frequency of 91 that resampled the maps mid-episode.
+        # These mirror config/teddy/teddy.ini. The trainer passes every [env] key as a
+        # kwarg, so they only apply to a direct Drive(...) -- but that is what
+        # validate_init.py, viz.py and any ad-hoc check use, and a default that
+        # disagrees with the ini silently gives those a different simulator.
+        #
+        # Unlike in `giga`, all five reward keys below are live: `teddy` reads them
+        # straight out of the config for every agent, which is what replaces giga's
+        # per-agent conditioning vector.
         reward_vehicle_collision=-0.5,
         reward_offroad_collision=-0.5,
         reward_goal=1.0,
         reward_goal_post_respawn=0.25,
         goal_behavior=0,
         goal_target_distance=30.0,
-        goal_radius=2.0,
-        goal_speed=100.0,
+        # giga randomized these per agent over U(2, 12) m and U(0, 20) m/s
+        # (cond[COND_DELTA_GOAL] / cond[COND_V_GOAL]). Fixed here at the middle of
+        # each range, since there is nothing left to randomize them with.
+        goal_radius=5.0,
+        goal_speed=20.0,
         collision_behavior=0,
         offroad_behavior=0,
         dt=0.1,
@@ -127,6 +114,11 @@ class Drive(pufferlib.PufferEnv):
         init_mode="create_all_valid",
         control_mode="control_agents",
         max_controlled_agents=32,
+        # How far a partner can be and still enter the observation, in metres. Was a
+        # hardcoded 50 m in the C loop; the loop now also ranks candidates by distance,
+        # so shrinking this cleanly narrows what the policy sees instead of silently
+        # changing which cars survive truncation.
+        partner_obs_radius=50.0,
         map_dir="resources/drive/binaries/training",
         obs_mode="vector",
         render_road_types=0,
@@ -167,6 +159,7 @@ class Drive(pufferlib.PufferEnv):
         self.resample_frequency = resample_frequency
         self.dynamics_model = dynamics_model
         self.max_controlled_agents = max_controlled_agents
+        self.partner_obs_radius = partner_obs_radius
         self.agents_per_map_min = agents_per_map_min
         self.agents_per_map_max = agents_per_map_max
         self.spawn_speed_max = spawn_speed_max
@@ -350,6 +343,7 @@ class Drive(pufferlib.PufferEnv):
                 waypoint_min_dist=self.waypoint_min_dist,
                 waypoint_max_dist=self.waypoint_max_dist,
                 max_controlled_agents=self.max_controlled_agents,
+                partner_obs_radius=self.partner_obs_radius,
                 render_mode=render_mode,
                 obs_mode=self._obs_mode_flag,
                 render_road_types=self.render_road_types,
@@ -406,7 +400,7 @@ class Drive(pufferlib.PufferEnv):
 
         Off by default: an unbound buffer costs the C step one NULL test.
         """
-        n_feat = binding.GIGA_DEBUG_FEATURES
+        n_feat = binding.TEDDY_DEBUG_FEATURES
         self.debug_terms = np.zeros((self.num_agents, n_feat), dtype=np.float32)
         for i, env_id in enumerate(self.env_ids):
             cur = self.agent_offsets[i]
@@ -489,6 +483,7 @@ class Drive(pufferlib.PufferEnv):
                 waypoint_max_dist=self.waypoint_max_dist,
                 termination_mode=(int(self.termination_mode) if self.termination_mode is not None else 0),
                 max_controlled_agents=self.max_controlled_agents,
+                partner_obs_radius=self.partner_obs_radius,
                 render_mode=self.render_mode,
                 obs_mode=self._obs_mode_flag,
                 render_road_types=self.render_road_types,
@@ -536,13 +531,13 @@ class Drive(pufferlib.PufferEnv):
         frame than the agents.
         """
         env_id = self.env_ids[env_index]
-        n_agents, n_polys, n_pts = binding.giga_scene_sizes(env_id)
-        feat = binding.GIGA_SNAPSHOT_AGENT_FEATURES
+        n_agents, n_polys, n_pts = binding.teddy_scene_sizes(env_id)
+        feat = binding.TEDDY_SNAPSHOT_AGENT_FEATURES
         # numpy rejects zero-length buffers downstream; keep at least one slot.
         agents = np.zeros((max(n_agents, 1), feat), dtype=np.float32)
         road_xy = np.zeros((max(n_pts, 1), 2), dtype=np.float32)
         road_meta = np.zeros((max(n_polys, 1), 2), dtype=np.int32)
-        binding.giga_scene_dump(env_id, agents, road_xy, road_meta)
+        binding.teddy_scene_dump(env_id, agents, road_xy, road_meta)
         return dict(
             map_id=int(self.map_ids[env_index]),
             agents=agents[:n_agents],

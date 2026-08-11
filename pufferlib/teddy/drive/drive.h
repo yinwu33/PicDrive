@@ -13,6 +13,7 @@
 #include "rlgl.h"
 #include <time.h>
 #include "error.h"
+#include "teddy_random.h"
 
 // Render modes
 #define RENDER_WINDOW 0
@@ -94,17 +95,25 @@
 #define PARTNER_OBS_RADIUS_DEFAULT 50.0f
 
 
+// Up to 3 intermediate waypoints (Gigaflow N_wp ~ U{0,3}) plus the final goal.
+#define MAX_WAYPOINTS 4
+
 // Maximum number of agents per scene
 #ifndef MAX_AGENTS
-#define MAX_AGENTS 32
+#define MAX_AGENTS 128
 #endif
-// How many *other* agents reach the vector observation. Every agent in the scene but
-// the ego fits here, so the budget only ever binds on the fullest scenes -- but it
-// does bind, and the partner loop ranks by distance so that when it does, the cars
-// that get dropped are the far ones. `teddy` defines the same constant at the same
-// value, which is what keeps a checkpoint loadable in both.
+// How many *other* agents reach the vector observation. Decoupled from MAX_AGENTS so
+// the observation width does not follow the traffic density -- giga uses Gigaflow's
+// N_o = 20 here as its partial-observability mechanism.
+//
+// 31 rather than 20 so that the observation is the same width as ocean's, which is
+// MAX_AGENTS - 1 = 31 there. That is the whole reason for the number: with both envs
+// on jerk dynamics, a policy trained on puffer_drive loads into puffer_teddy and back
+// without adapting a single tensor. Change this and that stops being true.
+//
+// The camera env observes no partners at all, so this only affects puffer_teddy.
 #ifndef MAX_PARTNER_OBS
-#define MAX_PARTNER_OBS (MAX_AGENTS - 1)
+#define MAX_PARTNER_OBS 31
 #endif
 #define STOP_AGENT 1
 #define REMOVE_AGENT 2
@@ -113,7 +122,9 @@
 #define ROAD_FEATURES_ONEHOT 13
 #define PARTNER_FEATURES 7
 
-// Ego features depend on dynamics model
+// Ego features depend on dynamics model. Plain ocean widths: `teddy` has no
+// per-agent conditioning to append, because its reward weights are the same fixed
+// config values for every agent.
 #define EGO_FEATURES_CLASSIC 8
 #define EGO_FEATURES_JERK 11
 
@@ -268,6 +279,11 @@ struct Entity {
     float heading_y;
     int current_lane_idx;
     int valid;
+    // The step a recycled agent was re-placed on, or -1 if it never was. In `teddy`
+    // this is a record, not a state: unlike `ocean`, nothing gates visibility or
+    // collision on it, because a respawned agent here is a full road user from the
+    // next step onward. Its only reader is the ego observation, which raises a flag
+    // for exactly the one step on which the pose jumped.
     int respawn_timestep;
     int respawn_count;
     int collided_before_goal;
@@ -278,6 +294,29 @@ struct Entity {
     int stopped;
     int removed;
 
+    // Frenet state against the nearest lane centerline, filled by
+    // compute_agent_metrics: signed heading error and signed lateral offset (positive
+    // to the left of travel). No reward term reads these -- `teddy` pays only for
+    // collisions, off-road and goals -- but the debug trace does, and "how far from
+    // the lane centre was it when it hit something" is the first question a trace has
+    // to answer. One atan2 per agent per step, against a neighbour sweep that already
+    // costs far more.
+    float lane_heading_error;
+    float lane_lateral_offset;
+    int lane_valid;
+
+    // Gigaflow route: waypoints[0..num_waypoints-1] are visited in order, the last
+    // one being the final goal. goal_position_x/y always mirrors the *current*
+    // target so every existing consumer (observations, reward, renderer) keeps
+    // working unchanged.
+    float waypoints[MAX_WAYPOINTS][2];
+    int num_waypoints;
+    int current_waypoint;
+    // Where this agent was spawned, kept so a respawn can start a fresh route from
+    // the lane graph rather than from the dataset trajectory.
+    int spawn_lane;
+    float spawn_s;
+
     // Jerk dynamics
     float a_long;
     float a_lat;
@@ -286,6 +325,10 @@ struct Entity {
     float steering_angle;
     float wheelbase;
 };
+
+#include "teddy_random.h"
+#include "lanegraph.h"
+#include "agent_dist.h"
 
 void free_entity(Entity *entity) {
     // free trajectory arrays
@@ -343,6 +386,52 @@ struct GridMap {
     int *neighbor_cache_count;               // number of entities in each cells neighbor cache
     GridMapEntity **neighbor_cache_entities; // preallocated array to hold neighbor entities
 };
+
+// ---------------------------------------------------------------------------
+// Per-step reward trace (debug only)
+//
+// The four reward terms are summed into one float before they reach `rewards[]`, so
+// a run that drives badly says nothing about *which* term it is answering -- which
+// is exactly the question when goal progress and collision rate rise together. When
+// Python binds a `debug_terms` buffer through env_put, the reward loop writes one
+// row per agent per step: every term separately, plus the state each term is
+// computed from, so the sum can be checked against the reward the trainer actually
+// saw. Unbound (the default, including in training) the whole mechanism costs one
+// NULL test per step.
+//
+// The lane columns are state, not reward: nothing in `teddy` pays for lane
+// discipline, but a trace that cannot say where in the lane the agent was is not
+// worth reading.
+// ---------------------------------------------------------------------------
+#define TEDDY_DBG_REWARD 0 // total for this step; equals rewards[i]
+#define TEDDY_DBG_R_COLLISION 1
+#define TEDDY_DBG_R_OFFROAD 2
+#define TEDDY_DBG_R_GOAL 3
+#define TEDDY_DBG_R_JERK 4 // classic dynamics only; 0 under jerk
+#define TEDDY_DBG_X 5
+#define TEDDY_DBG_Y 6
+#define TEDDY_DBG_HEADING 7
+#define TEDDY_DBG_SPEED 8
+#define TEDDY_DBG_SIGNED_V 9
+#define TEDDY_DBG_A_LONG 10
+#define TEDDY_DBG_A_LAT 11
+#define TEDDY_DBG_JERK_LONG 12
+#define TEDDY_DBG_JERK_LAT 13
+#define TEDDY_DBG_STEERING 14
+#define TEDDY_DBG_COLLISION_STATE 15 // 0 none, 1 vehicle, 2 offroad
+#define TEDDY_DBG_LANE_VALID 16
+#define TEDDY_DBG_LANE_HEADING_ERR 17
+#define TEDDY_DBG_LANE_LATERAL_OFFSET 18
+#define TEDDY_DBG_LANE_ALIGNED 19
+#define TEDDY_DBG_DIST_TO_GOAL 20
+#define TEDDY_DBG_CURRENT_WAYPOINT 21
+#define TEDDY_DBG_NUM_WAYPOINTS 22
+#define TEDDY_DBG_GOALS_REACHED 23 // cumulative over the agent's life
+#define TEDDY_DBG_REACHED_FINAL 24 // final goal hit on this step
+#define TEDDY_DBG_RESPAWN_COUNT 25
+#define TEDDY_DBG_ACTION 26
+#define TEDDY_DBG_TIMESTEP 27
+#define TEDDY_DEBUG_FEATURES (TEDDY_DBG_TIMESTEP + 1)
 
 struct Drive {
     Client *client;
@@ -407,6 +496,19 @@ struct Drive {
     // config means "use the 50 m default" -- see PARTNER_OBS_RADIUS_DEFAULT.
     float partner_obs_radius;
 
+    // Gigaflow-style random initialization. Unlike ocean's env this is not optional:
+    // agents are always placed by sampling the lane graph, never from logged tracks.
+    LaneGraph lane_graph;
+    TeddyRng rng;
+    int agents_per_map_min;
+    int agents_per_map_max;
+    float spawn_speed_max;
+    float spawn_heading_jitter_deg;
+    float wrong_way_frac;
+    int num_waypoints_max;
+    float waypoint_min_dist;
+    float waypoint_max_dist;
+
     // Perspective rendering (Pictura). Buffers are owned by Python and handed in
     // through the binding, so the rasterizer reads them without a copy.
     int obs_mode;
@@ -433,6 +535,11 @@ struct Drive {
     // which case the panels fall back to an index.
     char *render_camera_names;
     int render_camera_name_stride;
+
+    // Per-step reward trace. Owned by Python, NULL unless env_put was handed a
+    // `debug_terms` array; see the TEDDY_DBG_* block above for the row layout.
+    float *debug_terms;
+    int debug_max_rows;
 };
 
 // Single source of truth for the observation stride. In RENDER_STATE mode the
@@ -481,8 +588,11 @@ void add_log(Drive *env) {
         if (!offroad && !collided && frac_goal_reached < 1.0f) {
             env->log.dnf_rate += 1.0f;
         }
-        int lane_aligned = env->logs[i].lane_alignment_rate;
-        env->log.lane_alignment_rate += lane_aligned;
+        // Time average over the agent's own step count, which is the episode length
+        // for every agent here (respawn recycles an agent, it does not end it).
+        float steps = env->logs[i].episode_length;
+        if (steps > 0.0f)
+            env->log.lane_alignment_rate += env->logs[i].lane_alignment_rate / steps;
         env->log.speed_at_goal += env->logs[i].speed_at_goal;
         env->log.episode_length += env->logs[i].episode_length;
         env->log.episode_return += env->logs[i].episode_return;
@@ -1081,17 +1191,18 @@ int collision_check(Drive *env, int agent_idx) {
     if (agent->x == INVALID_POSITION)
         return -1;
 
-    // Skip collision checking for pedestrians because they are often too
-    // close to other entities at initialization.
-    if (agent->type == PEDESTRIAN)
-        return -1;
+    // ocean skips pedestrians here because dataset-driven init drops them onto
+    // sidewalks already overlapping other entities. Gigaflow init has no such
+    // pedestrians: every controlled agent is rejection-sampled onto the lane graph,
+    // routed over it and driven with the same bicycle model, so the type only
+    // selects a silhouette. Exempting it produced ~15% of traffic that could drive
+    // through cars and off the road for free while still collecting the lane and
+    // goal rewards -- and, because pedestrians stayed valid collision *targets*,
+    // charging the vehicles they hit for it.
 
     int car_collided_with_index = -1;
 
-    if (agent->respawn_timestep != -1)
-        return car_collided_with_index; // Skip respawning entities
-
-    for (int i = 0; i < MAX_AGENTS; i++) {
+    for (int i = 0; i < env->num_actors; i++) {
         int index = -1;
         if (i < env->active_agent_count) {
             index = env->active_agent_indices[i];
@@ -1103,8 +1214,6 @@ int collision_check(Drive *env, int agent_idx) {
         if (index == agent_idx)
             continue;
         Entity *entity = &env->entities[index];
-        if (entity->respawn_timestep != -1)
-            continue; // Skip respawning entities
         float x1 = entity->x;
         float y1 = entity->y;
         float dist = ((x1 - agent->x) * (x1 - agent->x) + (y1 - agent->y) * (y1 - agent->y));
@@ -1236,8 +1345,9 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         Entity *entity;
         entity = &env->entities[entity_list[i].entity_idx];
 
-        // Check for offroad collision with road edges (only for vehicles and cyclists)
-        if (entity->type == ROAD_EDGE && agent->type != PEDESTRIAN) {
+        // Check for offroad collision with road edges. Applies to every controlled
+        // agent, pedestrians included: see the note in collision_check.
+        if (entity->type == ROAD_EDGE) {
             int geometry_idx = entity_list[i].geometry_idx;
             float start[2] = {entity->traj_x[geometry_idx], entity->traj_y[geometry_idx]};
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
@@ -1285,20 +1395,46 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     if (min_distance > 4.0f || closest_lane_entity_idx == -1) {
         agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f;
         agent->current_lane_idx = -1;
+        agent->lane_valid = 0;
+        agent->lane_heading_error = 0.0f;
+        agent->lane_lateral_offset = 0.0f;
     } else {
         agent->current_lane_idx = closest_lane_entity_idx;
         int lane_aligned =
             check_lane_aligned(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
         agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
+
+        // Frenet frame of the closest segment: heading error wrapped to [-pi, pi] and
+        // lateral offset signed by which side of the lane the agent sits on (positive
+        // left). The sign matters -- alpha_center_bias picks a side, so an unsigned
+        // offset would make the left and right halves of the lane indistinguishable.
+        Entity *lane = &env->entities[closest_lane_entity_idx];
+        int g = closest_lane_geometry_idx;
+        float sx = lane->traj_x[g], sy = lane->traj_y[g];
+        float dx = lane->traj_x[g + 1] - sx, dy = lane->traj_y[g + 1] - sy;
+        float seg_len = sqrtf(dx * dx + dy * dy);
+        if (seg_len > 1e-6f) {
+            dx /= seg_len;
+            dy /= seg_len;
+            float err = agent->heading - atan2f(dy, dx);
+            while (err > (float)M_PI)
+                err -= 2.0f * (float)M_PI;
+            while (err < -(float)M_PI)
+                err += 2.0f * (float)M_PI;
+            agent->lane_heading_error = err;
+            agent->lane_lateral_offset = -dy * (agent->x - sx) + dx * (agent->y - sy);
+            agent->lane_valid = 1;
+        } else {
+            agent->lane_valid = 0;
+            agent->lane_heading_error = 0.0f;
+            agent->lane_lateral_offset = 0.0f;
+        }
     }
 
-    // Check for vehicle collisions (skip for pedestrians)
-    int car_collided_with_index = -1;
-    if (agent->type != PEDESTRIAN) {
-        car_collided_with_index = collision_check(env, agent_idx);
-        if (car_collided_with_index != -1)
-            collided = VEHICLE_COLLISION;
-    }
+    // Check for vehicle collisions
+    int car_collided_with_index = collision_check(env, agent_idx);
+    if (car_collided_with_index != -1)
+        collided = VEHICLE_COLLISION;
 
     agent->collision_state = collided;
 
@@ -1328,6 +1464,384 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     return;
 }
 
+// ---------------------------------------------------------------------------
+// Gigaflow-style random initialization
+//
+// Replaces the dataset-driven placement entirely: no logged track supplies a pose,
+// a size or a goal. Agents are drawn from the WOMD state distribution, placed by
+// rejection sampling along the lane graph, and routed over it.
+// ---------------------------------------------------------------------------
+
+#define TEDDY_SPAWN_ATTEMPTS 48
+#define TEDDY_SPAWN_GAP 1.5f // metres of clear space required between footprints
+
+// True if the agent's box crosses a road edge. Spawning happens on lane centerlines,
+// so "outside the road" is not a failure mode that needs testing; what this catches
+// is a footprint wide or long enough to straddle a curb, which is a real outcome
+// once sizes are sampled independently of the lane that hosts them.
+static int teddy_is_offroad(Drive *env, Entity *agent) {
+    if (agent->type == PEDESTRIAN)
+        return 0; // pedestrians are exempt from offroad everywhere else too
+    float half_length = agent->length / 2.0f;
+    float half_width = agent->width / 2.0f;
+    float ch = agent->heading_x;
+    float sh = agent->heading_y;
+    float corners[4][2];
+    for (int i = 0; i < 4; i++) {
+        corners[i][0] = agent->x + (offsets[i][0] * half_length * ch - offsets[i][1] * half_width * sh);
+        corners[i][1] = agent->y + (offsets[i][0] * half_length * sh + offsets[i][1] * half_width * ch);
+    }
+    GridMapEntity entity_list[MAX_ENTITIES_PER_CELL * 25];
+    int list_size =
+        checkNeighbors(env, agent->x, agent->y, entity_list, MAX_ENTITIES_PER_CELL * 25, collision_offsets, 25);
+    for (int i = 0; i < list_size; i++) {
+        if (entity_list[i].entity_idx == -1)
+            continue;
+        Entity *e = &env->entities[entity_list[i].entity_idx];
+        if (e->type != ROAD_EDGE)
+            continue;
+        int g = entity_list[i].geometry_idx;
+        float start[2] = {e->traj_x[g], e->traj_y[g]};
+        float end[2] = {e->traj_x[g + 1], e->traj_y[g + 1]};
+        for (int k = 0; k < 4; k++)
+            if (check_line_intersection(corners[k], corners[(k + 1) % 4], start, end))
+                return 1;
+    }
+    return 0;
+}
+
+// Slack in metres between this footprint at (x, y) and the nearest already-placed
+// agent: negative means they overlap. Circumscribed radii keep it heading-agnostic,
+// which is what lets the caller score a candidate before committing to it.
+static float teddy_clearance(Drive *env, int agent_idx, float x, float y, int count) {
+    Entity *a = &env->entities[agent_idx];
+    float ra = 0.5f * sqrtf(a->length * a->length + a->width * a->width);
+    float best = 1e30f;
+    for (int j = 0; j < count; j++) {
+        if (j == agent_idx)
+            continue;
+        Entity *o = &env->entities[j];
+        if (o->removed)
+            continue;
+        float dx = o->x - x, dy = o->y - y;
+        float ro = 0.5f * sqrtf(o->length * o->length + o->width * o->width);
+        float slack = sqrtf(dx * dx + dy * dy) - (ra + ro + TEDDY_SPAWN_GAP);
+        if (slack < best)
+            best = slack;
+    }
+    return best;
+}
+
+// True if this agent's box, at its current pose, intersects any already-placed one.
+//
+// teddy_clearance uses circumscribed circles, which is the right thing to *rank*
+// candidates by but the wrong thing to accept on: two cars abreast in neighbouring
+// lanes have intersecting circles and perfectly disjoint boxes. Accepting on circles
+// makes dense maps unplaceable and forces the best-effort fallback, which is where the
+// real overlaps came from. The circle test survives as a cheap reject in front of the
+// same oriented-box check the simulator's own collision detection uses.
+static int teddy_overlaps_any(Drive *env, int agent_idx, int count) {
+    Entity *a = &env->entities[agent_idx];
+    float ra = 0.5f * sqrtf(a->length * a->length + a->width * a->width);
+    for (int j = 0; j < count; j++) {
+        if (j == agent_idx)
+            continue;
+        Entity *o = &env->entities[j];
+        if (o->removed)
+            continue;
+        float dx = o->x - a->x, dy = o->y - a->y;
+        float ro = 0.5f * sqrtf(o->length * o->length + o->width * o->width);
+        float reach = ra + ro;
+        if (dx * dx + dy * dy > reach * reach)
+            continue;
+        if (check_aabb_collision(a, o))
+            return 1;
+    }
+    return 0;
+}
+
+// Waypoint chain: N_wp ~ U{0, num_waypoints_max} intermediate points plus a final
+// goal, each one a random forward walk further along the lane graph.
+//
+// Gigaflow spaces waypoints 20-200 m apart. That upper bound assumes CARLA towns
+// with 4-40 km of lane; a WOMD crop is ~274 m across and a random walk covers 168 m
+// on average, so a 200 m draw would land in the paper's constraint-relaxation branch
+// most of the time. The bound is configurable and defaults to 80 m instead. Walks
+// that dead-end short (usually at the map boundary) end the chain, which is the
+// relaxation behaviour the paper describes.
+static void teddy_sample_route(Drive *env, int agent_idx) {
+    Entity *a = &env->entities[agent_idx];
+    LaneGraph *lg = &env->lane_graph;
+    a->num_waypoints = 0;
+    a->current_waypoint = 0;
+
+    if (lg->num_lanes == 0) {
+        a->waypoints[0][0] = a->x;
+        a->waypoints[0][1] = a->y;
+        a->num_waypoints = 1;
+    } else {
+        int n_wp = teddy_rand_int(&env->rng, 0, env->num_waypoints_max) + 1; // + final goal
+        if (n_wp > MAX_WAYPOINTS)
+            n_wp = MAX_WAYPOINTS;
+        int lane = a->spawn_lane;
+        float s = a->spawn_s;
+        for (int i = 0; i < n_wp; i++) {
+            float want = teddy_rand_range(&env->rng, env->waypoint_min_dist, env->waypoint_max_dist);
+            int next_lane;
+            float next_s;
+            float got = lane_walk_forward(lg, &env->rng, lane, s, want, &next_lane, &next_s);
+            // Commit only if the walk actually moved. Appending regardless would stack
+            // waypoints on the same spot every time a walk starts at a dead end -- and
+            // a final goal coincident with the waypoint before it is reached for free.
+            if (got < 1.0f)
+                break;
+            float x, y, h;
+            lane_pose_at(lg, env->entities, next_lane, next_s, &x, &y, &h);
+            a->waypoints[a->num_waypoints][0] = x;
+            a->waypoints[a->num_waypoints][1] = y;
+            a->num_waypoints++;
+            lane = next_lane;
+            s = next_s;
+        }
+
+        // Spawned somewhere with no room to move forward at all (the end of a lane
+        // that leaves the map crop). Fall back to a goal elsewhere on the network
+        // rather than leaving the agent with none: Gigaflow samples the first goal
+        // uniformly over the map anyway, so a goal that is not lane-reachable from
+        // here is within the spirit of the design.
+        if (a->num_waypoints == 0) {
+            int lane2;
+            float s2, x, y, h;
+            if (sample_lane_point(lg, &env->rng, &lane2, &s2)) {
+                lane_pose_at(lg, env->entities, lane2, s2, &x, &y, &h);
+                a->waypoints[0][0] = x;
+                a->waypoints[0][1] = y;
+            } else {
+                a->waypoints[0][0] = a->x;
+                a->waypoints[0][1] = a->y;
+            }
+            a->num_waypoints = 1;
+        }
+    }
+
+    // goal_position_* always mirrors the *current* waypoint, so every existing
+    // consumer -- the ego observation, the goal reward, the renderer -- keeps working
+    // without knowing routes exist.
+    a->goal_position_x = a->waypoints[0][0];
+    a->goal_position_y = a->waypoints[0][1];
+    a->goal_position_z = 0.0f;
+    a->init_goal_x = a->waypoints[0][0];
+    a->init_goal_y = a->waypoints[0][1];
+    a->goals_sampled_this_episode += 1.0f;
+}
+
+// Draws this agent's embodiment and pose. `count` is how many entries of
+// env->entities are already placed and should be avoided.
+static void teddy_place_agent(Drive *env, int agent_idx, int count) {
+    Entity *a = &env->entities[agent_idx];
+    LaneGraph *lg = &env->lane_graph;
+
+    // Size first: the clearance test needs the footprint.
+    agent_dist_sample(&env->rng, &a->type, &a->length, &a->width, &a->height);
+    a->lane_valid = 0;
+    a->lane_heading_error = 0.0f;
+    a->lane_lateral_offset = 0.0f;
+    a->wheelbase = 0.6f * a->length;
+    a->removed = 0;
+    a->stopped = 0;
+
+    if (lg->num_lanes == 0) {
+        // Cannot happen on the WOMD corpus (all 10000 maps carry >= 2 lanes), but a
+        // silently stacked scene would be far worse than an obviously absent agent.
+        a->removed = 1;
+        a->x = a->y = INVALID_POSITION;
+        a->num_waypoints = 0;
+        return;
+    }
+
+    float jitter = env->spawn_heading_jitter_deg * (float)M_PI / 180.0f;
+    float best_x = 0.0f, best_y = 0.0f, best_h = 0.0f, best_s = 0.0f, best_score = -1e30f;
+    int best_lane = 0;
+
+    for (int attempt = 0; attempt < TEDDY_SPAWN_ATTEMPTS; attempt++) {
+        int lane;
+        float s;
+        if (!sample_lane_point(lg, &env->rng, &lane, &s))
+            break;
+        float x, y, h;
+        lane_pose_at(lg, env->entities, lane, s, &x, &y, &h);
+        h += teddy_rand_normal(&env->rng) * jitter;
+        if (teddy_rand_float(&env->rng) < env->wrong_way_frac)
+            h += (float)M_PI;
+
+        float clear = teddy_clearance(env, agent_idx, x, y, count);
+
+        // Prefer somewhere with road ahead. An agent dropped within a metre of a
+        // terminal lane end -- the map crop boundary -- has no route to generate, and
+        // teddy_sample_route then has to fall back to a goal it cannot reach by
+        // following lanes. Scoring it down here is cheaper than repairing it later,
+        // and it reuses the rejection loop that is already running.
+        const Lane *cand = &lg->lanes[lane];
+        int dead_end = (cand->num_succ == 0 && (cand->length - s) < env->waypoint_min_dist);
+
+        // Provisional placement so the offroad test sees the real oriented box.
+        a->x = x;
+        a->y = y;
+        a->heading = h;
+        a->heading_x = cosf(h);
+        a->heading_y = sinf(h);
+        // Ranking for the fallback, when no attempt turns out fully legal. The
+        // penalties are ordered by how bad the outcome actually is: starting inside a
+        // wall is unrecoverable, starting inside another car costs an immediate
+        // collision, and a dead-end spawn merely yields a goal that has to be sampled
+        // elsewhere. They are far larger than any clearance value (bounded by a few
+        // metres) so the ordering is strict and clearance only breaks ties.
+        int offroad = teddy_is_offroad(env, a);
+        int overlap = teddy_overlaps_any(env, agent_idx, count);
+        float score = clear - (offroad ? 1000.0f : 0.0f) - (overlap ? 200.0f : 0.0f) - (dead_end ? 50.0f : 0.0f);
+
+        if (score > best_score) {
+            best_score = score;
+            best_x = x;
+            best_y = y;
+            best_h = h;
+            best_lane = lane;
+            best_s = s;
+        }
+        // Accept as soon as the pose is legal: on the road, with road ahead, and not
+        // inside anyone.
+        if (!offroad && !overlap && !dead_end)
+            break;
+    }
+
+    // The agent count per scene is fixed by my_shared before any map is read, and
+    // Python has already sized the observation slice to match, so a map too small to
+    // hold them all must still yield exactly that many agents. Falling back to the
+    // roomiest candidate degrades density rather than breaking the contract.
+    // Gigaflow can instead shrink the set, because it picks the count after placing.
+    a->x = best_x;
+    a->y = best_y;
+    a->z = 0.0f;
+    a->heading = best_h;
+    a->heading_x = cosf(best_h);
+    a->heading_y = sinf(best_h);
+    a->spawn_lane = best_lane;
+    a->spawn_s = best_s;
+
+    float speed = teddy_rand_range(&env->rng, 0.0f, env->spawn_speed_max);
+    a->vx = speed * a->heading_x;
+    a->vy = speed * a->heading_y;
+    a->vz = 0.0f;
+
+    a->valid = 1;
+    a->collision_state = 0;
+    a->respawn_timestep = -1;
+    a->current_goal_reached = 0;
+    a->collided_before_goal = 0;
+    a->a_long = 0.0f;
+    a->a_lat = 0.0f;
+    a->jerk_long = 0.0f;
+    a->jerk_lat = 0.0f;
+    a->steering_angle = 0.0f;
+    for (int m = 0; m < 4; m++)
+        a->metrics_array[m] = 0.0f;
+
+    // Keep the one-sample trajectory in step with the spawn pose; a few helpers
+    // (renderer traces, the WOSAC export) still read traj_*[0].
+    a->traj_x[0] = a->x;
+    a->traj_y[0] = a->y;
+    a->traj_z[0] = a->z;
+    a->traj_vx[0] = a->vx;
+    a->traj_vy[0] = a->vy;
+    a->traj_vz[0] = a->vz;
+    a->traj_heading[0] = a->heading;
+    a->traj_valid[0] = 1;
+
+    teddy_sample_route(env, agent_idx);
+}
+
+// Discards the logged tracks and puts `n_agents` blank synthetic agents in their
+// place. Roads are carried over untouched, and the "objects first, roads second"
+// layout is preserved so every downstream loop keeps working unchanged.
+static void teddy_build_agents(Drive *env, int n_agents) {
+    if (n_agents < 1)
+        n_agents = 1;
+    if (n_agents > MAX_AGENTS)
+        n_agents = MAX_AGENTS;
+
+    int num_roads = env->num_entities - env->num_objects;
+    Entity *fresh = (Entity *)calloc((size_t)(n_agents + num_roads), sizeof(Entity));
+    memcpy(&fresh[n_agents], &env->entities[env->num_objects], (size_t)num_roads * sizeof(Entity));
+
+    // Only the logged tracks are freed; the roads' polyline arrays are now owned by
+    // `fresh`, so freeing the whole old array here would be a double free.
+    for (int i = 0; i < env->num_objects; i++)
+        free_entity(&env->entities[i]);
+    free(env->entities);
+
+    for (int i = 0; i < n_agents; i++) {
+        Entity *a = &fresh[i];
+        a->id = i;
+        a->type = VEHICLE; // replaced by agent_dist_sample when placed
+        // A one-sample trajectory rather than NULL: several helpers still index
+        // traj_*[0], and a length-1 array lets them read the spawn pose instead of
+        // dereferencing NULL.
+        a->array_size = 1;
+        a->traj_x = (float *)calloc(1, sizeof(float));
+        a->traj_y = (float *)calloc(1, sizeof(float));
+        a->traj_z = (float *)calloc(1, sizeof(float));
+        a->traj_vx = (float *)calloc(1, sizeof(float));
+        a->traj_vy = (float *)calloc(1, sizeof(float));
+        a->traj_vz = (float *)calloc(1, sizeof(float));
+        a->traj_heading = (float *)calloc(1, sizeof(float));
+        a->traj_valid = (int *)calloc(1, sizeof(int));
+        a->traj_valid[0] = 1;
+        a->valid = 1;
+        a->respawn_timestep = -1;
+        a->current_lane_idx = -1;
+        a->length = 4.7f;
+        a->width = 2.1f;
+        a->height = 1.7f;
+    }
+
+    env->entities = fresh;
+    env->num_objects = n_agents;
+    env->num_roads = num_roads;
+    env->num_entities = n_agents + num_roads;
+    env->sdc_track_index = -1; // a synthetic scene has no logged ego
+}
+
+// Every synthetic agent is policy-controlled. There are no static or expert-replay
+// agents in a Gigaflow scene: nothing is replaying anything.
+static void teddy_set_active_agents(Drive *env) {
+    int n = env->num_objects;
+    env->active_agent_count = n;
+    env->num_actors = n;
+    env->static_agent_count = 0;
+    env->expert_static_agent_count = 0;
+    env->active_agent_indices = (int *)malloc((size_t)n * sizeof(int));
+    for (int i = 0; i < n; i++) {
+        env->active_agent_indices[i] = i;
+        env->entities[i].active_agent = 1;
+    }
+    // c_close frees these unconditionally.
+    env->static_agent_indices = (int *)calloc(1, sizeof(int));
+    env->expert_static_agent_indices = (int *)calloc(1, sizeof(int));
+}
+
+// Sequential rejection sampling, as in Gigaflow App. A.1: place agent i avoiding the
+// i-1 already placed. Sampling a hundred poses jointly and hoping none collide has a
+// vanishing acceptance rate on a map this size.
+static void teddy_spawn_all(Drive *env) {
+    for (int i = 0; i < env->num_objects; i++)
+        teddy_place_agent(env, i, i);
+}
+
+// DEAD IN TEDDY. Reached only from set_active_agents below, which nothing calls:
+// teddy_set_active_agents replaces it and makes every synthesised entity active
+// regardless of type. Kept so the file still reads against ocean's, but note the
+// consequence -- `control_mode` selects nothing here, so CONTROL_VEHICLES does NOT
+// restrict teddy to type == VEHICLE the way it does in ocean.
 bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
     // Check if we have room for more agents or are already at capacity
     if (env->active_agent_count >= control_limit) {
@@ -1377,6 +1891,9 @@ bool should_control_agent(Drive *env, int agent_idx, int control_limit) {
     return distance_to_goal >= MIN_DISTANCE_TO_GOAL;
 }
 
+// DEAD IN TEDDY: superseded by teddy_set_active_agents. This is the dataset-driven
+// selector; it reads traj_valid and the SDC index, neither of which a synthesised
+// Gigaflow scene has.
 void set_active_agents(Drive *env) {
 
     // Initialize
@@ -1481,6 +1998,8 @@ void set_active_agents(Drive *env) {
     return;
 }
 
+// DEAD IN TEDDY: no caller, and it returns immediately unless control_mode is
+// CONTROL_WOSAC, which teddy never uses.
 void remove_bad_trajectories(Drive *env) {
 
     if (env->control_mode != CONTROL_WOSAC) {
@@ -1547,17 +2066,23 @@ void init(Drive *env) {
     if (env->render_road_types == 0)
         env->render_road_types = RENDER_ROAD_TYPES_DEFAULT;
     env->entities = load_map_binary(env->map_name, env);
+    // set_means still centres the map using the logged tracks, before they are
+    // discarded, so teddy and ocean put the same map in the same place.
     set_means(env);
+    teddy_build_agents(env, env->num_agents);
+    // After teddy_build_agents: the graph stores entity indices, and rebuilding the
+    // array moves every road. After set_means: it stores interpolated poses, so it
+    // must be in the same map-centered frame as everything else.
+    build_lane_graph(&env->lane_graph, env->entities, env->num_objects, env->num_entities, ROAD_LANE);
     init_grid_map(env);
     env->grid_map->vision_range = 21; // TODO: Why is this hardcoded?
     init_neighbor_offsets(env);
     cache_neighbor_offsets(env);
     env->logs_capacity = 0;
-    set_active_agents(env);
+    teddy_set_active_agents(env);
     env->logs_capacity = env->active_agent_count;
-    remove_bad_trajectories(env);
-    set_start_position(env);
-    init_goal_positions(env);
+    // Must follow init_grid_map: spawn rejection queries the grid for road edges.
+    teddy_spawn_all(env);
     env->logs = (Log *)calloc(env->active_agent_count, sizeof(Log));
 }
 
@@ -1589,6 +2114,7 @@ void c_close(Drive *env) {
     free(env->grid_map->neighbor_cache_entities);
     free(env->grid_map->neighbor_cache_count);
     free(env->grid_map);
+    free_lane_graph(&env->lane_graph);
     free(env->static_agent_indices);
     free(env->expert_static_agent_indices);
     free(env->ini_file);
@@ -1668,6 +2194,13 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
             steering = STEERING_VALUES[steering_index];
         }
 
+        // Every agent shares one actuation response, as in ocean. Gigaflow randomizes
+        // it per agent (C_throttle / C_steer / C_acc) and hands the draw to the policy
+        // in the observation; here there is no conditioning block to put it in, so a
+        // randomized response would be an unobservable disturbance rather than an
+        // embodiment the policy can adapt to.
+        acceleration = clip(acceleration, -5.0f, 2.5f);
+
         // Current state
         float x = agent->x;
         float y = agent->y;
@@ -1697,6 +2230,18 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         x = x + (new_vx * env->dt);
         y = y + (new_vy * env->dt);
         heading = heading + yaw_rate * env->dt;
+
+        // Realized accelerations. The classic model commands acceleration directly
+        // rather than integrating it, but R_comfort reads a_long/a_lat/jerk_* the
+        // same way in both models, so they have to be maintained here too -- left at
+        // zero the comfort term is identically zero and alpha_comfort is dead.
+        // a_lat is the centripetal term v * yaw_rate, the classic-model counterpart
+        // of the jerk model's v^2 * curvature.
+        float a_lat_new = signed_speed * yaw_rate;
+        agent->jerk_long = (acceleration - agent->a_long) / env->dt;
+        agent->jerk_lat = (a_lat_new - agent->a_lat) / env->dt;
+        agent->a_long = acceleration;
+        agent->a_lat = a_lat_new;
 
         // Apply updates to the agent's state
         agent->x = x;
@@ -1755,13 +2300,28 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         // Calculate new velocity
         float v_dot_heading = agent->vx * agent->heading_x + agent->vy * agent->heading_y;
         float signed_v = copysignf(sqrtf(agent->vx * agent->vx + agent->vy * agent->vy), v_dot_heading);
-        float v_new = signed_v + 0.5f * (a_long_new + agent->a_long) * env->dt;
+        float v_target = signed_v + 0.5f * (a_long_new + agent->a_long) * env->dt;
+        float v_new = v_target;
 
         // Make it easy to stop with 0 vel
-        if (signed_v * v_new < 0) {
+        if (signed_v * v_target < 0) {
             v_new = 0.0f;
         } else {
-            v_new = clip(v_new, -2.0f, 20.0f);
+            v_new = clip(v_target, -2.0f, 20.0f);
+        }
+
+        // A speed the limiter refused is a speed change that did not happen, so the
+        // acceleration behind it did not happen either. Carrying a_long forward
+        // unchanged made it a claim about the vehicle that nothing else agreed with:
+        // held at the -2 m/s reverse floor with a_long = -5, the speed was constant
+        // and jerk_long was zero, yet R_comfort charged the |a_long| > 3 indicator on
+        // every one of those steps and the ego observation reported hard braking. The
+        // state was also absorbing -- the zero-jerk action leaves a_long untouched, so
+        // only ~13 consecutive full-throttle steps could unwind it, and both a random
+        // and a 1.7B-step policy sat in it for 96% of an episode. Nothing accelerates
+        // a vehicle pinned against a limit; the realized value is zero.
+        if (v_new != v_target) {
+            a_long_new = 0.0f;
         }
 
         // Calculate new steering angle
@@ -1875,6 +2435,72 @@ void c_get_road_edge_counts(Drive *env, int *num_polylines_out, int *total_point
     *total_points_out = points;
 }
 
+// Scene snapshot for the visualization acceptance check (pufferlib/teddy/drive/viz.py).
+//
+// Deliberately dumps roads *and* agents from the same env in one call: the simulator
+// works in a map-centered frame (set_means subtracts the map centroid), so a viz that
+// re-parsed the .bin for road geometry would draw the road in a different frame than
+// the agents and the mismatch would look like a spawn bug. Reading both from here
+// makes the two frames the same by construction.
+#define TEDDY_SNAPSHOT_AGENT_FEATURES (11 + 2 * MAX_WAYPOINTS)
+
+// out = {num_agents, num_road_polylines, num_road_points}
+void c_teddy_scene_sizes(Drive *env, int *out) {
+    int polys = 0;
+    int pts = 0;
+    for (int i = env->num_objects; i < env->num_entities; i++) {
+        polys++;
+        pts += env->entities[i].array_size;
+    }
+    out[0] = env->active_agent_count;
+    out[1] = polys;
+    out[2] = pts;
+}
+
+// agents:    float[num_agents][TEDDY_SNAPSHOT_AGENT_FEATURES]
+//            x, y, heading, length, width, height, type, vx, vy,
+//            num_waypoints, current_waypoint, then MAX_WAYPOINTS pairs of (x, y)
+// road_xy:   float[num_road_points][2]
+// road_meta: int[num_road_polylines][2] = {entity type, point count}
+void c_teddy_scene_dump(Drive *env, float *agents, float *road_xy, int *road_meta) {
+    for (int i = 0; i < env->active_agent_count; i++) {
+        Entity *a = &env->entities[env->active_agent_indices[i]];
+        float *row = &agents[(size_t)i * TEDDY_SNAPSHOT_AGENT_FEATURES];
+        row[0] = a->x;
+        row[1] = a->y;
+        row[2] = a->heading;
+        row[3] = a->length;
+        row[4] = a->width;
+        row[5] = a->height;
+        row[6] = (float)a->type;
+        row[7] = a->vx;
+        row[8] = a->vy;
+        row[9] = (float)a->num_waypoints;
+        row[10] = (float)a->current_waypoint;
+        for (int w = 0; w < MAX_WAYPOINTS; w++) {
+            // Pad unused slots with the agent position so a careless consumer draws a
+            // zero-length segment rather than a line to the map origin.
+            int have = w < a->num_waypoints;
+            row[11 + 2 * w] = have ? a->waypoints[w][0] : a->x;
+            row[12 + 2 * w] = have ? a->waypoints[w][1] : a->y;
+        }
+    }
+
+    int poly = 0;
+    size_t pt = 0;
+    for (int i = env->num_objects; i < env->num_entities; i++) {
+        Entity *e = &env->entities[i];
+        road_meta[poly * 2 + 0] = e->type;
+        road_meta[poly * 2 + 1] = e->array_size;
+        poly++;
+        for (int j = 0; j < e->array_size; j++) {
+            road_xy[pt * 2 + 0] = e->traj_x[j];
+            road_xy[pt * 2 + 1] = e->traj_y[j];
+            pt++;
+        }
+    }
+}
+
 void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *lengths_out, char *scenario_ids_out) {
     int poly_idx = 0, pt_idx = 0;
     for (int i = env->num_objects; i < env->num_entities; i++) {
@@ -1976,7 +2602,7 @@ void fill_render_state(Drive *env) {
     int prim_entity[MAX_AGENTS];
     // Same iteration and validity rules as the partner observations above, so the
     // vectorized and perspective modalities see the same set of agents.
-    for (int j = 0; j < MAX_AGENTS && n < cap; j++) {
+    for (int j = 0; j < env->num_actors && n < cap; j++) {
         int index = -1;
         if (j < env->active_agent_count) {
             index = env->active_agent_indices[j];
@@ -1988,7 +2614,7 @@ void fill_render_state(Drive *env) {
         Entity *e = &env->entities[index];
         if (e->type > CYCLIST || e->type == NONE)
             continue;
-        if (e->removed || e->respawn_timestep != -1)
+        if (e->removed)
             continue;
 
         float *out = &env->render_agents[n * RENDER_AGENT_FEATURES];
@@ -2064,11 +2690,11 @@ void compute_observations(Drive *env) {
             obs[7] =
                 (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
             obs[8] = ego_entity->a_lat / JERK_LAT[2];
-            obs[9] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
+            obs[9] = (ego_entity->respawn_timestep == env->timestep) ? 1 : 0;
             // Add normalized entity type (VEHICLE=1, PEDESTRIAN=2, CYCLIST=3)
             obs[10] = ego_entity->type / 3.0f;
         } else {
-            obs[6] = (ego_entity->respawn_timestep != -1) ? 1 : 0;
+            obs[6] = (ego_entity->respawn_timestep == env->timestep) ? 1 : 0;
             obs[7] = ego_entity->type / 3.0f;
         }
 
@@ -2107,10 +2733,6 @@ void compute_observations(Drive *env) {
                 break;
             if (index == env->active_agent_indices[i])
                 continue; // Skip self
-            if (ego_entity->respawn_timestep != -1)
-                continue;
-            if (env->entities[index].respawn_timestep != -1)
-                continue;
             Entity *other_entity = &env->entities[index];
             float dx = other_entity->x - ego_entity->x;
             float dy = other_entity->y - ego_entity->y;
@@ -2297,7 +2919,7 @@ void sample_new_goal(Drive *env, int agent_idx) {
 
 void c_reset(Drive *env) {
     env->timestep = env->init_steps;
-    set_start_position(env);
+    teddy_spawn_all(env);
     for (int x = 0; x < env->active_agent_count; x++) {
         env->logs[x] = (Log){0};
         int agent_idx = env->active_agent_indices[x];
@@ -2305,7 +2927,8 @@ void c_reset(Drive *env) {
         env->entities[agent_idx].respawn_count = 0;
         env->entities[agent_idx].collided_before_goal = 0;
         env->entities[agent_idx].goals_reached_this_episode = 0.0f;
-        // Initialize to 1 because there is one goal in the data file
+        // teddy_spawn_all -> teddy_sample_route already counted this episode's first
+        // goal, so unlike ocean there is no data-file goal to seed here.
         env->entities[agent_idx].goals_sampled_this_episode = 1.0f;
         env->entities[agent_idx].current_goal_reached = 0;
         env->entities[agent_idx].metrics_array[COLLISION_IDX] = 0.0f;
@@ -2326,18 +2949,16 @@ void c_reset(Drive *env) {
 }
 
 void respawn_agent(Drive *env, int agent_idx) {
-    env->entities[agent_idx].x = env->entities[agent_idx].traj_x[0];
-    env->entities[agent_idx].y = env->entities[agent_idx].traj_y[0];
-    env->entities[agent_idx].heading = env->entities[agent_idx].traj_heading[0];
-    env->entities[agent_idx].heading_x = cosf(env->entities[agent_idx].heading);
-    env->entities[agent_idx].heading_y = sinf(env->entities[agent_idx].heading);
-    env->entities[agent_idx].vx = env->entities[agent_idx].traj_vx[0];
-    env->entities[agent_idx].vy = env->entities[agent_idx].traj_vy[0];
-    env->entities[agent_idx].metrics_array[COLLISION_IDX] = 0.0f;
-    env->entities[agent_idx].metrics_array[OFFROAD_IDX] = 0.0f;
-    env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 0.0f;
-    env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX] = 0.0f;
+    // Re-place from the lane graph with a fresh embodiment and route. Avoiding every
+    // other agent (num_objects, not just the ones placed so far) matters here: the
+    // scene is already populated and moving.
+    teddy_place_agent(env, agent_idx, env->num_objects);
 
+    // Stamped, not latched: `teddy_place_agent` already cleared this to -1, and every
+    // consumer other than the ego flag treats the recycled agent as an ordinary one.
+    // Gigaflow keeps agent density constant by recycling, so an agent that is invisible
+    // to the cameras and inert in collision after its first goal would drain the very
+    // traffic the self-play is meant to produce.
     env->entities[agent_idx].respawn_timestep = env->timestep;
     env->entities[agent_idx].collided_before_goal = 0;
     env->entities[agent_idx].stopped = 0;
@@ -2353,6 +2974,10 @@ void c_step(Drive *env) {
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
+    if (env->debug_terms) {
+        int rows = (env->active_agent_count < env->debug_max_rows) ? env->active_agent_count : env->debug_max_rows;
+        memset(env->debug_terms, 0, (size_t)rows * TEDDY_DEBUG_FEATURES * sizeof(float));
+    }
     env->timestep++;
 
     // Move static experts
@@ -2380,6 +3005,8 @@ void c_step(Drive *env) {
             float jerk_penalty = -0.0002f * sqrtf(delta_vx * delta_vx + delta_vy * delta_vy) / env->dt;
             env->rewards[i] += jerk_penalty;
             env->logs[i].episode_return += jerk_penalty;
+            if (env->debug_terms && i < env->debug_max_rows)
+                env->debug_terms[(size_t)i * TEDDY_DEBUG_FEATURES + TEDDY_DBG_R_JERK] = jerk_penalty;
         }
     }
 
@@ -2391,57 +3018,137 @@ void c_step(Drive *env) {
         compute_agent_metrics(env, agent_idx);
         int collision_state = env->entities[agent_idx].collision_state;
 
-        if (collision_state > 0) {
-            if (collision_state == VEHICLE_COLLISION) {
-                env->rewards[i] += env->reward_vehicle_collision;
-                env->logs[i].episode_return += env->reward_vehicle_collision;
-                env->logs[i].collision_rate = 1.0f;
-                env->logs[i].collisions_per_agent += 1.0f;
-            } else if (collision_state == OFFROAD) {
-                env->rewards[i] += env->reward_offroad_collision;
-                env->logs[i].episode_return += env->reward_offroad_collision;
-                env->logs[i].offroad_rate = 1.0f;
-                env->logs[i].offroad_per_agent += 1.0f;
-            }
+        // ocean's reward, unchanged in form: a fixed penalty for hitting a car, a
+        // fixed penalty for leaving the road, and a fixed payment for reaching a
+        // goal. Every weight is a config value shared by the whole fleet -- there is
+        // no per-agent conditioning here, which is the whole point of `teddy`. The
+        // only adaptation is the goal test, which walks the waypoint route `teddy`
+        // inherits from the Gigaflow-style initialization instead of testing a single
+        // dataset goal.
+        Entity *a = &env->entities[agent_idx];
+        float speed = sqrtf(a->vx * a->vx + a->vy * a->vy);
+        float signed_v = copysignf(speed, a->vx * a->heading_x + a->vy * a->heading_y);
+        // One named variable per term rather than a single running sum, so the trace
+        // below can attribute the step's reward.
+        float r_collision = 0.0f, r_offroad = 0.0f, r_goal = 0.0f;
 
-            env->entities[agent_idx].collided_before_goal = 1;
+        if (collision_state == VEHICLE_COLLISION) {
+            r_collision = env->reward_vehicle_collision;
+            env->logs[i].collision_rate = 1.0f;
+            env->logs[i].collisions_per_agent += 1.0f;
+            a->collided_before_goal = 1;
+        } else if (collision_state == OFFROAD) {
+            r_offroad = env->reward_offroad_collision;
+            env->logs[i].offroad_rate = 1.0f;
+            env->logs[i].offroad_per_agent += 1.0f;
+            a->collided_before_goal = 1;
         }
 
-        float distance_to_goal =
-            relative_distance_2d(env->entities[agent_idx].x, env->entities[agent_idx].y,
-                                 env->entities[agent_idx].goal_position_x, env->entities[agent_idx].goal_position_y);
-
-        float current_speed = sqrtf(env->entities[agent_idx].vx * env->entities[agent_idx].vx +
-                                    env->entities[agent_idx].vy * env->entities[agent_idx].vy);
-
-        // Reward agent if it is within X meters of goal and speed is below threshold
+        float distance_to_goal = relative_distance_2d(a->x, a->y, a->goal_position_x, a->goal_position_y);
         bool within_distance = distance_to_goal < env->goal_radius;
-        bool within_speed = current_speed <= env->goal_speed;
+        bool within_speed = speed <= env->goal_speed;
+        // Only the final goal has to be reached at low speed. Intermediate waypoints
+        // are drive-through: they mark a route, and stopping on each one would make a
+        // three-waypoint route a different task from a one-waypoint route.
+        int is_final = (a->current_waypoint >= a->num_waypoints - 1);
 
-        if (within_distance && within_speed && !env->entities[agent_idx].current_goal_reached) {
-            if (env->goal_behavior == GOAL_RESPAWN && env->entities[agent_idx].respawn_timestep != -1) {
-                env->rewards[i] += env->reward_goal_post_respawn;
-                env->logs[i].episode_return += env->reward_goal_post_respawn;
-                env->entities[agent_idx].current_goal_reached = 1;
-            } else if (env->goal_behavior == GOAL_GENERATE_NEW && (!env->entities[agent_idx].current_goal_reached)) {
-                env->rewards[i] += env->reward_goal;
-                env->logs[i].episode_return += env->reward_goal;
+        if (within_distance && !a->current_goal_reached && (!is_final || within_speed)) {
+            if (!is_final) {
+                r_goal = env->reward_goal;
+                a->current_waypoint++;
+                a->goal_position_x = a->waypoints[a->current_waypoint][0];
+                a->goal_position_y = a->waypoints[a->current_waypoint][1];
+                a->goals_sampled_this_episode += 1.0f;
+            } else if (env->goal_behavior == GOAL_RESPAWN && a->respawn_timestep != -1) {
+                // Not the agent's first goal of the episode: `respawn_timestep` is -1
+                // until teddy_place_agent recycles it, so this pays the discounted
+                // rate for every goal after the first.
+                r_goal = env->reward_goal_post_respawn;
+                a->current_goal_reached = 1;
+                a->metrics_array[REACHED_GOAL_IDX] = 1.0f;
+                a->goals_reached_this_episode += 1.0f;
+            } else if (env->goal_behavior == GOAL_GENERATE_NEW) {
+                r_goal = env->reward_goal;
                 sample_new_goal(env, agent_idx);
-                env->entities[agent_idx].current_goal_reached = 0;
-                env->entities[agent_idx].goals_reached_this_episode += 1.0f;
-            } else { // Zero out the velocity so that the agent stops at the goal
-                env->rewards[i] = env->reward_goal;
-                env->logs[i].episode_return = env->reward_goal;
-                env->entities[agent_idx].stopped = 1;
-                env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
-                env->entities[agent_idx].goals_reached_this_episode += 1.0f;
+                a->current_goal_reached = 0;
+                a->metrics_array[REACHED_GOAL_IDX] = 1.0f;
+                a->goals_reached_this_episode += 1.0f;
+            } else {
+                // GOAL_STOP, and also the first goal of an agent's life under
+                // GOAL_RESPAWN (respawn_timestep is still -1 then).
+                //
+                // ONE DELIBERATE DEVIATION FROM OCEAN. ocean writes
+                //     env->rewards[i]            = env->reward_goal;
+                //     env->logs[i].episode_return = env->reward_goal;
+                // -- assignment, not accumulation. Under ocean's 91-step episodes,
+                // where an agent reaches its single dataset goal at most once and the
+                // episode ends there, that is nearly invisible. Here it is not: with
+                // GOAL_RESPAWN every agent passes through this branch on its first
+                // goal and then respawns, many times over a 1280-step episode, so
+                // assigning would (a) erase a collision charged on the very same step,
+                // paying full price for a goal reached by driving through someone, and
+                // (b) reset episode_return -- the headline training metric -- to 1.0
+                // each time. Accumulating instead.
+                r_goal = env->reward_goal;
+                a->stopped = 1;
+                a->vx = a->vy = 0.0f;
+                a->metrics_array[REACHED_GOAL_IDX] = 1.0f;
+                a->goals_reached_this_episode += 1.0f;
             }
-            env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX] = 1.0f;
-            env->logs[i].speed_at_goal = current_speed;
+            env->logs[i].speed_at_goal = speed;
         }
 
-        int lane_aligned = env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX];
-        env->logs[i].lane_alignment_rate = lane_aligned;
+        float r = 0.0f;
+        r += r_collision;
+        r += r_offroad;
+        r += r_goal;
+
+        env->rewards[i] += r;
+        env->logs[i].episode_return += r;
+
+        if (env->debug_terms && i < env->debug_max_rows) {
+            float *row = &env->debug_terms[(size_t)i * TEDDY_DEBUG_FEATURES];
+            // rewards[i], not r: under classic dynamics the jerk penalty was already
+            // added in the movement loop, and the trace has to add up to what the
+            // trainer sees.
+            row[TEDDY_DBG_REWARD] = env->rewards[i];
+            row[TEDDY_DBG_R_COLLISION] = r_collision;
+            row[TEDDY_DBG_R_OFFROAD] = r_offroad;
+            row[TEDDY_DBG_R_GOAL] = r_goal;
+            row[TEDDY_DBG_X] = a->x;
+            row[TEDDY_DBG_Y] = a->y;
+            row[TEDDY_DBG_HEADING] = a->heading;
+            row[TEDDY_DBG_SPEED] = speed;
+            row[TEDDY_DBG_SIGNED_V] = signed_v;
+            row[TEDDY_DBG_A_LONG] = a->a_long;
+            row[TEDDY_DBG_A_LAT] = a->a_lat;
+            row[TEDDY_DBG_JERK_LONG] = a->jerk_long;
+            row[TEDDY_DBG_JERK_LAT] = a->jerk_lat;
+            row[TEDDY_DBG_STEERING] = a->steering_angle;
+            row[TEDDY_DBG_COLLISION_STATE] = (float)collision_state;
+            row[TEDDY_DBG_LANE_VALID] = (float)a->lane_valid;
+            row[TEDDY_DBG_LANE_HEADING_ERR] = a->lane_heading_error;
+            row[TEDDY_DBG_LANE_LATERAL_OFFSET] = a->lane_lateral_offset;
+            row[TEDDY_DBG_LANE_ALIGNED] = a->metrics_array[LANE_ALIGNED_IDX];
+            row[TEDDY_DBG_DIST_TO_GOAL] = distance_to_goal;
+            row[TEDDY_DBG_CURRENT_WAYPOINT] = (float)a->current_waypoint;
+            row[TEDDY_DBG_NUM_WAYPOINTS] = (float)a->num_waypoints;
+            row[TEDDY_DBG_GOALS_REACHED] = a->goals_reached_this_episode;
+            row[TEDDY_DBG_REACHED_FINAL] = a->metrics_array[REACHED_GOAL_IDX];
+            row[TEDDY_DBG_RESPAWN_COUNT] = (float)a->respawn_count;
+            // Discrete: the joint action index. Continuous: the longitudinal channel
+            // only, since the row has one slot and steering is recoverable from
+            // steering_angle above.
+            row[TEDDY_DBG_ACTION] =
+                (env->action_type == 1) ? ((float *)env->actions)[2 * i] : (float)((int *)env->actions)[i];
+            row[TEDDY_DBG_TIMESTEP] = (float)env->timestep;
+        }
+
+        // Accumulated, not assigned: this is the fraction of the episode spent
+        // aligned, normalized by episode_length in add_log. Assigning here made it a
+        // snapshot of the final step, which over a 1280-step episode says almost
+        // nothing about how the agent drove.
+        env->logs[i].lane_alignment_rate += env->entities[agent_idx].metrics_array[LANE_ALIGNED_IDX];
     }
 
     if (env->goal_behavior == GOAL_RESPAWN) {
@@ -2466,7 +3173,9 @@ void c_step(Drive *env) {
     }
 
     // Episode boundary after this step: treat time-limit and early-termination as truncation.
-    // `timestep` is incremented at step start, so truncate when `(timestep + 1) >= episode_length`.
+    // `timestep` is incremented at the top of c_step, so after the k-th step it
+    // equals init_steps + k. Truncating at `timestep + 1 >= episode_length` ran one
+    // step short (1279 of a configured 1280); compare `timestep` itself.
     int originals_remaining = 0;
     for (int i = 0; i < env->active_agent_count; i++) {
         int agent_idx = env->active_agent_indices[i];
@@ -2475,7 +3184,7 @@ void c_step(Drive *env) {
             break;
         }
     }
-    int reached_time_limit = (env->timestep + 1) >= env->episode_length;
+    int reached_time_limit = env->timestep >= env->episode_length;
     int reached_early_termination = (!originals_remaining && env->termination_mode == 1);
     if (reached_time_limit || reached_early_termination) {
         for (int i = 0; i < env->active_agent_count; i++) {
@@ -2845,7 +3554,7 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
     }
     // First draw other agent observations
     int obs_idx = ego_dim; // Start after ego obs
-    for (int j = 0; j < MAX_AGENTS - 1; j++) {
+    for (int j = 0; j < MAX_PARTNER_OBS; j++) {
         if (agent_obs[obs_idx] == 0 || agent_obs[obs_idx + 1] == 0) {
             obs_idx += 7; // Move to next agent observation
             continue;
@@ -2957,7 +3666,7 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         obs_idx += PARTNER_FEATURES; // Move to next agent observation (7 values per agent)
     }
     // Then draw map observations
-    int map_start_idx = ego_dim + PARTNER_FEATURES * (MAX_AGENTS - 1); // Start after agent observations
+    int map_start_idx = ego_dim + PARTNER_FEATURES * MAX_PARTNER_OBS; // Start after agent observations
     for (int k = 0; k < MAX_ROAD_SEGMENT_OBSERVATIONS; k++) {          // Loop through potential map entities
         int entity_idx = map_start_idx + k * 7;
         if (agent_obs[entity_idx] == 0 && agent_obs[entity_idx + 1] == 0) {
@@ -3104,7 +3813,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 }
             }
 
-            if ((!is_active_agent && !is_static_agent) || env->entities[i].respawn_timestep != -1) {
+            if (!is_active_agent && !is_static_agent) {
                 continue;
             }
             Vector3 position;
@@ -3425,6 +4134,9 @@ static void draw_camera_panels(Drive *env, Client *client) {
 }
 
 void c_render(Drive *env, int view_mode, int draw_traces) {
+    // Kept in the signature so the binding stays call-compatible with ocean's, but a
+    // synthetic scene has nothing to trace. See the sim-state branch below.
+    (void)draw_traces;
 
     // Create client on first render call
     if (env->client == NULL) {
@@ -3452,31 +4164,13 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             begin_sim_view(client);
             BeginMode3D(camera);
 
-            if (draw_traces) { // Show logged trajectories of active agents and expert static agents
-                for (int i = 0; i < env->active_agent_count; i++) {
-                    int idx = env->active_agent_indices[i];
-                    for (int t = env->init_steps; t < env->episode_length; t++) {
-                        Color agent_color = LIGHTBLUE;
-                        if (env->entities[idx].type == PEDESTRIAN) {
-                            agent_color = LIGHT_ORANGE;
-                        } else if (env->entities[idx].type == CYCLIST) {
-                            agent_color = LIGHT_PURPLE;
-                        }
-                        DrawSphere(
-                            (Vector3){env->entities[idx].traj_x[t], env->entities[idx].traj_y[t], Z_AGENT_DETAILS},
-                            0.15f, agent_color);
-                    }
-                }
-
-                for (int i = 0; i < env->expert_static_agent_count; i++) {
-                    int idx = env->expert_static_agent_indices[i];
-                    for (int t = env->init_steps; t < env->episode_length; t++) {
-                        DrawSphere(
-                            (Vector3){env->entities[idx].traj_x[t], env->entities[idx].traj_y[t], Z_AGENT_DETAILS},
-                            0.15f, EXPERT_REPLAY);
-                    }
-                }
-            }
+            // ocean draws the logged trajectory of every agent here as one sphere per
+            // timestep. A Gigaflow scene has no logged trajectory to draw: the agents
+            // are synthesised, teddy_build_agents gives each a length-1 traj_* array
+            // holding only the spawn pose, and there are no expert-replay agents at
+            // all. Running the loop anyway read `episode_length` (1280) floats out of
+            // a 1-element allocation and drew ~77k spheres of heap garbage per frame,
+            // which is what made eval rendering ~27x slower than ocean's.
 
             draw_scene(env, client, 1, 0, 0, 0);
 

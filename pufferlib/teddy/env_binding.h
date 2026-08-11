@@ -707,6 +707,36 @@ static PyObject *vec_get_scenario_ids(PyObject *self, PyObject *args) {
     return list;
 }
 
+static PyObject *teddy_scene_sizes(PyObject *self, PyObject *args) {
+    Env *env = unpack_env(args);
+    if (!env)
+        return NULL;
+    int sizes[3];
+    c_teddy_scene_sizes((Drive *)env, sizes);
+    return Py_BuildValue("(iii)", sizes[0], sizes[1], sizes[2]);
+}
+
+static PyObject *teddy_scene_dump(PyObject *self, PyObject *args) {
+    if (PyTuple_Size(args) != 4) {
+        PyErr_SetString(PyExc_TypeError, "teddy_scene_dump requires 4 arguments");
+        return NULL;
+    }
+    Env *env = unpack_env(args);
+    if (!env)
+        return NULL;
+    PyObject *agents = PyTuple_GetItem(args, 1);
+    PyObject *road_xy = PyTuple_GetItem(args, 2);
+    PyObject *road_meta = PyTuple_GetItem(args, 3);
+    if (!PyArray_Check(agents) || !PyArray_Check(road_xy) || !PyArray_Check(road_meta)) {
+        PyErr_SetString(PyExc_TypeError, "teddy_scene_dump outputs must be NumPy arrays");
+        return NULL;
+    }
+    c_teddy_scene_dump((Drive *)env, (float *)PyArray_DATA((PyArrayObject *)agents),
+                      (float *)PyArray_DATA((PyArrayObject *)road_xy),
+                      (int *)PyArray_DATA((PyArrayObject *)road_meta));
+    Py_RETURN_NONE;
+}
+
 static PyObject *get_global_agent_state(PyObject *self, PyObject *args) {
     if (PyTuple_Size(args) != 7) {
         PyErr_SetString(PyExc_TypeError, "get_global_agent_state requires 7 arguments");
@@ -1080,6 +1110,8 @@ static PyMethodDef methods[] = {
     {"vec_close", vec_close, METH_VARARGS, "Close the vector of environments"},
     {"vec_get_scenario_ids", vec_get_scenario_ids, METH_VARARGS, "Get scenario IDs for all envs"},
     {"shared", (PyCFunction)my_shared, METH_VARARGS | METH_KEYWORDS, "Shared state"},
+    {"teddy_scene_sizes", teddy_scene_sizes, METH_VARARGS, "Snapshot buffer sizes: (agents, road polylines, road points)"},
+    {"teddy_scene_dump", teddy_scene_dump, METH_VARARGS, "Dump agents and roads of one env in the map-centered frame"},
     {"get_global_agent_state", get_global_agent_state, METH_VARARGS, "Get global agent state"},
     {"vec_get_global_agent_state", vec_get_global_agent_state, METH_VARARGS, "Get agent state from vectorized env"},
     {"get_ground_truth_trajectories", get_ground_truth_trajectories, METH_VARARGS, "Get ground truth trajectories"},
@@ -1109,6 +1141,9 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "MAX_ROAD_SEGMENT_OBSERVATIONS", MAX_ROAD_SEGMENT_OBSERVATIONS);
     PyModule_AddIntConstant(m, "MAX_AGENTS", MAX_AGENTS);
     PyModule_AddIntConstant(m, "MAX_PARTNER_OBS", MAX_PARTNER_OBS);
+    PyModule_AddIntConstant(m, "MAX_WAYPOINTS", MAX_WAYPOINTS);
+    PyModule_AddIntConstant(m, "TEDDY_SNAPSHOT_AGENT_FEATURES", TEDDY_SNAPSHOT_AGENT_FEATURES);
+    PyModule_AddIntConstant(m, "TEDDY_DEBUG_FEATURES", TEDDY_DEBUG_FEATURES);
     PyModule_AddIntConstant(m, "TRAJECTORY_LENGTH", TRAJECTORY_LENGTH);
     PyModule_AddIntConstant(m, "MAX_ENTITIES_PER_CELL", MAX_ENTITIES_PER_CELL);
 

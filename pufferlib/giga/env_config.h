@@ -60,7 +60,7 @@ static void env_config_set_giga_defaults(env_init_config *c) {
     c->waypoint_max_dist = 80.0f;
 }
 
-// INI file parser handler - parses all environment configuration from drive.ini
+// INI file parser handler - parses all environment configuration from giga.ini
 static int handler(void *config, const char *section, const char *name, const char *value) {
     env_init_config *env_config = (env_init_config *)config;
 #define MATCH(s, n) strcmp(section, s) == 0 && strcmp(name, n) == 0
