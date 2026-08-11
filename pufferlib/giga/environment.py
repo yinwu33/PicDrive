@@ -6,8 +6,8 @@ the Gigaflow-style random initialization can diverge from the dataset-driven env
 serving WOSAC and human-replay evaluation, which need logged trajectories.
 
 Env names are `puffer_giga` (privileged vector observations), `puffer_giga_cam`
-(a single front camera) and `puffer_giga_3cam` (Waymo's three front-facing
-cameras). All three are the same C simulator in different observation modes,
+(a single front camera), `puffer_giga_3cam` (Waymo's three front-facing cameras)
+and `puffer_giga_debug` (the single-car, single-map overfitting rig). All three are the same C simulator in different observation modes,
 exactly as in `ocean`, where the counterparts are `puffer_drive`,
 `puffer_drive_cam` and `puffer_drive_3cam`.
 """
@@ -18,6 +18,11 @@ import pufferlib
 
 MAKE_FUNCTIONS = {
     "giga": "Drive",
+    # Same simulator and same observation as `giga`, pinned by its config to one car
+    # on one map. Registered rather than reachable by CLI overrides because the
+    # single-scene setup spans [vec], [env] and [train] together, and a half-applied
+    # version of it silently trains something else.
+    "giga_debug": "Drive",
     # Same simulator, configured for perspective observations and wrapped by
     # PerspectiveVecEnv below. These two differ only in the camera rig named by
     # their config, so they share this entry point.

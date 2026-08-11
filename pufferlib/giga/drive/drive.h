@@ -376,6 +376,59 @@ struct GridMap {
     GridMapEntity **neighbor_cache_entities; // preallocated array to hold neighbor entities
 };
 
+// ---------------------------------------------------------------------------
+// Per-step reward trace (debug only)
+//
+// The nine Gigaflow reward terms are summed into one float before they reach
+// `rewards[]`, so a run that drives badly says nothing about *which* term it is
+// answering -- which is exactly the question when goal progress and collision rate
+// rise together. When Python binds a `debug_terms` buffer through env_put, the
+// reward loop writes one row per agent per step: every term separately, plus the
+// state each term is computed from, so the sum can be checked against the reward
+// the trainer actually saw. Unbound (the default, including in training) the whole
+// mechanism costs one NULL test per step.
+// ---------------------------------------------------------------------------
+#define GIGA_DBG_REWARD 0 // total for this step; equals rewards[i]
+#define GIGA_DBG_R_COLLISION 1
+#define GIGA_DBG_R_OFFROAD 2
+#define GIGA_DBG_R_COMFORT 3
+#define GIGA_DBG_R_ALIGN 4
+#define GIGA_DBG_R_CENTER 5
+#define GIGA_DBG_R_VELOCITY 6
+#define GIGA_DBG_R_REVERSE 7
+#define GIGA_DBG_R_TIMESTEP 8
+#define GIGA_DBG_R_GOAL 9
+#define GIGA_DBG_R_JERK 10 // classic dynamics only; 0 under jerk
+#define GIGA_DBG_X 11
+#define GIGA_DBG_Y 12
+#define GIGA_DBG_HEADING 13
+#define GIGA_DBG_SPEED 14
+#define GIGA_DBG_SIGNED_V 15
+#define GIGA_DBG_A_LONG 16
+#define GIGA_DBG_A_LAT 17
+#define GIGA_DBG_JERK_LONG 18
+#define GIGA_DBG_JERK_LAT 19
+#define GIGA_DBG_STEERING 20
+#define GIGA_DBG_COLLISION_STATE 21 // 0 none, 1 vehicle, 2 offroad
+#define GIGA_DBG_LANE_VALID 22
+#define GIGA_DBG_LANE_HEADING_ERR 23
+#define GIGA_DBG_LANE_LATERAL_OFFSET 24
+#define GIGA_DBG_LANE_ALIGNED 25
+#define GIGA_DBG_DIST_TO_GOAL 26
+#define GIGA_DBG_CURRENT_WAYPOINT 27
+#define GIGA_DBG_NUM_WAYPOINTS 28
+#define GIGA_DBG_GOALS_REACHED 29 // cumulative over the agent's life
+#define GIGA_DBG_REACHED_FINAL 30 // final goal hit on this step
+#define GIGA_DBG_RESPAWN_COUNT 31
+#define GIGA_DBG_ACTION 32
+#define GIGA_DBG_TIMESTEP 33
+// The agent's own conditioning, raw (not normalized as in the observation). Every
+// penalty above is scaled by one of these and they are redrawn on every respawn, so
+// a trace without them cannot be read: an agent paying 0.1 for leaving the road and
+// one paying 3.0 are running different reward functions.
+#define GIGA_DBG_COND 34
+#define GIGA_DEBUG_FEATURES (GIGA_DBG_COND + GIGA_NUM_COND)
+
 struct Drive {
     Client *client;
     float *observations;
@@ -470,6 +523,11 @@ struct Drive {
     // which case the panels fall back to an index.
     char *render_camera_names;
     int render_camera_name_stride;
+
+    // Per-step reward trace. Owned by Python, NULL unless env_put was handed a
+    // `debug_terms` array; see the GIGA_DBG_* block above for the row layout.
+    float *debug_terms;
+    int debug_max_rows;
 };
 
 // Single source of truth for the observation stride. In RENDER_STATE mode the
@@ -2241,13 +2299,28 @@ void move_dynamics(Drive *env, int action_idx, int agent_idx) {
         // Calculate new velocity
         float v_dot_heading = agent->vx * agent->heading_x + agent->vy * agent->heading_y;
         float signed_v = copysignf(sqrtf(agent->vx * agent->vx + agent->vy * agent->vy), v_dot_heading);
-        float v_new = signed_v + 0.5f * (a_long_new + agent->a_long) * env->dt;
+        float v_target = signed_v + 0.5f * (a_long_new + agent->a_long) * env->dt;
+        float v_new = v_target;
 
         // Make it easy to stop with 0 vel
-        if (signed_v * v_new < 0) {
+        if (signed_v * v_target < 0) {
             v_new = 0.0f;
         } else {
-            v_new = clip(v_new, -2.0f, 20.0f);
+            v_new = clip(v_target, -2.0f, 20.0f);
+        }
+
+        // A speed the limiter refused is a speed change that did not happen, so the
+        // acceleration behind it did not happen either. Carrying a_long forward
+        // unchanged made it a claim about the vehicle that nothing else agreed with:
+        // held at the -2 m/s reverse floor with a_long = -5, the speed was constant
+        // and jerk_long was zero, yet R_comfort charged the |a_long| > 3 indicator on
+        // every one of those steps and the ego observation reported hard braking. The
+        // state was also absorbing -- the zero-jerk action leaves a_long untouched, so
+        // only ~13 consecutive full-throttle steps could unwind it, and both a random
+        // and a 1.7B-step policy sat in it for 96% of an episode. Nothing accelerates
+        // a vehicle pinned against a limit; the realized value is zero.
+        if (v_new != v_target) {
+            a_long_new = 0.0f;
         }
 
         // Calculate new steering angle
@@ -2870,6 +2943,10 @@ void c_step(Drive *env) {
     memset(env->rewards, 0, env->active_agent_count * sizeof(float));
     memset(env->terminals, 0, env->active_agent_count * sizeof(unsigned char));
     memset(env->truncations, 0, env->active_agent_count * sizeof(unsigned char));
+    if (env->debug_terms) {
+        int rows = (env->active_agent_count < env->debug_max_rows) ? env->active_agent_count : env->debug_max_rows;
+        memset(env->debug_terms, 0, (size_t)rows * GIGA_DEBUG_FEATURES * sizeof(float));
+    }
     env->timestep++;
 
     // Move static experts
@@ -2897,6 +2974,8 @@ void c_step(Drive *env) {
             float jerk_penalty = -0.0002f * sqrtf(delta_vx * delta_vx + delta_vy * delta_vy) / env->dt;
             env->rewards[i] += jerk_penalty;
             env->logs[i].episode_return += jerk_penalty;
+            if (env->debug_terms && i < env->debug_max_rows)
+                env->debug_terms[(size_t)i * GIGA_DEBUG_FEATURES + GIGA_DBG_R_JERK] = jerk_penalty;
         }
     }
 
@@ -2917,18 +2996,23 @@ void c_step(Drive *env) {
         const float dt = env->dt;
         float speed = sqrtf(a->vx * a->vx + a->vy * a->vy);
         float signed_v = copysignf(speed, a->vx * a->heading_x + a->vy * a->heading_y);
-        float r = 0.0f;
+        // One named variable per Gigaflow term rather than a single running sum, so
+        // the trace below can attribute the step's reward. They are added up in the
+        // order they are declared, which is the order the sum used to be built in.
+        float r_collision = 0.0f, r_offroad = 0.0f, r_comfort = 0.0f;
+        float r_align = 0.0f, r_center = 0.0f, r_velocity = 0.0f;
+        float r_reverse = 0.0f, r_timestep = 0.0f, r_goal = 0.0f;
 
         // R_collision: the speed term is what makes a fast collision worse than a
         // nudge, and alpha_collision is what makes one driver more willing to risk it
         // than another.
         if (collision_state == VEHICLE_COLLISION) {
-            r -= (cond[COND_ALPHA_COLLISION] + 0.1f * speed);
+            r_collision = -(cond[COND_ALPHA_COLLISION] + 0.1f * speed);
             env->logs[i].collision_rate = 1.0f;
             env->logs[i].collisions_per_agent += 1.0f;
             a->collided_before_goal = 1;
         } else if (collision_state == OFFROAD) {
-            r -= cond[COND_ALPHA_BOUNDARY];
+            r_offroad = -cond[COND_ALPHA_BOUNDARY];
             env->logs[i].offroad_rate = 1.0f;
             env->logs[i].offroad_per_agent += 1.0f;
             a->collided_before_goal = 1;
@@ -2939,7 +3023,7 @@ void c_step(Drive *env) {
         if (cond[COND_ALPHA_COMFORT] > 0.0f) {
             int n = (fabsf(a->a_long) > 3.0f) + (fabsf(a->a_lat) > 3.0f) +
                     ((fabsf(a->jerk_long) > 5.0f || fabsf(a->jerk_lat) > 5.0f) ? 1 : 0);
-            r -= cond[COND_ALPHA_COMFORT] * (float)n;
+            r_comfort = -cond[COND_ALPHA_COMFORT] * (float)n;
         }
 
         // The lane-relative terms need a lane to be relative to. Off the lane graph
@@ -2952,27 +3036,27 @@ void c_step(Drive *env) {
             // it separately (alpha_vel_align), and pays a small bonus for being
             // straight. Randomizing alpha_l_align across a two-order-of-magnitude
             // range is what occasionally produces agents willing to drive the wrong way.
-            r += cond[COND_ALPHA_L_ALIGN] * dt *
-                 (fminf(cos_t, 0.0f) + cond[COND_ALPHA_VEL_ALIGN] * fminf(cos_t * signed_v, 0.0f) +
-                  0.0025f * (1.0f - fabsf(th) / (float)(M_PI / 2.0)));
+            r_align = cond[COND_ALPHA_L_ALIGN] * dt *
+                      (fminf(cos_t, 0.0f) + cond[COND_ALPHA_VEL_ALIGN] * fminf(cos_t * signed_v, 0.0f) +
+                       0.0025f * (1.0f - fabsf(th) / (float)(M_PI / 2.0)));
             // R_l-center, offset by alpha_center_bias so agents prefer different parts
             // of the lane (the strongest behavioural knob in the paper's Sec. F.1
             // mutual-information ranking).
             float d = fabsf(a->lane_lateral_offset - cond[COND_ALPHA_CENTER_BIAS]);
-            r -= cond[COND_ALPHA_L_CENTER] * dt * ((cos_t > 0.5f ? d : 0.0f) - 0.05f / expf(d - 0.5f));
+            r_center = -cond[COND_ALPHA_L_CENTER] * dt * ((cos_t > 0.5f ? d : 0.0f) - 0.05f / expf(d - 0.5f));
             // R_velocity: forward progress along the lane. Fixed weight; the paper
             // credits it with avoiding gridlock in self-play.
             if (fabsf(signed_v) > 2.5f)
-                r += GIGA_ALPHA_VELOCITY * dt * fmaxf(cos_t, 0.0f);
+                r_velocity = GIGA_ALPHA_VELOCITY * dt * fmaxf(cos_t, 0.0f);
         }
 
         if (signed_v < 0.0f)
-            r -= cond[COND_ALPHA_REVERSE] * dt; // R_reverse
+            r_reverse = -cond[COND_ALPHA_REVERSE] * dt; // R_reverse
 
         // R_timestep, disabled while stationary: an agent waiting at an intersection
         // should not be paying for the privilege, which is what makes it patient.
         if (fabsf(signed_v) > 0.0f || fabsf(a->a_long) > 0.0f)
-            r -= GIGA_ALPHA_TIMESTEP * dt;
+            r_timestep = -GIGA_ALPHA_TIMESTEP * dt;
 
         // R_goal, over the waypoint chain. Only the final goal has to be reached at
         // low speed; intermediate waypoints are drive-through (paper's 1_waypoint).
@@ -2980,7 +3064,7 @@ void c_step(Drive *env) {
         int is_final = (a->current_waypoint >= a->num_waypoints - 1);
         if (distance_to_goal < cond[COND_DELTA_GOAL] && !a->current_goal_reached &&
             (!is_final || speed <= cond[COND_V_GOAL])) {
-            r += env->reward_goal;
+            r_goal = env->reward_goal;
             a->goals_reached_this_episode += 1.0f;
             env->logs[i].speed_at_goal = speed;
             if (is_final) {
@@ -2996,8 +3080,67 @@ void c_step(Drive *env) {
             }
         }
 
+        // Same order the running sum used to be built in, so the float result is
+        // bit-for-bit what it was before the terms were named.
+        float r = 0.0f;
+        r += r_collision;
+        r += r_offroad;
+        r += r_comfort;
+        r += r_align;
+        r += r_center;
+        r += r_velocity;
+        r += r_reverse;
+        r += r_timestep;
+        r += r_goal;
+
         env->rewards[i] += r;
         env->logs[i].episode_return += r;
+
+        if (env->debug_terms && i < env->debug_max_rows) {
+            float *row = &env->debug_terms[(size_t)i * GIGA_DEBUG_FEATURES];
+            // rewards[i], not r: under classic dynamics the jerk penalty was already
+            // added in the movement loop, and the trace has to add up to what the
+            // trainer sees.
+            row[GIGA_DBG_REWARD] = env->rewards[i];
+            row[GIGA_DBG_R_COLLISION] = r_collision;
+            row[GIGA_DBG_R_OFFROAD] = r_offroad;
+            row[GIGA_DBG_R_COMFORT] = r_comfort;
+            row[GIGA_DBG_R_ALIGN] = r_align;
+            row[GIGA_DBG_R_CENTER] = r_center;
+            row[GIGA_DBG_R_VELOCITY] = r_velocity;
+            row[GIGA_DBG_R_REVERSE] = r_reverse;
+            row[GIGA_DBG_R_TIMESTEP] = r_timestep;
+            row[GIGA_DBG_R_GOAL] = r_goal;
+            row[GIGA_DBG_X] = a->x;
+            row[GIGA_DBG_Y] = a->y;
+            row[GIGA_DBG_HEADING] = a->heading;
+            row[GIGA_DBG_SPEED] = speed;
+            row[GIGA_DBG_SIGNED_V] = signed_v;
+            row[GIGA_DBG_A_LONG] = a->a_long;
+            row[GIGA_DBG_A_LAT] = a->a_lat;
+            row[GIGA_DBG_JERK_LONG] = a->jerk_long;
+            row[GIGA_DBG_JERK_LAT] = a->jerk_lat;
+            row[GIGA_DBG_STEERING] = a->steering_angle;
+            row[GIGA_DBG_COLLISION_STATE] = (float)collision_state;
+            row[GIGA_DBG_LANE_VALID] = (float)a->lane_valid;
+            row[GIGA_DBG_LANE_HEADING_ERR] = a->lane_heading_error;
+            row[GIGA_DBG_LANE_LATERAL_OFFSET] = a->lane_lateral_offset;
+            row[GIGA_DBG_LANE_ALIGNED] = a->metrics_array[LANE_ALIGNED_IDX];
+            row[GIGA_DBG_DIST_TO_GOAL] = distance_to_goal;
+            row[GIGA_DBG_CURRENT_WAYPOINT] = (float)a->current_waypoint;
+            row[GIGA_DBG_NUM_WAYPOINTS] = (float)a->num_waypoints;
+            row[GIGA_DBG_GOALS_REACHED] = a->goals_reached_this_episode;
+            row[GIGA_DBG_REACHED_FINAL] = a->metrics_array[REACHED_GOAL_IDX];
+            row[GIGA_DBG_RESPAWN_COUNT] = (float)a->respawn_count;
+            // Discrete: the joint action index. Continuous: the longitudinal channel
+            // only, since the row has one slot and steering is recoverable from
+            // steering_angle above.
+            row[GIGA_DBG_ACTION] =
+                (env->action_type == 1) ? ((float *)env->actions)[2 * i] : (float)((int *)env->actions)[i];
+            row[GIGA_DBG_TIMESTEP] = (float)env->timestep;
+            for (int k = 0; k < GIGA_NUM_COND; k++)
+                row[GIGA_DBG_COND + k] = cond[k];
+        }
 
         // Accumulated, not assigned: this is the fraction of the episode spent
         // aligned, normalized by episode_length in add_log. Assigning here made it a

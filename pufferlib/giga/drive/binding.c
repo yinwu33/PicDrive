@@ -71,6 +71,21 @@ static int my_put(Env *env, PyObject *args, PyObject *kwargs) {
         fill_render_roads(env);
     }
 
+    // Per-step reward trace. Optional and off in training; see the GIGA_DBG_* block
+    // in drive.h for the row layout.
+    found = unpack_optional_f32(kwargs, "debug_terms", &data, &count);
+    if (found < 0)
+        return 1;
+    if (found) {
+        if (count % GIGA_DEBUG_FEATURES != 0) {
+            PyErr_Format(PyExc_ValueError, "debug_terms must be a multiple of GIGA_DEBUG_FEATURES (%d) long",
+                         GIGA_DEBUG_FEATURES);
+            return 1;
+        }
+        env->debug_terms = data;
+        env->debug_max_rows = count / GIGA_DEBUG_FEATURES;
+    }
+
     PyObject *cam = PyDict_GetItemString(kwargs, "render_camera_rgb");
     if (cam != NULL) {
         if (!PyObject_TypeCheck(cam, &PyArray_Type) || PyArray_TYPE((PyArrayObject *)cam) != NPY_UINT8 ||

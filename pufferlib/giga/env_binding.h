@@ -1143,6 +1143,7 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "MAX_PARTNER_OBS", MAX_PARTNER_OBS);
     PyModule_AddIntConstant(m, "MAX_WAYPOINTS", MAX_WAYPOINTS);
     PyModule_AddIntConstant(m, "GIGA_SNAPSHOT_AGENT_FEATURES", GIGA_SNAPSHOT_AGENT_FEATURES);
+    PyModule_AddIntConstant(m, "GIGA_DEBUG_FEATURES", GIGA_DEBUG_FEATURES);
     PyModule_AddIntConstant(m, "TRAJECTORY_LENGTH", TRAJECTORY_LENGTH);
     PyModule_AddIntConstant(m, "MAX_ENTITIES_PER_CELL", MAX_ENTITIES_PER_CELL);
 

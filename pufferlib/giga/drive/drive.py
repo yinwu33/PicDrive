@@ -20,6 +20,69 @@ _PACKAGE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(_
 DEFAULT_INI_FILE = os.path.join(_PACKAGE_DIR, "config", "giga", "drive.ini")
 
 
+# Column layout of the per-step reward trace, in the order drive.h writes it. The
+# assert below is the whole safety net: the C side owns the ordering, and a silently
+# shifted column would misattribute reward to the wrong term.
+DEBUG_FEATURE_NAMES = [
+    "reward",
+    "r_collision",
+    "r_offroad",
+    "r_comfort",
+    "r_align",
+    "r_center",
+    "r_velocity",
+    "r_reverse",
+    "r_timestep",
+    "r_goal",
+    "r_jerk",
+    "x",
+    "y",
+    "heading",
+    "speed",
+    "signed_v",
+    "a_long",
+    "a_lat",
+    "jerk_long",
+    "jerk_lat",
+    "steering",
+    "collision_state",
+    "lane_valid",
+    "lane_heading_err",
+    "lane_lateral_offset",
+    "lane_aligned",
+    "dist_to_goal",
+    "current_waypoint",
+    "num_waypoints",
+    "goals_reached",
+    "reached_final",
+    "respawn_count",
+    "action",
+    "timestep",
+    # conditioning.h, in COND_* order
+    "cond_delta_goal",
+    "cond_v_goal",
+    "cond_alpha_collision",
+    "cond_alpha_boundary",
+    "cond_alpha_comfort",
+    "cond_alpha_l_align",
+    "cond_alpha_vel_align",
+    "cond_alpha_l_center",
+    "cond_alpha_center_bias",
+    "cond_alpha_reverse",
+    "cond_c_throttle",
+    "cond_c_steer",
+    "cond_c_acc",
+]
+assert len(DEBUG_FEATURE_NAMES) == binding.GIGA_DEBUG_FEATURES, (
+    f"DEBUG_FEATURE_NAMES has {len(DEBUG_FEATURE_NAMES)} entries but the C env writes "
+    f"{binding.GIGA_DEBUG_FEATURES} columns. Rebuild the extension or fix the list."
+)
+
+# The nine Gigaflow terms plus the classic-dynamics jerk penalty, i.e. every column
+# that is a reward contribution rather than state.
+DEBUG_REWARD_TERMS = [n for n in DEBUG_FEATURE_NAMES if n.startswith("r_")]
+
+
 class RenderView(IntEnum):
     FULL_SIM_STATE = 0  # Orthographic top-down, fully observable simulator state
     BEV_AGENT_OBS = 1  # Orthographic top-down, only show what the selected agent can observe
@@ -78,6 +141,10 @@ class Drive(pufferlib.PufferEnv):
         waypoint_min_dist=20.0,
         waypoint_max_dist=80.0,
         agent_dist_path="resources/drive/agent_dist.bin",
+        # Debugging: pin every packed scene to one map instead of sampling map ids.
+        # `num_maps=1` already forces map_000; this is what lets a trace be repeated
+        # on any other single map without reshuffling the directory.
+        force_map_id=None,
     ):
         # env
         self.dt = dt
@@ -109,7 +176,10 @@ class Drive(pufferlib.PufferEnv):
         self.waypoint_min_dist = waypoint_min_dist
         self.waypoint_max_dist = waypoint_max_dist
         self.agent_dist_path = agent_dist_path
+        self.force_map_id = force_map_id
         self.seed = int(seed)
+        # Filled by enable_debug_trace(); None means the C env writes no trace.
+        self.debug_terms = None
 
         # Observation space calculation
         self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}.get(
@@ -228,6 +298,9 @@ class Drive(pufferlib.PufferEnv):
             seed=self.seed,
         )
 
+        if force_map_id is not None:
+            map_ids = [int(force_map_id)] * len(map_ids)
+
         self.num_agents = agent_offsets[-1]
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
@@ -321,6 +394,34 @@ class Drive(pufferlib.PufferEnv):
                 dict(agents=agents, egos=egos, roads=roads, counts=counts, num_roads=int(counts[1]))
             )
 
+    def enable_debug_trace(self):
+        """Bind the per-step reward trace, one row per agent, and return it.
+
+        The returned array is written in place by every `step()`: row `i` holds the
+        reward agent `i` was paid on the step that just ran, split into the terms
+        drive.h computed it from, plus the state each term saw. Nothing else changes
+        -- the trace is the same numbers the trainer gets, not a re-derivation of
+        them, which is what makes disagreement between a term and the behaviour
+        meaningful.
+
+        Off by default: an unbound buffer costs the C step one NULL test.
+        """
+        n_feat = binding.GIGA_DEBUG_FEATURES
+        self.debug_terms = np.zeros((self.num_agents, n_feat), dtype=np.float32)
+        for i, env_id in enumerate(self.env_ids):
+            cur = self.agent_offsets[i]
+            nxt = self.agent_offsets[i + 1]
+            # A view, so the C env writes straight into the slice of the full array
+            # that belongs to its own agents.
+            binding.env_put(env_id, debug_terms=self.debug_terms[cur:nxt])
+        return self.debug_terms
+
+    def debug_trace_frame(self):
+        """The last step's trace as a list of per-agent dicts. Convenience only."""
+        if self.debug_terms is None:
+            raise RuntimeError("call enable_debug_trace() before reading the trace")
+        return [dict(zip(DEBUG_FEATURE_NAMES, row.tolist())) for row in self.debug_terms]
+
     def reset(self, seed=0):
         binding.vec_reset(self.c_envs, seed)
         self.tick = 0
@@ -339,6 +440,8 @@ class Drive(pufferlib.PufferEnv):
             agents_per_map_max=self.agents_per_map_max,
             seed=seed,
         )
+        if self.force_map_id is not None:
+            map_ids = [int(self.force_map_id)] * len(map_ids)
         self.agent_offsets = agent_offsets
         self.map_ids = map_ids
         self.num_envs = num_envs
@@ -394,6 +497,9 @@ class Drive(pufferlib.PufferEnv):
         self.c_envs = binding.vectorize(*self.env_ids)
         # New maps mean new road geometry, so the RenderState buffers are resized.
         self._alloc_render_state()
+        # The old C envs are gone, and with them the pointers into the trace buffer.
+        if self.debug_terms is not None:
+            self.enable_debug_trace()
 
         binding.vec_reset(self.c_envs, seed)
         self.terminals[:] = 1

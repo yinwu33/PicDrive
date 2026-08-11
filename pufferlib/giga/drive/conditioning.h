@@ -46,15 +46,45 @@
 #define GIGA_ALPHA_VELOCITY 0.0025f
 #define GIGA_ALPHA_TIMESTEP 0.000025f
 
+// alpha_l_align and alpha_l_center are pinned to 0, which switches R_l-align and
+// R_l-center off. Measured over 3200 steps of a trained policy the two charged
+// -0.0019/step on the lane graph and exactly 0.0 off it -- both live inside
+// `if (a->lane_valid)`, and that flag drops as soon as the nearest centerline is more
+// than 4 m away. Per step, driving outside a lane cost -0.0039 against -0.0073 for
+// driving properly inside one: the terms meant to enforce lane discipline made
+// leaving the lane the cheaper option. Restoring them means extending them
+// continuously past the 4 m gate rather than gating them, which is a separate change.
+// Paper values were U(0.00025, 0.025) and U(0.00025, 0.0075).
 static const float GIGA_COND_LO[GIGA_NUM_COND] = {
-    2.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.00025f, 0.0f, 0.00025f, -0.5f, 0.00025f,
-    0.8f,           // C_throttle, X(1.25)
-    0.8f,           // C_steer,    X(1.25)
-    2.0f / 3.0f,    // C_acc,      X(1.5)
+    2.0f,        // delta_goal: goal-reach radius lower bound, m
+    0.0f,        // v_goal: maximum speed at final goal lower bound, m/s
+    0.0f,        // alpha_collision: collision penalty weight lower bound
+    0.0f,        // alpha_boundary: off-road penalty weight lower bound
+    0.0f,        // alpha_comfort: acceleration/jerk penalty weight lower bound
+    0.0f,        // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
+    0.0f,        // alpha_vel_align: wrong-way motion multiplier; inert while alpha_l_align=0
+    0.0f,        // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
+    -0.5f,       // alpha_center_bias: preferred lateral offset lower bound, m (right)
+    0.00025f,    // alpha_reverse: reversing penalty weight lower bound
+    0.8f,        // C_throttle normalization bound; sampled with X(1.25)
+    0.8f,        // C_steer normalization bound; sampled with X(1.25)
+    2.0f / 3.0f, // C_acc normalization bound; sampled with X(1.5)
 };
+
 static const float GIGA_COND_HI[GIGA_NUM_COND] = {
-    12.0f, 20.0f, 3.0f, 3.0f, 0.1f, 0.025f, 1.0f, 0.0075f, 0.5f, 0.0075f,
-    1.25f, 1.25f, 1.5f,
+    12.0f,   // delta_goal: goal-reach radius upper bound, m
+    20.0f,   // v_goal: maximum speed at final goal upper bound, m/s
+    3.0f,    // alpha_collision: collision penalty weight upper bound
+    3.0f,    // alpha_boundary: off-road penalty weight upper bound
+    0.0f,    // alpha_comfort: acceleration/jerk penalty weight upper bound
+    0.0f,    // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
+    1.0f,    // alpha_vel_align: wrong-way motion multiplier; currently reward-inert
+    0.0f,    // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
+    0.5f,    // alpha_center_bias: preferred lateral offset upper bound, m (left)
+    0.0075f, // alpha_reverse: reversing penalty weight upper bound
+    1.25f,   // C_throttle normalization bound; sampled with X(1.25)
+    1.25f,   // C_steer normalization bound; sampled with X(1.25)
+    1.5f,    // C_acc normalization bound; sampled with X(1.5)
 };
 
 // Drawn per agent per life -- at episode reset and again on every respawn, since a
