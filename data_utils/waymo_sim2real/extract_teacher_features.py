@@ -1,0 +1,317 @@
+"""Render processed Waymo scenes and extract frozen DriveCam teacher features.
+
+This stage never opens TFRecord files. It consumes only compact samples emitted
+by :mod:`data_utils.waymo_sim2real.preprocess`, renders their abstract scene with
+the existing CUDA rasterizer, and stores the frozen teacher's 256-D scene
+embedding plus the three rendered views needed for audit visualization.
+
+Example:
+
+    python -m data_utils.waymo_sim2real.extract_teacher_features \
+        --processed artifacts/waymo_sim2real/processed \
+        --checkpoint experiments/puffer_drive_cam_gwvaxkmh/model_puffer_drive_cam_007800.pt \
+        --output artifacts/waymo_sim2real/teacher_features
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
+import hashlib
+import json
+import os
+from pathlib import Path
+from types import SimpleNamespace
+
+import gymnasium
+import numpy as np
+import torch
+
+from pufferlib.ocean.drive import raster_cuda
+from pufferlib.ocean.drive.raster_ref import WAYMO_RIG
+from pufferlib.ocean.torch import DriveCam
+
+from .processed import (
+    CAMERA_NAMES,
+    FEATURE_SCHEMA_VERSION,
+    SIM_HEIGHT,
+    SIM_WIDTH,
+    atomic_savez,
+    list_processed_files,
+    load_feature,
+    load_render_input,
+)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _load_teacher(checkpoint: Path, device: torch.device) -> DriveCam:
+    env = SimpleNamespace(
+        num_cameras=3,
+        height=SIM_HEIGHT,
+        width=SIM_WIDTH,
+        image_bytes=3 * 3 * SIM_HEIGHT * SIM_WIDTH,
+        ego_dim=11,
+        single_action_space=gymnasium.spaces.MultiDiscrete([12]),
+    )
+    teacher = DriveCam(env)
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if not isinstance(state, dict):
+        raise TypeError(f"{checkpoint} contains {type(state).__name__}, expected a state dict")
+    state = {key.removeprefix("module."): value for key, value in state.items()}
+    teacher.load_state_dict(state, strict=True)
+    if teacher.scene_encoder.in_features != 384 or teacher.scene_encoder.out_features != 256:
+        raise ValueError(
+            "checkpoint is not the expected three-camera teacher: "
+            f"scene_encoder is {teacher.scene_encoder.in_features}->{teacher.scene_encoder.out_features}"
+        )
+    teacher.requires_grad_(False)
+    teacher.eval()
+    return teacher.to(device)
+
+
+def _scene_features(teacher: DriveCam, images: torch.Tensor) -> torch.Tensor:
+    """Return the natural sim-perception boundary, before ego/planning layers."""
+    batch, cameras = images.shape[:2]
+    features = teacher.cnn(images.reshape(batch * cameras, 3, SIM_HEIGHT, SIM_WIDTH).float() / 255.0)
+    features = teacher.cam_proj(features.flatten(1)).reshape(batch, -1)
+    return teacher.scene_encoder(features)
+
+
+def _prefix_ranges(chunks: list[np.ndarray], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    offsets = [0]
+    for chunk in chunks:
+        offsets.append(offsets[-1] + len(chunk))
+    if offsets[-1]:
+        values = torch.from_numpy(np.ascontiguousarray(np.concatenate(chunks, axis=0))).to(device)
+    else:
+        width = chunks[0].shape[1]
+        values = torch.empty((0, width), dtype=torch.float32, device=device)
+    ranges = torch.tensor(offsets, dtype=torch.int32, device=device)
+    return values, ranges
+
+
+def _prefetched_samples(
+    files: list[Path], workers: int
+) -> tuple[Path, dict[str, np.ndarray]]:
+    """Yield ordered render inputs with a small, bounded read-ahead window."""
+    if workers == 1:
+        for source in files:
+            yield source, load_render_input(source)
+        return
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        iterator = iter(files)
+        pending: deque[tuple[Path, Future[dict[str, np.ndarray]]]] = deque()
+
+        def submit_one() -> bool:
+            try:
+                source = next(iterator)
+            except StopIteration:
+                return False
+            pending.append((source, executor.submit(load_render_input, source)))
+            return True
+
+        for _ in range(workers * 2):
+            if not submit_one():
+                break
+        while pending:
+            source, future = pending.popleft()
+            yield source, future.result()
+            submit_one()
+
+
+@torch.inference_mode()
+def _extract_batch(
+    teacher: DriveCam, samples: list[tuple[Path, dict[str, np.ndarray]]], device: torch.device
+) -> tuple[np.ndarray, np.ndarray]:
+    rigs = [sample["rig"] for _, sample in samples]
+    if not all(np.allclose(rig, rigs[0], atol=1e-5, rtol=1e-5) for rig in rigs[1:]):
+        raise ValueError("a render batch crossed camera calibrations; group samples by segment")
+    agents, agent_ranges = _prefix_ranges([sample["agents"] for _, sample in samples], device)
+    roads, road_ranges = _prefix_ranges([sample["roads"] for _, sample in samples], device)
+    egos = torch.from_numpy(np.stack([sample["ego"] for _, sample in samples])).to(device)
+    ego_scene = torch.arange(len(samples), dtype=torch.int32, device=device)
+    rig = torch.from_numpy(np.ascontiguousarray(rigs[0])).to(device)
+
+    images = raster_cuda.render(
+        agents=agents,
+        roads=roads,
+        egos=egos,
+        cameras=WAYMO_RIG,
+        rig=rig,
+        ego_scene=ego_scene,
+        agent_ranges=agent_ranges,
+        road_ranges=road_ranges,
+    )
+    features = _scene_features(teacher, images)
+    sim_rgb = images.permute(0, 1, 3, 4, 2).contiguous().cpu().numpy()
+    return features.float().cpu().numpy(), sim_rgb
+
+
+def _flush_batch(
+    teacher: DriveCam,
+    pending: list[tuple[Path, dict[str, np.ndarray]]],
+    output: Path,
+    checkpoint_hash: str,
+    device: torch.device,
+    overwrite: bool,
+) -> list[dict[str, int | str]]:
+    if not pending:
+        return []
+    features, sim_images = _extract_batch(teacher, pending, device)
+    entries = []
+    for index, (source, sample) in enumerate(pending):
+        destination = output / source.name
+        if destination.exists() and not overwrite:
+            raise FileExistsError(
+                f"{destination} exists; pass --resume to keep it or --overwrite to replace it"
+            )
+        segment_id = str(np.asarray(sample["segment_id"]).item())
+        timestamp = int(np.asarray(sample["timestamp_micros"]).item())
+        atomic_savez(
+            destination,
+            schema_version=np.asarray(FEATURE_SCHEMA_VERSION, dtype=np.int32),
+            segment_id=np.asarray(segment_id),
+            timestamp_micros=np.asarray(timestamp, dtype=np.int64),
+            camera_names=np.asarray(CAMERA_NAMES),
+            teacher_feature=features[index],
+            sim_images=sim_images[index],
+            checkpoint_sha256=np.asarray(checkpoint_hash),
+        )
+        entries.append(
+            {
+                "file": destination.name,
+                "processed_file": source.name,
+                "segment_id": segment_id,
+                "timestamp_micros": timestamp,
+            }
+        )
+    return entries
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--processed", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--device", default="cuda")
+    parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument(
+        "--loader-workers",
+        type=int,
+        default=min(8, os.cpu_count() or 1),
+        help="Bounded NPZ prefetch threads (default: min(8, CPU count))",
+    )
+    parser.add_argument("--max-samples", type=int)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Keep validated features made with the same checkpoint",
+    )
+    args = parser.parse_args()
+    if args.batch_size < 1:
+        parser.error("--batch-size must be >= 1")
+    if args.loader_workers < 1:
+        parser.error("--loader-workers must be >= 1")
+    if args.resume and args.overwrite:
+        parser.error("--resume and --overwrite are mutually exclusive")
+    if not args.checkpoint.is_file():
+        parser.error(f"checkpoint does not exist: {args.checkpoint}")
+    device = torch.device(args.device)
+    if device.type != "cuda":
+        parser.error("the production rasterizer is CUDA-only; use --device cuda")
+    if not torch.cuda.is_available():
+        parser.error("CUDA is unavailable")
+
+    files = list_processed_files(args.processed, args.max_samples)
+    if not files:
+        parser.error(f"no processed .npz samples found under {args.processed}")
+    args.output.mkdir(parents=True, exist_ok=True)
+    checkpoint_hash = _sha256(args.checkpoint)
+    teacher = _load_teacher(args.checkpoint, device)
+
+    entries: list[dict[str, int | str]] = []
+    todo: list[Path] = []
+    for sample_index, source in enumerate(files, 1):
+        destination = args.output / source.name
+        if destination.exists() and args.resume:
+            feature = load_feature(destination)
+            saved_hash = str(np.asarray(feature["checkpoint_sha256"]).item())
+            if saved_hash != checkpoint_hash:
+                raise ValueError(
+                    f"{destination} uses checkpoint {saved_hash}, expected {checkpoint_hash}"
+                )
+            segment_id = str(np.asarray(feature["segment_id"]).item())
+            timestamp = int(np.asarray(feature["timestamp_micros"]).item())
+            entries.append(
+                {
+                    "file": destination.name,
+                    "processed_file": source.name,
+                    "segment_id": segment_id,
+                    "timestamp_micros": timestamp,
+                }
+            )
+        elif destination.exists() and not args.overwrite:
+            raise FileExistsError(
+                f"{destination} exists; pass --resume to keep it or --overwrite to replace it"
+            )
+        else:
+            todo.append(source)
+        if sample_index % 1000 == 0:
+            print(
+                f"[{sample_index}/{len(files)}] scanned; "
+                f"kept {len(entries)}, need {len(todo)}",
+                flush=True,
+            )
+
+    kept = len(entries)
+    pending: list[tuple[Path, dict[str, np.ndarray]]] = []
+    pending_segment: str | None = None
+    for todo_index, (source, sample) in enumerate(
+        _prefetched_samples(todo, args.loader_workers), 1
+    ):
+        segment = str(np.asarray(sample["segment_id"]).item())
+        if pending and (segment != pending_segment or len(pending) >= args.batch_size):
+            entries.extend(
+                _flush_batch(
+                    teacher, pending, args.output, checkpoint_hash, device, args.overwrite
+                )
+            )
+            pending = []
+        pending.append((source, sample))
+        pending_segment = segment
+        if todo_index % 500 == 0:
+            print(
+                f"[{kept + todo_index}/{len(files)}] kept/loaded features",
+                flush=True,
+            )
+    entries.extend(_flush_batch(teacher, pending, args.output, checkpoint_hash, device, args.overwrite))
+    entries.sort(key=lambda entry: entry["processed_file"])
+
+    metadata = {
+        "schema_version": FEATURE_SCHEMA_VERSION,
+        "checkpoint": str(args.checkpoint.resolve()),
+        "checkpoint_sha256": checkpoint_hash,
+        "num_samples": len(entries),
+        "camera_names": list(CAMERA_NAMES),
+        "feature_dim": 256,
+        "samples": entries,
+    }
+    (args.output / "manifest.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
+    print(
+        f"extracted {len(entries)} teacher features into {args.output}; "
+        f"checkpoint sha256={checkpoint_hash}"
+    )
+
+
+if __name__ == "__main__":
+    main()
