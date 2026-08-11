@@ -6,6 +6,10 @@ three 384x256 RGB images and emits a feature in exactly that space. The
 ImageNet-pretrained backbone is shared across cameras; fusion happens only
 after each view has been encoded, matching the camera-sharing structure of
 ``DriveCam`` while giving the real branch substantially more capacity.
+
+:class:`DistillationLoss` scores it against the teacher both in feature space
+and through the teacher's own frozen planning head, which is the objective
+Rowe et al. use for Gigapixel's sim-to-real stage.
 """
 
 from __future__ import annotations
@@ -91,6 +95,25 @@ class RealPerception(nn.Module):
         self.fusion.apply(self._initialize)
         nn.init.trunc_normal_(self.camera_embedding, std=0.02)
 
+    def freeze_backbone_stages(self, stages: int) -> int:
+        """Freeze the first ``stages`` ConvNeXt stages; return frozen parameters.
+
+        Full fine-tuning overfits quickly here: the paired set covers a few
+        hundred distinct scenes however many frames it holds, and consecutive
+        frames are near-duplicates. Holding the early, generic stages fixed is
+        the cheapest counterpart to the LoRA the paper puts on its own backbone.
+        """
+        if stages < 0:
+            raise ValueError("stages must be non-negative")
+        frozen = 0
+        for index, stage in enumerate(self.backbone):
+            if index >= stages:
+                break
+            for parameter in stage.parameters():
+                parameter.requires_grad_(False)
+                frozen += parameter.numel()
+        return frozen
+
     @staticmethod
     def _initialize(module: nn.Module) -> None:
         if isinstance(module, (nn.Conv2d, nn.Linear)):
@@ -119,27 +142,109 @@ class RealPerception(nn.Module):
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
 
 
-class FeatureAlignmentLoss(nn.Module):
-    """Exact feature regression plus an angular alignment term."""
+class DistillationLoss(nn.Module):
+    """The paper's adaptation objective: feature alignment plus planning agreement.
 
-    def __init__(self, cosine_weight: float = 0.1):
+    ``lambda * ||E_real - E_sim||^2 + L_plan``.  The feature term is a sum over
+    the feature dimension rather than a mean, which is the convention the
+    published ``lambda = 1`` balances against; ``mse`` is reported separately as
+    the per-dimension mean so it stays comparable across feature widths.
+
+    ``L_plan`` is the KL between the frozen planner's action distributions on the
+    teacher and student features.  It is what makes the objective care about
+    behaviour: the feature term alone weights every latent direction by its
+    coordinate scale, while the planner weights each direction by how much it
+    actually moves the wheel.  Dropping it leaves nothing tying the student to
+    the closed-loop policy that was distilled in simulation.
+
+    ``target_scale`` optionally divides the residual by a per-dimension standard
+    deviation, so no single high-variance coordinate dominates. The prediction
+    handed to the planning head is always the raw, unscaled feature.
+    """
+
+    def __init__(
+        self,
+        feature_weight: float = 1.0,
+        cosine_weight: float = 0.1,
+        plan_weight: float = 1.0,
+        plan_head: nn.Module | None = None,
+        temperature: float = 1.0,
+        target_scale: torch.Tensor | None = None,
+    ):
         super().__init__()
-        if cosine_weight < 0:
-            raise ValueError("cosine_weight must be non-negative")
+        if feature_weight < 0 or cosine_weight < 0 or plan_weight < 0:
+            raise ValueError("loss weights must be non-negative")
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        if plan_weight > 0 and plan_head is None:
+            raise ValueError("a non-zero plan weight needs the frozen planning head")
+        self.feature_weight = feature_weight
         self.cosine_weight = cosine_weight
+        self.plan_weight = plan_weight
+        self.temperature = temperature
+        self.plan_head = plan_head
+        if target_scale is None:
+            self.register_buffer("target_scale", None, persistent=False)
+        else:
+            scale = target_scale.detach().float().clone()
+            if (scale <= 0).any():
+                raise ValueError("target_scale must be strictly positive")
+            self.register_buffer("target_scale", scale, persistent=True)
+
+    @property
+    def uses_ego(self) -> bool:
+        return self.plan_weight > 0 and self.plan_head is not None
+
+    def _plan_terms(
+        self, prediction: torch.Tensor, target: torch.Tensor, ego: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        temperature = self.temperature
+        # The planner is a frozen reference, so it runs in full precision even
+        # when the student's backbone is under autocast: a KL read off bf16
+        # logits is noise at the scale this loss operates on.
+        with torch.autocast(device_type=prediction.device.type, enabled=False):
+            student_logits = self.plan_head(prediction.float(), ego.float())
+            with torch.no_grad():
+                teacher_logits = self.plan_head(target.float(), ego.float())
+            divergence = prediction.new_zeros(())
+            matches = prediction.new_zeros(())
+            for student, teacher in zip(student_logits, teacher_logits):
+                student_log = F.log_softmax(student / temperature, dim=-1)
+                teacher_log = F.log_softmax(teacher / temperature, dim=-1)
+                divergence = divergence + F.kl_div(
+                    student_log, teacher_log, log_target=True, reduction="batchmean"
+                ) * (temperature * temperature)
+                matches = matches + (student.argmax(-1) == teacher.argmax(-1)).float().mean()
+        return divergence, matches / max(1, len(student_logits))
 
     def forward(
-        self, prediction: torch.Tensor, target: torch.Tensor
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        ego: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         prediction = prediction.float()
         target = target.float()
+        residual = prediction - target
+        if self.target_scale is not None:
+            residual = residual / self.target_scale
+        squared = residual.pow(2)
+        feature_loss = squared.sum(dim=-1).mean()
         mse = F.mse_loss(prediction, target)
         cosine = F.cosine_similarity(prediction, target, dim=-1).mean()
-        loss = mse + self.cosine_weight * (1.0 - cosine)
+
+        loss = self.feature_weight * feature_loss + self.cosine_weight * (1.0 - cosine)
         metrics = {
-            "loss": loss.detach(),
+            "feature_loss": feature_loss.detach(),
             "mse": mse.detach(),
-            "rmse": mse.detach().sqrt(),
             "cosine": cosine.detach(),
         }
+        if self.uses_ego:
+            if ego is None:
+                raise ValueError("the planning loss needs the ego observation vector")
+            divergence, agreement = self._plan_terms(prediction, target, ego)
+            loss = loss + self.plan_weight * divergence
+            metrics["plan_kl"] = divergence.detach()
+            metrics["plan_agreement"] = agreement.detach()
+        metrics["loss"] = loss.detach()
         return loss, metrics

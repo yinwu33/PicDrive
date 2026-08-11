@@ -13,7 +13,7 @@ from typing import Callable, TypeVar
 import numpy as np
 from PIL import Image
 
-from .processed import load_feature, load_processed
+from .processed import EGO_OBS_DIM, load_ego_state, load_feature, load_processed
 
 
 T = TypeVar("T")
@@ -77,6 +77,34 @@ def _check_processed(path: Path) -> None:
             raise ValueError(f"{key} contains NaN or infinity")
 
 
+def _verify_ego_state(ego_dir: Path, processed_entries: list[dict[str, object]]) -> None:
+    """Check that every processed frame can find its reconstructed ego vector.
+
+    Optional: the ego state is only needed by the planning-loss term, so a tree
+    built before that stage still verifies. When it is present the join has to
+    be exact, because a silent miss would only surface as a training crash.
+    """
+    if not ego_dir.is_dir():
+        return
+    wanted: dict[str, set[int]] = {}
+    for entry in processed_entries:
+        wanted.setdefault(str(entry["segment_id"]), set()).add(int(entry["timestamp_micros"]))
+    for segment, stamps in sorted(wanted.items()):
+        path = ego_dir / f"{segment}.npz"
+        if not path.is_file():
+            raise ValueError(f"missing ego state for segment {segment}: {path}")
+        state = load_ego_state(path)
+        available = set(np.asarray(state["timestamp_micros"]).tolist())
+        missing = sorted(stamps - available)
+        if missing:
+            raise ValueError(f"{path} lacks ego state at {len(missing)} timestamps, e.g. {missing[:3]}")
+        obs = np.asarray(state["ego_obs"])
+        if not np.isfinite(obs).all():
+            raise ValueError(f"{path} ego_obs contains NaN or infinity")
+        if obs.shape[1] != EGO_OBS_DIM:
+            raise ValueError(f"{path} ego_obs is {obs.shape[1]}-D, expected {EGO_OBS_DIM}")
+
+
 def verify_split(split_root: Path, workers: int) -> dict[str, int]:
     processed_dir = split_root / "processed"
     features_dir = split_root / "teacher_features"
@@ -124,6 +152,7 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
         f"{split_root.name} features",
     )
     _bounded_check(png_files, _check_png_header, workers, f"{split_root.name} PNG headers")
+    _verify_ego_state(split_root / "ego_state", processed_entries)
 
     # Fully decode one processed sample and one PNG from every segment. This
     # complements the all-file structural checks without re-decoding all RGB.

@@ -18,13 +18,10 @@ from __future__ import annotations
 import argparse
 from collections import deque
 from concurrent.futures import Future, ThreadPoolExecutor
-import hashlib
 import json
 import os
 from pathlib import Path
-from types import SimpleNamespace
 
-import gymnasium
 import numpy as np
 import torch
 
@@ -35,54 +32,13 @@ from pufferlib.ocean.torch import DriveCam
 from .processed import (
     CAMERA_NAMES,
     FEATURE_SCHEMA_VERSION,
-    SIM_HEIGHT,
-    SIM_WIDTH,
+    TEACHER_FEATURE_DIM,
     atomic_savez,
     list_processed_files,
     load_feature,
     load_render_input,
 )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _load_teacher(checkpoint: Path, device: torch.device) -> DriveCam:
-    env = SimpleNamespace(
-        num_cameras=3,
-        height=SIM_HEIGHT,
-        width=SIM_WIDTH,
-        image_bytes=3 * 3 * SIM_HEIGHT * SIM_WIDTH,
-        ego_dim=11,
-        single_action_space=gymnasium.spaces.MultiDiscrete([12]),
-    )
-    teacher = DriveCam(env)
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    if not isinstance(state, dict):
-        raise TypeError(f"{checkpoint} contains {type(state).__name__}, expected a state dict")
-    state = {key.removeprefix("module."): value for key, value in state.items()}
-    teacher.load_state_dict(state, strict=True)
-    if teacher.scene_encoder.in_features != 384 or teacher.scene_encoder.out_features != 256:
-        raise ValueError(
-            "checkpoint is not the expected three-camera teacher: "
-            f"scene_encoder is {teacher.scene_encoder.in_features}->{teacher.scene_encoder.out_features}"
-        )
-    teacher.requires_grad_(False)
-    teacher.eval()
-    return teacher.to(device)
-
-
-def _scene_features(teacher: DriveCam, images: torch.Tensor) -> torch.Tensor:
-    """Return the natural sim-perception boundary, before ego/planning layers."""
-    batch, cameras = images.shape[:2]
-    features = teacher.cnn(images.reshape(batch * cameras, 3, SIM_HEIGHT, SIM_WIDTH).float() / 255.0)
-    features = teacher.cam_proj(features.flatten(1)).reshape(batch, -1)
-    return teacher.scene_encoder(features)
+from .teacher import load_teacher, scene_features, sha256_file
 
 
 def _prefix_ranges(chunks: list[np.ndarray], device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -151,7 +107,7 @@ def _extract_batch(
         agent_ranges=agent_ranges,
         road_ranges=road_ranges,
     )
-    features = _scene_features(teacher, images)
+    features = scene_features(teacher, images)
     sim_rgb = images.permute(0, 1, 3, 4, 2).contiguous().cpu().numpy()
     return features.float().cpu().numpy(), sim_rgb
 
@@ -236,8 +192,8 @@ def main() -> None:
     if not files:
         parser.error(f"no processed .npz samples found under {args.processed}")
     args.output.mkdir(parents=True, exist_ok=True)
-    checkpoint_hash = _sha256(args.checkpoint)
-    teacher = _load_teacher(args.checkpoint, device)
+    checkpoint_hash = sha256_file(args.checkpoint)
+    teacher = load_teacher(args.checkpoint, device)
 
     entries: list[dict[str, int | str]] = []
     todo: list[Path] = []
@@ -303,7 +259,7 @@ def main() -> None:
         "checkpoint_sha256": checkpoint_hash,
         "num_samples": len(entries),
         "camera_names": list(CAMERA_NAMES),
-        "feature_dim": 256,
+        "feature_dim": TEACHER_FEATURE_DIM,
         "samples": entries,
     }
     (args.output / "manifest.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")

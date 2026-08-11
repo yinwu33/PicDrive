@@ -11,6 +11,7 @@ import numpy as np
 
 PROCESSED_SCHEMA_VERSION = 1
 FEATURE_SCHEMA_VERSION = 1
+EGO_SCHEMA_VERSION = 1
 
 # Policy/checkpoint order. The visualization deliberately reorders this to
 # left/front/right for human inspection.
@@ -23,6 +24,29 @@ SIM_WIDTH = 96
 WAYMO_REAR_AXLE_TO_BOX_CENTER = 1.44
 RENDER_NEAR = 0.15
 RENDER_FAR = 200.0
+
+TEACHER_FEATURE_DIM = 256
+
+# Ego observation vector under the JERK dynamics model, mirroring
+# ``compute_observations`` in drive.h (EGO_FEATURES_JERK).  The planning head
+# distilled alongside the scene feature consumes exactly this layout, so the
+# normalizers below must track the #defines rather than be re-derived.
+EGO_OBS_DIM = 11
+MAX_SPEED = 100.0
+MAX_VEH_LEN = 30.0
+MAX_VEH_WIDTH = 15.0
+JERK_LONG_MIN = -15.0  # JERK_LONG[0]
+JERK_LONG_MAX = 4.0  # JERK_LONG[3]
+JERK_LAT_MAX = 4.0  # JERK_LAT[2]
+GOAL_OBS_SCALE = 0.005
+# drive_3cam.ini `goal_target_distance`: the sim aims at a lane point this far
+# ahead, so the Waymo analogue is the ego's own logged pose after the same
+# travelled distance.
+GOAL_TARGET_DISTANCE = 30.0
+# Waymo's self-driving Chrysler Pacifica. WOD never labels the ego vehicle, so
+# the box the sim would have read from a WOMD SDC track is supplied here.
+WAYMO_SDC_LENGTH = 5.286
+WAYMO_SDC_WIDTH = 2.332
 
 
 def atomic_savez(path: str | Path, **arrays) -> None:
@@ -131,6 +155,26 @@ def list_processed_files(directory: str | Path, max_samples: int | None = None) 
     return files if max_samples is None else files[:max_samples]
 
 
+def load_ego_state(path: str | Path) -> dict[str, np.ndarray]:
+    """Load one segment's per-frame ego observation table."""
+    path = Path(path)
+    with np.load(path, allow_pickle=False) as archive:
+        state = {key: archive[key] for key in archive.files}
+    required = {"schema_version", "segment_id", "timestamp_micros", "ego_obs"}
+    missing = sorted(required - state.keys())
+    if missing:
+        raise ValueError(f"{path} is missing fields: {missing}")
+    version = int(np.asarray(state["schema_version"]).item())
+    if version != EGO_SCHEMA_VERSION:
+        raise ValueError(f"{path} schema {version}, expected {EGO_SCHEMA_VERSION}")
+    obs = state["ego_obs"]
+    if obs.ndim != 2 or obs.shape[1] != EGO_OBS_DIM or obs.dtype != np.float32:
+        raise ValueError(f"{path} ego_obs must be float32 [N,{EGO_OBS_DIM}], got {obs.shape} {obs.dtype}")
+    if len(state["timestamp_micros"]) != len(obs):
+        raise ValueError(f"{path} has {len(obs)} rows for {len(state['timestamp_micros'])} timestamps")
+    return state
+
+
 def load_feature(path: str | Path) -> dict[str, np.ndarray]:
     path = Path(path)
     with np.load(path, allow_pickle=False) as archive:
@@ -153,6 +197,6 @@ def load_feature(path: str | Path) -> dict[str, np.ndarray]:
     sim = feature["sim_images"]
     if sim.shape != (3, SIM_HEIGHT, SIM_WIDTH, 3) or sim.dtype != np.uint8:
         raise ValueError(f"{path} sim_images has invalid shape/dtype {sim.shape} {sim.dtype}")
-    if feature["teacher_feature"].shape != (256,):
-        raise ValueError(f"{path} teacher_feature must be [256]")
+    if feature["teacher_feature"].shape != (TEACHER_FEATURE_DIM,):
+        raise ValueError(f"{path} teacher_feature must be [{TEACHER_FEATURE_DIM}]")
     return feature
