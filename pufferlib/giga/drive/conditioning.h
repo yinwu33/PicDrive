@@ -61,9 +61,9 @@ static const float GIGA_COND_LO[GIGA_NUM_COND] = {
     0.0f,        // alpha_collision: collision penalty weight lower bound
     0.0f,        // alpha_boundary: off-road penalty weight lower bound
     0.0f,        // alpha_comfort: acceleration/jerk penalty weight lower bound
-    0.0f,        // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
+    0.00025f,        // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
     0.0f,        // alpha_vel_align: wrong-way motion multiplier; inert while alpha_l_align=0
-    0.0f,        // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
+    0.00025f,        // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
     -0.5f,       // alpha_center_bias: preferred lateral offset lower bound, m (right)
     0.00025f,    // alpha_reverse: reversing penalty weight lower bound
     0.8f,        // C_throttle normalization bound; sampled with X(1.25)
@@ -76,10 +76,10 @@ static const float GIGA_COND_HI[GIGA_NUM_COND] = {
     20.0f,   // v_goal: maximum speed at final goal upper bound, m/s
     3.0f,    // alpha_collision: collision penalty weight upper bound
     3.0f,    // alpha_boundary: off-road penalty weight upper bound
-    0.0f,    // alpha_comfort: acceleration/jerk penalty weight upper bound
-    0.0f,    // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
+    0.1f,    // alpha_comfort: acceleration/jerk penalty weight upper bound
+    0.025f,    // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
     1.0f,    // alpha_vel_align: wrong-way motion multiplier; currently reward-inert
-    0.0f,    // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
+    0.075f,    // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
     0.5f,    // alpha_center_bias: preferred lateral offset upper bound, m (left)
     0.0075f, // alpha_reverse: reversing penalty weight upper bound
     1.25f,   // C_throttle normalization bound; sampled with X(1.25)
