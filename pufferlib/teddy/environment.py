@@ -83,10 +83,11 @@ def vecenv_wrapper(env_name, vecenv, args):
     if env_name not in CAMERA_ENVS:
         return vecenv
 
-    from pufferlib.teddy.drive.perspective import PerspectiveVecEnv
+    from pufferlib.teddy.drive.perspective import PerspectiveVecEnv, RenderNoise
 
     return PerspectiveVecEnv(
         vecenv,
         cameras=args["env"].get("cameras"),
         device=args["train"]["device"],
+        render_noise=RenderNoise.from_env_config(args["env"]),
     )

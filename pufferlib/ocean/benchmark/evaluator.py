@@ -803,6 +803,12 @@ class Evaluator:
         eval_config["env"]["num_agents"] = eval_config["eval"]["num_eval_agents"]
         eval_config["env"]["episode_length"] = self.EVAL_EPISODE_LENGTH
         eval_config["vec"] = dict(backend=backend, num_envs=1)
+        # Camera envs (teddy) may jitter rendered agent poses; eval rollouts do not
+        # necessarily want that noise, so [eval] can override it independently of
+        # the training config. `.get` defaults to leaving the training value alone
+        # for envs that do not define render noise at all.
+        if "render_noise_eval" in eval_config["eval"]:
+            eval_config["env"]["render_noise_enabled"] = eval_config["eval"]["render_noise_eval"]
 
         self.hr_eval_config = copy.deepcopy(eval_config)
         self.hr_eval_config["env"]["control_mode"] = "control_sdc_only"

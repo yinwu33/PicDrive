@@ -1540,7 +1540,18 @@ def autotune(args=None, env_name=None, vecenv=None, policy=None):
 
 
 # Config keys consumed by the vecenv wrapper rather than by the env constructor.
-ENV_KWARG_BLOCKLIST = {"cameras"}
+ENV_KWARG_BLOCKLIST = {
+    "cameras",
+    "render_noise_enabled",
+    "render_noise_x_mean",
+    "render_noise_x_std",
+    "render_noise_y_mean",
+    "render_noise_y_std",
+    "render_noise_z_mean",
+    "render_noise_z_std",
+    "render_noise_heading_mean_deg",
+    "render_noise_heading_std_deg",
+}
 
 # Some Ocean envs re-parse the config in C for settings the Python constructor does
 # not forward. They take the path as this kwarg; hand them the file this run was

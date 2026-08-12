@@ -22,6 +22,9 @@ both parts without paying float32 for the images:
 
 from __future__ import annotations
 
+import math
+from dataclasses import dataclass
+
 import gymnasium
 import numpy as np
 import torch
@@ -33,6 +36,92 @@ from pufferlib.teddy.drive.raster_ref import DEFAULT_RIG, Camera, rig_from_confi
 # Bytes per panel label handed to the viewer, NUL-padded. Long enough for the
 # names in the rigs plus a terminator.
 _NAME_STRIDE = 16
+
+
+@dataclass(frozen=True)
+class RenderNoise:
+    """Gaussian pose jitter applied to the rasterizer's copy of every agent.
+
+    x/y are additive, in metres. z has no dedicated column in the render
+    contract -- `RENDER_AGENT_FEATURES` has no agent z position, since the world
+    is flat and every box is drawn from ground z=0 up to its `height` -- so z
+    noise perturbs that `height` column instead. Heading noise samples an angle
+    in degrees and rotates the stored (cos_h, sin_h) unit vector by it, rather
+    than adding to cos_h/sin_h independently, which would not stay a unit vector.
+
+    None of this reaches the simulator: it is applied to a tensor already copied
+    off the C environment's RenderState buffers (see `PerspectiveVecEnv._render`),
+    well after anything that feeds physics, reward or the ego observation.
+    """
+
+    enabled: bool = True
+    x_mean: float = 0.0
+    x_std: float = 0.0
+    y_mean: float = 0.0
+    y_std: float = 0.0
+    z_mean: float = 0.0
+    z_std: float = 0.0
+    heading_mean_deg: float = 0.0
+    heading_std_deg: float = 0.0
+
+    @classmethod
+    def from_env_config(cls, cfg: dict) -> "RenderNoise":
+        """Build from the `[env]` section's `render_noise_*` keys, all optional."""
+        return cls(
+            enabled=bool(cfg.get("render_noise_enabled", True)),
+            x_mean=float(cfg.get("render_noise_x_mean", 0.0)),
+            x_std=float(cfg.get("render_noise_x_std", 0.0)),
+            y_mean=float(cfg.get("render_noise_y_mean", 0.0)),
+            y_std=float(cfg.get("render_noise_y_std", 0.0)),
+            z_mean=float(cfg.get("render_noise_z_mean", 0.0)),
+            z_std=float(cfg.get("render_noise_z_std", 0.0)),
+            heading_mean_deg=float(cfg.get("render_noise_heading_mean_deg", 0.0)),
+            heading_std_deg=float(cfg.get("render_noise_heading_std_deg", 0.0)),
+        )
+
+    @property
+    def active(self) -> bool:
+        """Whether applying this would change anything."""
+        return self.enabled and any(
+            v != 0.0
+            for v in (
+                self.x_mean,
+                self.x_std,
+                self.y_mean,
+                self.y_std,
+                self.z_mean,
+                self.z_std,
+                self.heading_mean_deg,
+                self.heading_std_deg,
+            )
+        )
+
+
+def apply_render_noise(agents: torch.Tensor, noise: RenderNoise) -> None:
+    """Jitter `agents` (`[A, 8] = x, y, cos_h, sin_h, length, width, height, type`) in place.
+
+    A no-op axis (mean and std both 0) is skipped rather than sampling a
+    zero-variance normal, so a `RenderNoise()` default costs nothing.
+    """
+    n = agents.shape[0]
+    device = agents.device
+    if noise.x_mean or noise.x_std:
+        agents[:, 0] += torch.randn(n, device=device) * noise.x_std + noise.x_mean
+    if noise.y_mean or noise.y_std:
+        agents[:, 1] += torch.randn(n, device=device) * noise.y_std + noise.y_mean
+    if noise.z_mean or noise.z_std:
+        agents[:, 6] += torch.randn(n, device=device) * noise.z_std + noise.z_mean
+        # A zero or negative height degenerates the box into nothing the
+        # rasterizer can draw a face for.
+        agents[:, 6].clamp_(min=0.05)
+    if noise.heading_mean_deg or noise.heading_std_deg:
+        mean_rad = math.radians(noise.heading_mean_deg)
+        std_rad = math.radians(noise.heading_std_deg)
+        dtheta = torch.randn(n, device=device) * std_rad + mean_rad
+        cos_h, sin_h = agents[:, 2].clone(), agents[:, 3].clone()
+        cos_d, sin_d = torch.cos(dtheta), torch.sin(dtheta)
+        agents[:, 2] = cos_h * cos_d - sin_h * sin_d
+        agents[:, 3] = cos_h * sin_d + sin_h * cos_d
 
 
 def display_order(cameras: list[Camera]) -> list[int]:
@@ -55,9 +144,16 @@ class PerspectiveVecEnv:
     attributes, `num_agents`, `agents_per_batch` and `driver_env`.
     """
 
-    def __init__(self, vecenv, cameras: list[Camera] | str | None = None, device: str = "cuda"):
+    def __init__(
+        self,
+        vecenv,
+        cameras: list[Camera] | str | None = None,
+        device: str = "cuda",
+        render_noise: RenderNoise | None = None,
+    ):
         self.vecenv = vecenv
         self.device = torch.device(device)
+        self.render_noise = render_noise or RenderNoise()
         if self.device.type != "cuda":
             raise ValueError("PerspectiveVecEnv needs a CUDA device for the rasterizer")
 
@@ -223,6 +319,12 @@ class PerspectiveVecEnv:
         egos_t = torch.from_numpy(np.ascontiguousarray(egos)).to(self.device, non_blocking=True)
         ego_scene = torch.from_numpy(scene_ids).to(self.device, non_blocking=True)
         agent_ranges = torch.tensor(agent_offsets, dtype=torch.int32, device=self.device)
+
+        # `agents_t` is already a copy off the C buffers (the `.to` above), so
+        # jittering it here reaches only the rasterizer, never the real Entity
+        # state `env.step` and reward computed against.
+        if self.render_noise.active:
+            apply_render_noise(agents_t, self.render_noise)
 
         raster_cuda.render(
             agents_t,
