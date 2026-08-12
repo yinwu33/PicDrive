@@ -10,13 +10,32 @@
 // trip and needs no graphics driver.
 //
 // Structure, per rendered image:
-//   1. transform_kernel bins nothing and simply projects every primitive into
-//      screen space once, writing triangles to a scratch buffer. Scenes hold on
-//      the order of a thousand segments, so this is cheap and avoids
-//      re-transforming per pixel.
-//   2. raster_kernel takes one tile of one image per block. Threads cooperatively
-//      compact the triangles whose bounding box meets the tile into shared
-//      memory, then each thread shades its own pixels against that short list.
+//   1. count_kernel projects every primitive and counts the triangles that land
+//      on screen, without writing them.
+//   2. The host prefix-sums those counts, so each image owns exactly as much
+//      scratch as it needs.
+//   3. transform_kernel repeats the projection and writes the surviving
+//      triangles compacted into that slice, alongside the index each triangle
+//      would have had in the old fixed-stride layout.
+//   4. raster_kernel takes one tile of one image per block, one pixel per thread.
+//      Threads cooperatively compact the triangles whose bounding box meets the
+//      tile into shared memory, a chunk at a time, and each thread shades its own
+//      pixel against each chunk in turn.
+//
+// Compaction is what makes this affordable at self-play scale. A scene holds a
+// couple of thousand road segments but one 96x64 camera sees about a sixth of
+// them, and the rest used to occupy scratch and be rescanned by every tile: at
+// 2048 egos x 3 cameras that was 5.4 GB written and 17.7 GB reread per step,
+// more than half of it padding to the largest scene in the batch. Counting first
+// costs one extra projection pass, which is compute the transform was not bound
+// by, and removes both.
+//
+// The scratch order now depends on the order threads happen to reserve slots in,
+// so nothing downstream may depend on it. Nothing does: `tri_index` carries the
+// old fixed-stride index, road fragments merge by colour and sort on it, and
+// agent fragments sort on (quantised depth, index). Both orderings are recovered
+// from the key rather than from the buffer, which is what makes the compaction
+// safe.
 //
 // Visibility follows the reference's three layers: an analytic ray/ground-plane
 // background, road markings drawn over it (coplanar, so no depth test), and agent
@@ -39,17 +58,32 @@ namespace pufferlib {
 // u0,v0,z0, u1,v1,z1, u2,v2,z2, r,g,b, umin,umax,vmin,vmax
 #define TRI_STRIDE 16
 
-// Scratch slots reserved per source triangle. Clipping one triangle against the
-// near plane yields at most two, and slots are addressed by primitive index
-// rather than by an allocator, so each primitive owns a fixed pair. That doubles
-// the scratch buffer; the alternative, an atomic bump allocator, would make the
-// triangle ordering depend on thread scheduling.
+// Index slots reserved per source triangle. Clipping one triangle against the
+// near plane yields at most two, and the pair shares a base index so the
+// tie-break key stays exactly what the fixed-stride layout used to produce.
 #define TRIS_PER_PRIM 2
 
 // Screen-space tile handled by one block.
 #define TILE_W 32
 #define TILE_H 16
-#define MAX_TILE_TRIS 4096
+
+// Threads per block. The raster pass runs one thread per tile pixel, which is
+// what lets a pixel's fragment state live in that thread across the chunk loop
+// below, and what lifts occupancy: shared memory is charged per block, so at 128
+// threads a 32 KB block bought only 384 resident threads on an A6000 (25% of the
+// 1536 it can hold), while at 512 it buys all of them from the same allocation.
+#define TRANSFORM_THREADS 128
+#define RASTER_THREADS (TILE_W * TILE_H)
+
+// Triangles staged into shared memory at a time. The tile's triangles are walked
+// in index-range chunks of this size, so the staging list cannot overflow however
+// dense the scene is -- at most TILE_CHUNK candidates are ever offered to it. The
+// fixed 4096-entry list this replaces silently dropped whatever a tile held past
+// it; measured on a 2048-ego batch the mean tile holds 58 road triangles and the
+// densest 4074, so the cap had to be sized for a case 70x the mean and still had
+// no margin. Road and agent triangles reuse the one buffer, since their passes
+// are sequential.
+#define TILE_CHUNK 1024
 
 // Fragments retained per pixel per layer, nearest first. Front-to-back
 // compositing terminates once alpha saturates, so this only truncates when many
@@ -154,38 +188,27 @@ __device__ __forceinline__ void to_camera(const Cam &c, const float *ego, float 
     out[2] = c.rot[6] * ex + c.rot[7] * ey + c.rot[8] * ez;
 }
 
-// An inverted bounding box marks a slot empty; the tile test rejects it.
-__device__ __forceinline__ void mark_empty(float *scratch, int slot) {
-    float *t = scratch + (size_t)slot * TRI_STRIDE;
-    t[12] = 1.0f; t[13] = -1.0f; t[14] = 1.0f; t[15] = -1.0f;
-}
-
-// Emit one screen-space triangle. Every vertex must already be at or beyond the
-// near plane, which is what emit_clipped below guarantees.
-// Slots are assigned by primitive index rather than by an atomic counter, so the
-// triangle ordering is deterministic and identical to the reference's. Ties in
-// fragment depth are then broken by that index, which makes the composited result
-// independent of the order threads happen to visit primitives in.
-__device__ __forceinline__ void emit_triangle(float *scratch, int slot, const Cam &c, const float *p0,
-                                              const float *p1, const float *p2, const float *color) {
-    float *t = scratch + (size_t)slot * TRI_STRIDE;
-
+// Project one camera-frame triangle to screen space. Returns false when its
+// bounding box misses the frame, which is the test that used to run after the
+// triangle had already been written to scratch. Every vertex must already be at
+// or beyond the near plane, which is what clip_prim below guarantees.
+__device__ __forceinline__ bool project_tri(const Cam &c, const float *p0, const float *p1,
+                                            const float *p2, const float *color, float *t) {
     float u0 = c.fx * p0[0] / p0[2] + c.cx, v0 = c.fy * p0[1] / p0[2] + c.cy;
     float u1 = c.fx * p1[0] / p1[2] + c.cx, v1 = c.fy * p1[1] / p1[2] + c.cy;
     float u2 = c.fx * p2[0] / p2[2] + c.cx, v2 = c.fy * p2[1] / p2[2] + c.cy;
 
     float umin = fminf(u0, fminf(u1, u2)), umax = fmaxf(u0, fmaxf(u1, u2));
     float vmin = fminf(v0, fminf(v1, v2)), vmax = fmaxf(v0, fmaxf(v1, v2));
-    if (umax < -0.5f || umin > c.width + 0.5f || vmax < -0.5f || vmin > c.height + 0.5f) {
-        t[12] = 1.0f; t[13] = -1.0f; t[14] = 1.0f; t[15] = -1.0f;
-        return;
-    }
+    if (umax < -0.5f || umin > c.width + 0.5f || vmax < -0.5f || vmin > c.height + 0.5f) return false;
 
+    if (t == nullptr) return true;
     t[0] = u0; t[1] = v0; t[2] = p0[2];
     t[3] = u1; t[4] = v1; t[5] = p1[2];
     t[6] = u2; t[7] = v2; t[8] = p2[2];
     t[9] = color[0]; t[10] = color[1]; t[11] = color[2];
     t[12] = umin; t[13] = umax; t[14] = vmin; t[15] = vmax;
+    return true;
 }
 
 // Where the segment p_in -> p_out crosses the near plane. p_out is behind the
@@ -200,8 +223,31 @@ __device__ __forceinline__ void near_point(const float *p_in, const float *p_out
     for (int k = 0; k < 3; k++) out[k] = p_in[k] + t * (p_out[k] - p_in[k]);
 }
 
-// Clip a camera-frame triangle against the near plane into the slot pair the
-// primitive owns.
+// Reserve a compacted slot and store the triangle, or just count it when
+// `data` is null. `base_idx` is the index this triangle had in the old
+// fixed-stride layout and travels with it as the tie-break key.
+__device__ __forceinline__ void put_tri(const Cam &c, const float *p0, const float *p1, const float *p2,
+                                        const float *color, int base_idx, float *data, int *index,
+                                        int *cursor, int capacity, int &counted) {
+    if (data == nullptr) {
+        if (project_tri(c, p0, p1, p2, color, nullptr)) counted++;
+        return;
+    }
+    float rec[TRI_STRIDE];
+    if (!project_tri(c, p0, p1, p2, color, rec)) return;
+    int slot = atomicAdd(cursor, 1);
+    // Exact by construction: the counting pass runs this same projection. The
+    // bound is insurance against a write past the slice rather than an expected
+    // path -- dropping a triangle is far cheaper than corrupting a neighbour.
+    if (slot >= capacity) return;
+    float *dst = data + (size_t)slot * TRI_STRIDE;
+#pragma unroll
+    for (int k = 0; k < TRI_STRIDE; k++) dst[k] = rec[k];
+    index[slot] = base_idx;
+    counted++;
+}
+
+// Clip a camera-frame triangle against the near plane and emit the pieces.
 //
 // Dropping straddling triangles instead, which is what this used to do, blanks
 // whatever the camera is standing on. With the drivable area drawn as ground
@@ -211,8 +257,10 @@ __device__ __forceinline__ void near_point(const float *p_in, const float *p_out
 // flickered off block by block as the car drove. The cut and the order the pieces
 // are emitted in mirror raster_ref._clip_near, so both implementations rasterize
 // the same geometry.
-__device__ __forceinline__ void emit_clipped(float *scratch, int slot, const Cam &c, const float *p0,
-                                             const float *p1, const float *p2, const float *color) {
+__device__ __forceinline__ void clip_prim(const Cam &c, const float *p0, const float *p1,
+                                          const float *p2, const float *color, int base_idx,
+                                          float *data, int *index, int *cursor, int capacity,
+                                          int &counted) {
     const float *p[3] = {p0, p1, p2};
     int inside[3];
     int n_inside = 0;
@@ -222,14 +270,10 @@ __device__ __forceinline__ void emit_clipped(float *scratch, int slot, const Cam
         n_inside += inside[i];
     }
 
+    if (n_inside == 0) return;
+
     if (n_inside == 3) {
-        emit_triangle(scratch, slot, c, p0, p1, p2, color);
-        mark_empty(scratch, slot + 1);
-        return;
-    }
-    if (n_inside == 0) {
-        mark_empty(scratch, slot);
-        mark_empty(scratch, slot + 1);
+        put_tri(c, p0, p1, p2, color, base_idx, data, index, cursor, capacity, counted);
         return;
     }
 
@@ -240,8 +284,7 @@ __device__ __forceinline__ void emit_clipped(float *scratch, int slot, const Cam
         float ab[3], ad[3];
         near_point(a, b, c.near_z, ab);
         near_point(a, d, c.near_z, ad);
-        emit_triangle(scratch, slot, c, a, ab, ad, color);
-        mark_empty(scratch, slot + 1);
+        put_tri(c, a, ab, ad, color, base_idx, data, index, cursor, capacity, counted);
         return;
     }
 
@@ -251,20 +294,25 @@ __device__ __forceinline__ void emit_clipped(float *scratch, int slot, const Cam
     float ab[3], ad[3];
     near_point(b, a, c.near_z, ab);
     near_point(d, a, c.near_z, ad);
-    emit_triangle(scratch, slot, c, b, d, ad, color);
-    emit_triangle(scratch, slot + 1, c, b, ad, ab, color);
+    put_tri(c, b, d, ad, color, base_idx, data, index, cursor, capacity, counted);
+    put_tri(c, b, ad, ab, color, base_idx + 1, data, index, cursor, capacity, counted);
 }
 
-// One block per (image, layer). Projects that layer's primitives into scratch.
+// Project one image's primitives, either counting the survivors or writing them.
+// Both passes call this so the count is exactly what the write produces.
+//
 // Egos are grouped into scenes; each scene owns a contiguous slice of the agent
 // and road arrays. One launch therefore covers every environment in the batch,
 // which matters because a training step holds on the order of a hundred of them
 // and per-scene launches would be dominated by their own overhead.
-__global__ void transform_kernel(const float *agents, const float *roads, const float *egos,
-                                 int ego_stride, const float *rig, int num_cams, const int *ego_scene,
-                                 const int *agent_ranges, const int *road_ranges, float *road_scratch,
-                                 int max_road_tris, float *agent_scratch, int max_agent_tris) {
-    int image = blockIdx.x;
+__device__ __forceinline__ void project_image(int image, const float *agents, const float *roads,
+                                              const float *egos, int ego_stride, const float *rig,
+                                              int num_cams, const int *ego_scene,
+                                              const int *agent_ranges, const int *road_ranges,
+                                              float *road_data, int *road_index, int *road_cursor,
+                                              int road_capacity, float *agent_data, int *agent_index,
+                                              int *agent_cursor, int agent_capacity, int &n_road,
+                                              int &n_agent) {
     int ego_i = image / num_cams;
     int cam_i = image % num_cams;
     Cam c = load_cam(rig, cam_i);
@@ -276,16 +324,6 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
     int road_lo = road_ranges[scene], road_hi = road_ranges[scene + 1];
     int num_agents = agent_hi - agent_lo;
     int num_roads = road_hi - road_lo;
-
-    float *r_scratch = road_scratch + (size_t)image * max_road_tris * TRI_STRIDE;
-    float *a_scratch = agent_scratch + (size_t)image * max_agent_tris * TRI_STRIDE;
-
-    // Slots past this scene's primitive count are marked empty so the tile scan,
-    // which walks a fixed stride, skips them.
-    for (int i = num_roads * 2 * TRIS_PER_PRIM + threadIdx.x; i < max_road_tris; i += blockDim.x)
-        mark_empty(r_scratch, i);
-    for (int i = num_agents * 12 * TRIS_PER_PRIM + threadIdx.x; i < max_agent_tris; i += blockDim.x)
-        mark_empty(a_scratch, i);
 
     for (int i = threadIdx.x; i < num_roads; i += blockDim.x) {
         const float *r = roads + (size_t)(road_lo + i) * RASTER_ROAD_FEATURES;
@@ -308,21 +346,16 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         to_camera(c, ego, r[2] - nx, r[3] - ny, road_z, d);
         to_camera(c, ego, r[2] + nx, r[3] + ny, road_z, e);
         // Reference order is every first triangle, then every second.
-        emit_clipped(r_scratch, TRIS_PER_PRIM * i, c, a, b, d, col);
-        emit_clipped(r_scratch, TRIS_PER_PRIM * (num_roads + i), c, a, d, e, col);
+        clip_prim(c, a, b, d, col, TRIS_PER_PRIM * i, road_data, road_index, road_cursor,
+                  road_capacity, n_road);
+        clip_prim(c, a, d, e, col, TRIS_PER_PRIM * (num_roads + i), road_data, road_index,
+                  road_cursor, road_capacity, n_road);
     }
 
     for (int i = threadIdx.x; i < num_agents; i += blockDim.x) {
-        // A camera does not see the vehicle it is mounted on. The slots are still
-        // written, marked empty, so indices stay aligned with the reference.
-        if (i == self_index) {
-            for (int t = 0; t < 12; t++) {
-                int slot = TRIS_PER_PRIM * (t * num_agents + i);
-                mark_empty(a_scratch, slot);
-                mark_empty(a_scratch, slot + 1);
-            }
-            continue;
-        }
+        // A camera does not see the vehicle it is mounted on.
+        if (i == self_index) continue;
+
         const float *g = agents + (size_t)(agent_lo + i) * RASTER_AGENT_FEATURES;
         float cos_h = g[2], sin_h = g[3];
         float half_l = g[4] * 0.5f, half_w = g[5] * 0.5f, height = g[6];
@@ -345,10 +378,58 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         for (int t = 0; t < 12; t++) {
             float shade = FACE_SHADE[t / 2];
             float col[3] = {base[0] * shade, base[1] * shade, base[2] * shade};
-            emit_clipped(a_scratch, TRIS_PER_PRIM * (t * num_agents + i), c, corners[BOX_TRIS[t][0]],
-                         corners[BOX_TRIS[t][1]], corners[BOX_TRIS[t][2]], col);
+            clip_prim(c, corners[BOX_TRIS[t][0]], corners[BOX_TRIS[t][1]], corners[BOX_TRIS[t][2]],
+                      col, TRIS_PER_PRIM * (t * num_agents + i), agent_data, agent_index,
+                      agent_cursor, agent_capacity, n_agent);
         }
     }
+}
+
+// Pass 1: how many triangles of each layer land on screen, per image.
+__global__ void count_kernel(const float *agents, const float *roads, const float *egos,
+                             int ego_stride, const float *rig, int num_cams, const int *ego_scene,
+                             const int *agent_ranges, const int *road_ranges, int *road_counts,
+                             int *agent_counts) {
+    int image = blockIdx.x;
+    __shared__ int block_road, block_agent;
+    if (threadIdx.x == 0) { block_road = 0; block_agent = 0; }
+    __syncthreads();
+
+    int n_road = 0, n_agent = 0;
+    project_image(image, agents, roads, egos, ego_stride, rig, num_cams, ego_scene, agent_ranges,
+                  road_ranges, nullptr, nullptr, nullptr, 0, nullptr, nullptr, nullptr, 0, n_road,
+                  n_agent);
+
+    atomicAdd(&block_road, n_road);
+    atomicAdd(&block_agent, n_agent);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        road_counts[image] = block_road;
+        agent_counts[image] = block_agent;
+    }
+}
+
+// Pass 2: write those triangles compacted into the slice the prefix sum assigned.
+__global__ void transform_kernel(const float *agents, const float *roads, const float *egos,
+                                 int ego_stride, const float *rig, int num_cams, const int *ego_scene,
+                                 const int *agent_ranges, const int *road_ranges,
+                                 const int *road_offsets, const int *agent_offsets, float *road_data,
+                                 int *road_index, float *agent_data, int *agent_index) {
+    int image = blockIdx.x;
+    __shared__ int road_cursor, agent_cursor;
+    if (threadIdx.x == 0) { road_cursor = 0; agent_cursor = 0; }
+    __syncthreads();
+
+    int road_base = road_offsets[image];
+    int agent_base = agent_offsets[image];
+    int road_cap = road_offsets[image + 1] - road_base;
+    int agent_cap = agent_offsets[image + 1] - agent_base;
+
+    int n_road = 0, n_agent = 0;
+    project_image(image, agents, roads, egos, ego_stride, rig, num_cams, ego_scene, agent_ranges,
+                  road_ranges, road_data + (size_t)road_base * TRI_STRIDE, road_index + road_base,
+                  &road_cursor, road_cap, agent_data + (size_t)agent_base * TRI_STRIDE,
+                  agent_index + agent_base, &agent_cursor, agent_cap, n_road, n_agent);
 }
 
 // Analytic edge coverage and interpolated depth for one triangle at one pixel.
@@ -519,10 +600,11 @@ __device__ __forceinline__ void composite(const float *fd, const float *fc, int 
     acc[3] = trans;
 }
 
-__global__ void raster_kernel(const float *roads, const float *egos, int ego_stride, const float *rig, int num_cams,
-                              const int *ego_scene, const int *agent_ranges, const int *road_ranges,
-                              const float *road_scratch, const float *agent_scratch, int max_road_tris,
-                              int max_agent_tris, unsigned char *out, int tiles_x, int tiles_y) {
+__global__ void raster_kernel(const float *roads, const float *egos, int ego_stride, const float *rig,
+                              int num_cams, const int *ego_scene, const int *road_ranges,
+                              const int *road_offsets, const int *agent_offsets,
+                              const float *road_data, const int *road_index, const float *agent_data,
+                              const int *agent_index, unsigned char *out, int tiles_x, int tiles_y) {
     int image = blockIdx.x;
     int tile = blockIdx.y;
     int tile_x = (tile % tiles_x) * TILE_W;
@@ -533,122 +615,134 @@ __global__ void raster_kernel(const float *roads, const float *egos, int ego_str
 
     int scene = ego_scene[image / num_cams];
     int road_lo = road_ranges[scene], road_hi = road_ranges[scene + 1];
-    int road_total = (road_hi - road_lo) * 2 * TRIS_PER_PRIM;
-    int agent_total = (agent_ranges[scene + 1] - agent_ranges[scene]) * 12 * TRIS_PER_PRIM;
     // fill_render_roads emits lane areas last. Their renderer-only tag opts only
     // teddy/giga into black non-road ground; ocean retains the original gray.
     bool black_ground = road_hi > road_lo && (int)roads[(size_t)(road_hi - 1) * RASTER_ROAD_FEATURES + 5] == 11;
 
-    extern __shared__ int shared_idx[];
-    int *road_list = shared_idx;
-    int *agent_list = shared_idx + MAX_TILE_TRIS;
-    __shared__ int n_road, n_agent;
-    if (threadIdx.x == 0) { n_road = 0; n_agent = 0; }
-    __syncthreads();
+    int road_base = road_offsets[image];
+    int agent_base = agent_offsets[image];
+    int road_total = road_offsets[image + 1] - road_base;
+    int agent_total = agent_offsets[image + 1] - agent_base;
+    const float *r_scratch = road_data + (size_t)road_base * TRI_STRIDE;
+    const float *a_scratch = agent_data + (size_t)agent_base * TRI_STRIDE;
+    const int *r_index = road_index + road_base;
+    const int *a_index = agent_index + agent_base;
+
+    __shared__ int tri_list[TILE_CHUNK];
+    __shared__ int n_tri;
 
     float tu0 = tile_x - 0.5f, tu1 = tile_x + TILE_W + 0.5f;
     float tv0 = tile_y - 0.5f, tv1 = tile_y + TILE_H + 0.5f;
 
-    const float *r_scratch = road_scratch + (size_t)image * max_road_tris * TRI_STRIDE;
-    const float *a_scratch = agent_scratch + (size_t)image * max_agent_tris * TRI_STRIDE;
+    // One pixel per thread, fixed for the life of the block.
+    int lx = threadIdx.x % TILE_W, ly = threadIdx.x / TILE_W;
+    int x = tile_x + lx, y = tile_y + ly;
+    bool in_frame = (x < c.width && y < c.height);
+    float px = x + 0.5f, py = y + 0.5f;
 
-    // Compact the triangles that touch this tile, preserving scratch order so the
-    // result does not depend on scheduling.
-    for (int i = threadIdx.x; i < road_total; i += blockDim.x) {
-        const float *t = r_scratch + (size_t)i * TRI_STRIDE;
-        if (t[13] >= tu0 && t[12] <= tu1 && t[15] >= tv0 && t[14] <= tv1) {
-            int s = atomicAdd(&n_road, 1);
-            if (s < MAX_TILE_TRIS) road_list[s] = i;
-        }
+    // Background: sky above the horizon, asphalt below with exact depth from
+    // the ray/ground-plane intersection.
+    float dcx = (px - c.cx) / c.fx, dcy = (py - c.cy) / c.fy;
+    // Camera -> ego is the transpose of the ego -> camera rotation.
+    float dez = c.rot[2] * dcx + c.rot[5] * dcy + c.rot[8];
+    float ground_depth = INFINITY;
+    float rgb[3];
+    if (dez < -1e-6f) {
+        ground_depth = -c.pos[2] / dez;  // dcz is 1, so the ray parameter is the depth
+        float s = depth_scale(ground_depth);
+        const float ground[3] = {
+            black_ground ? 0.0f : 0.16f,
+            black_ground ? 0.0f : 0.16f,
+            black_ground ? 0.0f : 0.17f,
+        };
+#pragma unroll
+        for (int k = 0; k < 3; k++) rgb[k] = ground[k] * s + PALETTE_SKY[k] * (1.0f - s);
+    } else {
+#pragma unroll
+        for (int k = 0; k < 3; k++) rgb[k] = PALETTE_SKY[k];
     }
-    for (int i = threadIdx.x; i < agent_total; i += blockDim.x) {
-        const float *t = a_scratch + (size_t)i * TRI_STRIDE;
-        if (t[13] >= tu0 && t[12] <= tu1 && t[15] >= tv0 && t[14] <= tv1) {
-            int s = atomicAdd(&n_agent, 1);
-            if (s < MAX_TILE_TRIS) agent_list[s] = i;
+
+    float fd[MAX_FRAGS];
+    float fc[MAX_FRAGS * 4];
+    int fi[MAX_FRAGS];
+
+    // Layer 1: road markings. Coplanar with the ground, so drawn over it rather
+    // than depth-tested against it. The fragment set survives the chunk loop, so
+    // splitting the triangle list changes nothing about what it ends up holding.
+    int count = 0;
+    for (int base = 0; base < road_total; base += TILE_CHUNK) {
+        int hi = min(base + TILE_CHUNK, road_total);
+        if (threadIdx.x == 0) n_tri = 0;
+        __syncthreads();
+        for (int i = base + threadIdx.x; i < hi; i += blockDim.x) {
+            const float *t = r_scratch + (size_t)i * TRI_STRIDE;
+            if (t[13] >= tu0 && t[12] <= tu1 && t[15] >= tv0 && t[14] <= tv1)
+                tri_list[atomicAdd(&n_tri, 1)] = i;
         }
+        __syncthreads();
+        int nr = n_tri;
+        if (in_frame) {
+            for (int i = 0; i < nr; i++) {
+                int local = tri_list[i];
+                const float *t = r_scratch + (size_t)local * TRI_STRIDE;
+                float depth;
+                float cov = coverage_depth(t, px, py, &depth);
+                if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z) continue;
+                accumulate_road_fragment(fd, fc, fi, count, depth, r_index[local], t + 9, cov);
+            }
+        }
+        __syncthreads();
     }
-    __syncthreads();
-    int nr = min(n_road, MAX_TILE_TRIS);
-    int na = min(n_agent, MAX_TILE_TRIS);
-
-    int pixels = TILE_W * TILE_H;
-    for (int p = threadIdx.x; p < pixels; p += blockDim.x) {
-        int lx = p % TILE_W, ly = p / TILE_W;
-        int x = tile_x + lx, y = tile_y + ly;
-        if (x >= c.width || y >= c.height) continue;
-        float px = x + 0.5f, py = y + 0.5f;
-
-        // Background: sky above the horizon, asphalt below with exact depth from
-        // the ray/ground-plane intersection.
-        float dcx = (px - c.cx) / c.fx, dcy = (py - c.cy) / c.fy;
-        // Camera -> ego is the transpose of the ego -> camera rotation.
-        float dez = c.rot[2] * dcx + c.rot[5] * dcy + c.rot[8];
-        float ground_depth = INFINITY;
-        float rgb[4];
-        if (dez < -1e-6f) {
-            ground_depth = -c.pos[2] / dez;  // dcz is 1, so the ray parameter is the depth
-            float s = depth_scale(ground_depth);
-            const float ground[3] = {
-                black_ground ? 0.0f : 0.16f,
-                black_ground ? 0.0f : 0.16f,
-                black_ground ? 0.0f : 0.17f,
-            };
+    if (count) {
+        finalize_road_fragments(fd, fc, fi, count);
+        float acc[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        composite(fd, fc, count, acc);
 #pragma unroll
-            for (int k = 0; k < 3; k++) rgb[k] = ground[k] * s + PALETTE_SKY[k] * (1.0f - s);
-        } else {
-#pragma unroll
-            for (int k = 0; k < 3; k++) rgb[k] = PALETTE_SKY[k];
-        }
+        for (int k = 0; k < 3; k++) rgb[k] = acc[k] + rgb[k] * acc[3];
+    }
 
-        float fd[MAX_FRAGS];
-        float fc[MAX_FRAGS * 4];
-        int fi[MAX_FRAGS];
-
-        // Layer 1: road markings. Coplanar with the ground, so drawn over it
-        // rather than depth-tested against it.
-        int count = 0;
-        for (int i = 0; i < nr; i++) {
-            const float *t = r_scratch + (size_t)road_list[i] * TRI_STRIDE;
-            float depth;
-            float cov = coverage_depth(t, px, py, &depth);
-            if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z) continue;
-            accumulate_road_fragment(fd, fc, fi, count, depth, road_list[i], t + 9, cov);
+    // Layer 2: agent boxes, bounded by the ground intercept. A box farther than
+    // the ground point seen through this pixel cannot be visible here.
+    count = 0;
+    for (int base = 0; base < agent_total; base += TILE_CHUNK) {
+        int hi = min(base + TILE_CHUNK, agent_total);
+        if (threadIdx.x == 0) n_tri = 0;
+        __syncthreads();
+        for (int i = base + threadIdx.x; i < hi; i += blockDim.x) {
+            const float *t = a_scratch + (size_t)i * TRI_STRIDE;
+            if (t[13] >= tu0 && t[12] <= tu1 && t[15] >= tv0 && t[14] <= tv1)
+                tri_list[atomicAdd(&n_tri, 1)] = i;
         }
-        if (count) {
-            finalize_road_fragments(fd, fc, fi, count);
-            float acc[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            composite(fd, fc, count, acc);
+        __syncthreads();
+        int na = n_tri;
+        if (in_frame) {
+            for (int i = 0; i < na; i++) {
+                int local = tri_list[i];
+                const float *t = a_scratch + (size_t)local * TRI_STRIDE;
+                float depth;
+                float cov = coverage_depth(t, px, py, &depth);
+                if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z ||
+                    depth > ground_depth * (1.0f + GROUND_DEPTH_SLACK))
+                    continue;
+                insert_fragment(fd, fc, fi, count, depth, a_index[local], t + 9, cov);
+            }
+        }
+        __syncthreads();
+    }
+    if (count) {
+        float acc[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        composite(fd, fc, count, acc);
 #pragma unroll
-            for (int k = 0; k < 3; k++) rgb[k] = acc[k] + rgb[k] * acc[3];
-        }
+        for (int k = 0; k < 3; k++) rgb[k] = acc[k] + rgb[k] * acc[3];
+    }
 
-        // Layer 2: agent boxes, bounded by the ground intercept. A box farther
-        // than the ground point seen through this pixel cannot be visible here.
-        count = 0;
-        for (int i = 0; i < na; i++) {
-            const float *t = a_scratch + (size_t)agent_list[i] * TRI_STRIDE;
-            float depth;
-            float cov = coverage_depth(t, px, py, &depth);
-            if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z ||
-                depth > ground_depth * (1.0f + GROUND_DEPTH_SLACK))
-                continue;
-            insert_fragment(fd, fc, fi, count, depth, agent_list[i], t + 9, cov);
-        }
-        if (count) {
-            float acc[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            composite(fd, fc, count, acc);
+    if (!in_frame) return;
+    size_t plane = (size_t)c.width * c.height;
+    size_t base = (size_t)image * 3 * plane + (size_t)y * c.width + x;
 #pragma unroll
-            for (int k = 0; k < 3; k++) rgb[k] = acc[k] + rgb[k] * acc[3];
-        }
-
-        size_t plane = (size_t)c.width * c.height;
-        size_t base = (size_t)image * 3 * plane + (size_t)y * c.width + x;
-#pragma unroll
-        for (int k = 0; k < 3; k++) {
-            float v = fminf(fmaxf(rgb[k], 0.0f), 1.0f) * 255.0f + 0.5f;
-            out[base + k * plane] = (unsigned char)v;
-        }
+    for (int k = 0; k < 3; k++) {
+        float v = fminf(fmaxf(rgb[k], 0.0f), 1.0f) * 255.0f + 0.5f;
+        out[base + k * plane] = (unsigned char)v;
     }
 }
 
@@ -677,8 +771,6 @@ void drive_raster_cuda(torch::Tensor agents, torch::Tensor roads, torch::Tensor 
     TORCH_CHECK(egos.dim() == 2 && egos.size(1) >= 4, "egos must be [E, 4] or [E, 5]");
     TORCH_CHECK(rig.dim() == 2 && rig.size(1) == RASTER_RIG_STRIDE, "rig must be [C, 20]");
 
-    int num_agents = agents.size(0);
-    int num_roads = roads.size(0);
     int num_egos = egos.size(0);
     int ego_stride = egos.size(1);
     int num_cams = rig.size(0);
@@ -686,48 +778,59 @@ void drive_raster_cuda(torch::Tensor agents, torch::Tensor roads, torch::Tensor 
     TORCH_CHECK(out.dim() == 5 && out.size(0) == num_egos && out.size(1) == num_cams && out.size(2) == 3,
                 "out must be [E, C, 3, H, W]");
     int height = out.size(3), width = out.size(4);
+    TORCH_CHECK(ego_scene.size(0) == num_egos, "ego_scene must have one entry per ego");
 
     auto opts_f = torch::TensorOptions().dtype(torch::kFloat32).device(agents.device());
     auto opts_i = torch::TensorOptions().dtype(torch::kInt32).device(agents.device());
 
-    TORCH_CHECK(ego_scene.size(0) == num_egos, "ego_scene must have one entry per ego");
+    const float *agents_p = agents.data_ptr<float>();
+    const float *roads_p = roads.data_ptr<float>();
+    const float *egos_p = egos.data_ptr<float>();
+    const float *rig_p = rig.data_ptr<float>();
+    const int *scene_p = ego_scene.data_ptr<int>();
+    const int *ar_p = agent_ranges.data_ptr<int>();
+    const int *rr_p = road_ranges.data_ptr<int>();
 
-    // Scratch is sized by the largest scene in the batch, since every image walks
-    // a fixed stride.
-    auto ar = agent_ranges.to(torch::kCPU);
-    auto rr = road_ranges.to(torch::kCPU);
-    const int *arp = ar.data_ptr<int>();
-    const int *rrp = rr.data_ptr<int>();
-    int num_scenes = ar.size(0) - 1;
-    int max_scene_agents = 0, max_scene_roads = 0;
-    for (int i = 0; i < num_scenes; i++) {
-        max_scene_agents = std::max(max_scene_agents, arp[i + 1] - arp[i]);
-        max_scene_roads = std::max(max_scene_roads, rrp[i + 1] - rrp[i]);
-    }
-    int max_road_tris = std::max(max_scene_roads * 2 * TRIS_PER_PRIM, 1);
-    int max_agent_tris = std::max(max_scene_agents * 12 * TRIS_PER_PRIM, 1);
-    (void)opts_i;
-    (void)num_roads;
-    (void)num_agents;
+    // Pass 1: count the on-screen triangles each image will produce, so its
+    // scratch slice can be sized exactly rather than padded to the largest scene
+    // in the batch.
+    auto counts = torch::empty({2, num_images}, opts_i);
+    count_kernel<<<num_images, TRANSFORM_THREADS>>>(agents_p, roads_p, egos_p, ego_stride, rig_p,
+                                                    num_cams, scene_p, ar_p, rr_p,
+                                                    counts[0].data_ptr<int>(),
+                                                    counts[1].data_ptr<int>());
 
-    auto road_scratch = torch::empty({(int64_t)num_images * max_road_tris * TRI_STRIDE}, opts_f);
-    auto agent_scratch = torch::empty({(int64_t)num_images * max_agent_tris * TRI_STRIDE}, opts_f);
-    transform_kernel<<<num_images, 128>>>(
-        agents.data_ptr<float>(), roads.data_ptr<float>(), egos.data_ptr<float>(), ego_stride,
-        rig.data_ptr<float>(), num_cams, ego_scene.data_ptr<int>(), agent_ranges.data_ptr<int>(),
-        road_ranges.data_ptr<int>(), road_scratch.data_ptr<float>(), max_road_tris,
-        agent_scratch.data_ptr<float>(), max_agent_tris);
+    // Exclusive prefix sum per layer, with the total in the last slot.
+    auto offsets = torch::zeros({2, num_images + 1}, opts_i);
+    offsets.slice(1, 1, num_images + 1).copy_(counts.cumsum(1).to(torch::kInt32));
+    // The only host round trip left, and it moves eight bytes: the allocator needs
+    // the totals. The scene ranges used to be copied back here as well, purely to
+    // recover a maximum the caller already knew.
+    auto totals = offsets.select(1, num_images).to(torch::kCPU);
+    int64_t total_road = std::max<int64_t>(totals[0].item<int>(), 1);
+    int64_t total_agent = std::max<int64_t>(totals[1].item<int>(), 1);
+
+    auto road_data = torch::empty({total_road * TRI_STRIDE}, opts_f);
+    auto road_index = torch::empty({total_road}, opts_i);
+    auto agent_data = torch::empty({total_agent * TRI_STRIDE}, opts_f);
+    auto agent_index = torch::empty({total_agent}, opts_i);
+
+    const int *road_off = offsets[0].data_ptr<int>();
+    const int *agent_off = offsets[1].data_ptr<int>();
+
+    transform_kernel<<<num_images, TRANSFORM_THREADS>>>(
+        agents_p, roads_p, egos_p, ego_stride, rig_p, num_cams, scene_p, ar_p, rr_p, road_off,
+        agent_off, road_data.data_ptr<float>(), road_index.data_ptr<int>(),
+        agent_data.data_ptr<float>(), agent_index.data_ptr<int>());
 
     int tiles_x = (width + TILE_W - 1) / TILE_W;
     int tiles_y = (height + TILE_H - 1) / TILE_H;
     dim3 grid(num_images, tiles_x * tiles_y);
-    size_t shmem = 2 * MAX_TILE_TRIS * sizeof(int);
 
-    raster_kernel<<<grid, 128, shmem>>>(
-        roads.data_ptr<float>(), egos.data_ptr<float>(), ego_stride, rig.data_ptr<float>(), num_cams, ego_scene.data_ptr<int>(),
-        agent_ranges.data_ptr<int>(), road_ranges.data_ptr<int>(), road_scratch.data_ptr<float>(),
-        agent_scratch.data_ptr<float>(), max_road_tris, max_agent_tris, out.data_ptr<unsigned char>(),
-        tiles_x, tiles_y);
+    raster_kernel<<<grid, RASTER_THREADS>>>(
+        roads_p, egos_p, ego_stride, rig_p, num_cams, scene_p, rr_p, road_off, agent_off,
+        road_data.data_ptr<float>(), road_index.data_ptr<int>(), agent_data.data_ptr<float>(),
+        agent_index.data_ptr<int>(), out.data_ptr<unsigned char>(), tiles_x, tiles_y);
 
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {

@@ -43,6 +43,10 @@ class RealPerceptionConfig:
         return asdict(self)
 
 
+class ViTRealPerceptionConfig(RealPerceptionConfig):
+    # TODO
+    pass
+
 class RealPerception(nn.Module):
     """Encode three real RGB views into the frozen teacher's 256-D space.
 
@@ -141,6 +145,11 @@ class RealPerception(nn.Module):
     def trainable_parameters(self) -> int:
         return sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
 
+
+
+class ViTRealPerception(nn.Module):
+    # TODO
+    pass
 
 class DistillationLoss(nn.Module):
     """The paper's adaptation objective: feature alignment plus planning agreement.
