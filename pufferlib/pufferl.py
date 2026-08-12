@@ -1112,7 +1112,7 @@ class WandbLogger:
         import wandb
 
         wandb.init(
-            id=load_id or wandb.util.generate_id(),
+            # id=load_id or wandb.util.generate_id(),
             project=args["wandb_project"],
             group=args["wandb_group"],
             allow_val_change=True,
