@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from pufferlib.pufferl import load_config
+from pufferlib.teddy.drive import raster_ref as reference
 
 
 @pytest.mark.parametrize(
@@ -60,3 +61,51 @@ def test_cuda_matches_reference_for_lane_area_palette():
     expected = reference.render(agents, roads, egos)
     actual = raster_cuda.render(agents.cuda(), roads.cuda(), egos.cuda()).cpu()
     assert (expected.int() - actual.int()).abs().max() <= 1
+
+
+def test_lane_area_segments_overlap_at_joints():
+    """`fill_render_roads` must extend each lane-area segment past its endpoints.
+
+    The strips are drawn one per polyline segment. Meeting exactly at a joint
+    leaves an uncovered wedge on the outside of every bend, and WOMD's centrelines
+    are decimated enough (3.9 m between points at the median) for those wedges to
+    show the ground through the drivable surface. Overlapping the strips instead
+    covers the wedge, and bridges the gaps where a lane feature ends short of its
+    successor.
+    """
+    import numpy as np
+
+    from pufferlib.teddy.drive.drive import Drive
+
+    try:
+        env = Drive(
+            num_agents=8,
+            num_maps=1,
+            episode_length=10,
+            obs_mode="render_state",
+            draw_lane_area=True,
+            lane_width=4.5,
+            render_road_types=0,
+        )
+    except FileNotFoundError:
+        pytest.skip("Drive map binaries are not available in this checkout")
+
+    try:
+        roads = env.render_state[0]["roads"][: env.render_state[0]["num_roads"]]
+        lane_area = roads[roads[:, 5] == reference.RENDER_LANE_AREA]
+        markings = roads[roads[:, 5] != reference.RENDER_LANE_AREA]
+        assert len(lane_area), "no lane-area segments were emitted"
+        lengths = np.hypot(
+            lane_area[:, 2] - lane_area[:, 0], lane_area[:, 3] - lane_area[:, 1]
+        )
+        # Each strip carries half a width of overlap at either end, so the shortest
+        # one drawn spans at least a full strip width however short its segment is.
+        assert lengths.min() >= 4.5 - 1e-3
+        # Painted features are not widened; only the drivable surface is.
+        if len(markings):
+            marked = np.hypot(
+                markings[:, 2] - markings[:, 0], markings[:, 3] - markings[:, 1]
+            )
+            assert marked.min() < 4.5
+    finally:
+        env.close()

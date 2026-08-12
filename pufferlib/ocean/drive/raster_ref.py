@@ -72,6 +72,18 @@ RIG_STRIDE = 20
 # the same number so the two produce identical images.
 MAX_FRAGMENTS = 16
 
+# Relative slack on the agent layer's ground-intercept bound; see
+# `_composite_shaded`. The CUDA kernel uses the same figure.
+GROUND_DEPTH_SLACK = 1e-4
+
+# Depth-ordering quantum, in metres. Two faces of a box meet along an edge where
+# their depths are equal in exact arithmetic, so ordering the fragments on the raw
+# float decides which face shades that edge by rounding -- differently on the CPU
+# and in the kernel. Rounding to a millimetre lets the primitive index settle it
+# instead, which both implementations agree on, and is far below any depth
+# difference the geometry means. The CUDA kernel uses the same figure.
+DEPTH_ORDER_QUANTUM = 1e-3
+
 
 # ---------------------------------------------------------------------------
 # Camera rig
@@ -437,48 +449,69 @@ def _clip_near(tris: torch.Tensor, colors: torch.Tensor, near: float):
 
     Triangles straddling the plane are re-cut so that geometry directly under
     the camera still renders. Fully-behind triangles are dropped.
+
+    Clipping against one plane yields at most two triangles, and each source
+    triangle keeps a fixed pair of output rows, so the result stays in primitive
+    order. That is what the compositor's depth tie-break is defined on, and it is
+    the order the CUDA kernel reproduces with its scratch slot pairs; compacting
+    the unused rows away preserves it.
     """
     if tris.shape[0] == 0:
         return tris, colors
 
+    count_in = tris.shape[0]
+    out = tris.new_zeros((2 * count_in, 3, 3))
+    filled = torch.zeros(2 * count_in, dtype=torch.bool, device=tris.device)
     inside = tris[..., 2] >= near
     count = inside.sum(dim=1)
 
-    keep = count == 3
-    out_tris = [tris[keep]]
-    out_cols = [colors[keep]]
-
     def intersect(p_in, p_out):
         """Point where segment p_in->p_out crosses z = near."""
-        t = (near - p_in[..., 2]) / (p_out[..., 2] - p_in[..., 2]).clamp_min(1e-9)
+        # p_out is behind the plane and p_in in front of it, so the denominator is
+        # negative by construction. Clamping its magnitude has to keep that sign:
+        # clamp_min turned every real crossing into a division by 1e-9, which threw
+        # the clipped vertex out past 1e11 and collapsed the triangle into a
+        # zero-area sliver on the horizon. Straddling geometry then disappeared
+        # instead of being re-cut -- most visibly the lane-area quad the camera
+        # sits on, which blanked the road right in front of the vehicle.
+        den = p_out[..., 2] - p_in[..., 2]
+        den = torch.where(den > -1e-9, torch.full_like(den, -1e-9), den)
+        t = (near - p_in[..., 2]) / den
         return p_in + t.unsqueeze(-1) * (p_out - p_in)
 
+    sel = (count == 3).nonzero().flatten()
+    if sel.numel():
+        out[2 * sel] = tris[sel]
+        filled[2 * sel] = True
+
     # One vertex inside: the triangle shrinks to a smaller triangle.
-    sel = count == 1
-    if sel.any():
-        t, c, m = tris[sel], colors[sel], inside[sel]
+    sel = (count == 1).nonzero().flatten()
+    if sel.numel():
+        t, m = tris[sel], inside[sel]
         idx = m.float().argmax(dim=1)
-        a = t[torch.arange(t.shape[0]), idx]
-        b = t[torch.arange(t.shape[0]), (idx + 1) % 3]
-        d = t[torch.arange(t.shape[0]), (idx + 2) % 3]
-        out_tris.append(torch.stack([a, intersect(a, b), intersect(a, d)], dim=1))
-        out_cols.append(c)
+        rows = torch.arange(t.shape[0], device=tris.device)
+        a = t[rows, idx]
+        b = t[rows, (idx + 1) % 3]
+        d = t[rows, (idx + 2) % 3]
+        out[2 * sel] = torch.stack([a, intersect(a, b), intersect(a, d)], dim=1)
+        filled[2 * sel] = True
 
     # Two vertices inside: the triangle becomes a quad, emitted as two triangles.
-    sel = count == 2
-    if sel.any():
-        t, c, m = tris[sel], colors[sel], inside[sel]
+    sel = (count == 2).nonzero().flatten()
+    if sel.numel():
+        t, m = tris[sel], inside[sel]
         idx = (~m).float().argmax(dim=1)  # the single outside vertex
-        a = t[torch.arange(t.shape[0]), idx]
-        b = t[torch.arange(t.shape[0]), (idx + 1) % 3]
-        d = t[torch.arange(t.shape[0]), (idx + 2) % 3]
+        rows = torch.arange(t.shape[0], device=tris.device)
+        a = t[rows, idx]
+        b = t[rows, (idx + 1) % 3]
+        d = t[rows, (idx + 2) % 3]
         ab, ad = intersect(b, a), intersect(d, a)
-        out_tris.append(torch.stack([b, d, ad], dim=1))
-        out_tris.append(torch.stack([b, ad, ab], dim=1))
-        out_cols.append(c)
-        out_cols.append(c)
+        out[2 * sel] = torch.stack([b, d, ad], dim=1)
+        out[2 * sel + 1] = torch.stack([b, ad, ab], dim=1)
+        filled[2 * sel] = True
+        filled[2 * sel + 1] = True
 
-    return torch.cat(out_tris, dim=0), torch.cat(out_cols, dim=0)
+    return out[filled], colors.repeat_interleave(2, dim=0)[filled]
 
 
 def _project(tris_cam: torch.Tensor, fx, fy, cx, cy):
@@ -541,7 +574,16 @@ def _coverage_and_depth(screen, depth, px, py, eps=1e-9):
     cov = torch.where(in_box, cov, torch.zeros_like(cov))
 
     w0, w1, w2 = bary
-    z = w0 * depth[:, 0:1] + w1 * depth[:, 1:2] + w2 * depth[:, 2:3]
+    # Perspective-correct depth. Screen-space barycentrics interpolate 1/z
+    # linearly, not z, and the error in interpolating z directly grows with how
+    # much depth the triangle spans on screen. It was invisible while every
+    # primitive was a short road segment or a car-sized box; the ground quad the
+    # camera stands on runs from the near plane to tens of metres, and shading it
+    # from an affine depth painted the haze of its far end across the near end,
+    # leaving the surface under the vehicle flat and a shade apart from the quads
+    # beyond it.
+    inv = w0 / depth[:, 0:1] + w1 / depth[:, 1:2] + w2 / depth[:, 2:3]
+    z = torch.where(inv > eps, 1.0 / inv.clamp_min(eps), torch.full_like(inv, float("inf")))
     # Degenerate (zero-area) triangles contribute nothing.
     cov = torch.where(area.abs().unsqueeze(-1) < eps, torch.zeros_like(cov), cov)
     return cov, z
@@ -602,6 +644,51 @@ def _haze(color, scale, sky):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+
+def _merge_coplanar(cov, depth, colors):
+    """Fold the coplanar fragments of one colour into a single surface per pixel.
+
+    Road primitives tile a surface rather than stack on it: two abutting lane-area
+    quads split the pixels along their shared joint between them, and so do the two
+    triangles each quad is made of. Compositing those as independent fragments
+    leaves 1 - (1 - a)(1 - b) of the pixel to whatever is behind, so a dark seam is
+    drawn along every joint and every quad diagonal and the drivable area reads as
+    a mosaic of tiles instead of one surface. Adding the coverages is exact where
+    the primitives tile and saturates where they overlap, which is what an opaque
+    ground surface wants either way.
+
+    The surface's depth is the coverage-weighted mean of its fragments. That is
+    exact when they are coplanar, which road primitives are, and unlike picking the
+    nearest fragment it moves continuously with coverage: a fragment whose coverage
+    rounds to zero on one device and to 1e-7 on another cannot swing the whole
+    surface's haze to its own depth. The sum is carried by the lowest-indexed
+    covering fragment of the colour, so the fragment ordering and its tie-break
+    stay what the compositor and the CUDA kernel already agree on.
+
+    Returns (coverage, depth) in the input's [T, P] shape, with everything but each
+    surface's carrier zeroed out.
+    """
+    if cov.shape[0] == 0:
+        return cov, depth
+
+    groups, inverse = torch.unique(colors, dim=0, return_inverse=True)
+    shape = (groups.shape[0], cov.shape[1])
+    covering = cov > 0
+    total = cov.new_zeros(shape).index_add_(0, inverse, cov)
+    weighted = cov.new_zeros(shape).index_add_(
+        0, inverse, cov * torch.where(covering, depth, torch.zeros_like(depth))
+    )
+
+    order = torch.arange(cov.shape[0], device=cov.device).unsqueeze(1).expand_as(cov)
+    unset = torch.iinfo(torch.int64).max
+    candidate = torch.where(covering, order, torch.full_like(order, unset))
+    first = order.new_full(shape, unset).index_reduce_(0, inverse, candidate, "amin")
+    carrier = order == first[inverse]
+
+    merged_cov = torch.where(carrier, total.clamp(max=1.0)[inverse], torch.zeros_like(cov))
+    merged_depth = torch.where(carrier, (weighted / total.clamp_min(1e-9))[inverse], depth)
+    return merged_cov, merged_depth
 
 
 def render(
@@ -691,6 +778,14 @@ def render(
                     screen, depth_v = _project(tris_cam, fx, fy, cx, cy)
                     cov, zbuf = _coverage_and_depth(screen, depth_v, px, py)
                     shaded = cols_c
+                    if layer_idx == 0:
+                        # Drop what the compositor would discard anyway before
+                        # merging, so a fragment beyond the far plane cannot lend
+                        # its coverage to a surface that survives.
+                        cov = torch.where(
+                            (zbuf > cam.far) | (zbuf <= 0), torch.zeros_like(cov), cov
+                        )
+                        cov, zbuf = _merge_coplanar(cov, zbuf, cols_c)
                     # Road markings are coplanar with the ground, so they are drawn
                     # over it rather than depth-tested against it; agents are.
                     limit = (
@@ -699,8 +794,16 @@ def render(
                         else depth_limit
                     )
                     scale = _depth_scale(zbuf, palette)
+                    # Road decals are painted in buffer order; agents are depth-sorted.
+                    order_key = None
+                    if layer_idx == 0:
+                        order_key = (
+                            torch.arange(cov.shape[0], device=cov.device, dtype=cov.dtype)
+                            .unsqueeze(1)
+                            .expand_as(cov)
+                        )
                     weighted = _composite_shaded(
-                        cov, zbuf, shaded, scale, sky, acc, limit, cam.far
+                        cov, zbuf, shaded, scale, sky, acc, limit, cam.far, order_key
                     )
                     acc = weighted
                 image[start:stop] = acc
@@ -711,17 +814,32 @@ def render(
     return out
 
 
-def _composite_shaded(cov, depth, colors, depth_scale, sky, background, background_depth, far):
+def _composite_shaded(
+    cov, depth, colors, depth_scale, sky, background, background_depth, far, order_key=None
+):
     """`_composite`, with per-fragment aerial perspective applied.
 
     The haze varies per pixel (it depends on interpolated depth), so the colour
     cannot be folded into the per-triangle table beforehand.
+
+    `order_key` replaces depth as the front-to-back order. The road layer passes
+    the primitive index: its fragments are decals on one plane, so which of them is
+    on top is a painter's-order decision the buffer already encodes -- markings are
+    emitted before the lane area they are painted on -- and their interpolated
+    depths agree to within float noise, which would otherwise settle the order
+    differently on the CPU and in the kernel.
     """
     if cov.shape[0] == 0:
         return background
 
     cov = torch.where(depth > far, torch.zeros_like(cov), cov)
-    cov = torch.where(depth > background_depth.unsqueeze(0), torch.zeros_like(cov), cov)
+    # A box's bottom face lies exactly on the ground plane, so its depth equals the
+    # ground intercept to within rounding and an exact comparison decides that face
+    # by float noise -- differently in float32 on the CPU and in the kernel. The
+    # bound only has to reject boxes genuinely behind the ground point, so give it
+    # a relative slack far below anything the geometry cares about.
+    limit = background_depth.unsqueeze(0) * (1.0 + GROUND_DEPTH_SLACK)
+    cov = torch.where(depth > limit, torch.zeros_like(cov), cov)
     cov = torch.where(depth <= 0, torch.zeros_like(cov), cov)
 
     # Sort covering fragments nearest first. Pushing non-covering ones to infinity
@@ -729,7 +847,8 @@ def _composite_shaded(cov, depth, colors, depth_scale, sky, background, backgrou
     # primitive index -- coplanar road markings routinely land at identical depth,
     # and the CUDA kernel breaks those ties the same way so the two agree
     # regardless of the order its threads visit primitives in.
-    sort_key = torch.where(cov > 0, depth, torch.full_like(depth, float("inf")))
+    key = torch.round(depth / DEPTH_ORDER_QUANTUM) if order_key is None else order_key
+    sort_key = torch.where(cov > 0, key, torch.full_like(key, float("inf")))
     order = torch.argsort(sort_key, dim=0, stable=True)
     if order.shape[0] > MAX_FRAGMENTS:
         order = order[:MAX_FRAGMENTS]

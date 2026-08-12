@@ -514,5 +514,84 @@ def test_cuda_skips_the_ego_own_box():
     assert torch.equal(raster_cuda.render(a, r, skipped.cuda()), without)
 
 
+# ---------------------------------------------------------------------------
+# Ground surfaces the camera stands on
+# ---------------------------------------------------------------------------
+
+
+def _ground_quad(x0, x1, width=4.5, road_type=None):
+    """One ground-plane strip along +x, as a single road segment."""
+    road_type = float(R.ROAD_LANE if road_type is None else road_type)
+    return torch.tensor([[float(x0), 0.0, float(x1), 0.0, width, road_type]])
+
+
+def test_quad_under_the_camera_is_clipped_not_dropped():
+    """A strip the camera stands on must still cover the road ahead.
+
+    The near plane cuts through every ground quad the vehicle is inside. Dropping
+    those instead of re-cutting them blanked the road from the bottom of the frame
+    out to the end of the segment -- with WOMD's decimated centrelines, up to 16 m
+    of it -- and the hole reappeared at every segment the ego drove into.
+    """
+    straddling = R.render(NO_AGENTS, _ground_quad(-10.0, 30.0), EGO_AT_ORIGIN)
+    # The same surface, starting just far enough ahead to need no clipping. The
+    # camera cannot see the ground closer than about 7 m, so the two must agree.
+    ahead = R.render(NO_AGENTS, _ground_quad(0.2, 30.0), EGO_AT_ORIGIN)
+    assert (straddling.int() - ahead.int()).abs().max() <= 1
+
+
+def test_abutting_ground_quads_leave_no_seam():
+    """Coplanar strips that tile a surface must not draw a seam where they meet.
+
+    Their coverages split the pixels along the joint between them, so compositing
+    them as independent fragments leaves part of every joint -- and of the diagonal
+    inside each quad -- showing whatever is behind. That is what made the drivable
+    area read as a mosaic of separate tiles.
+    """
+    edges = torch.arange(7.0, 87.1, 4.0)
+    tiled = torch.cat([_ground_quad(edges[i], edges[i + 1]) for i in range(len(edges) - 1)])
+    img = R.render(NO_AGENTS, tiled, EGO_AT_ORIGIN)[0, 0, 0].int()
+
+    # Down the middle of the surface, brightness may only fall as the ground comes
+    # nearer and the haze thins. A seam is a local dip, so any rise between two
+    # rows is one. Rows are taken between the horizon band and the strip's own near
+    # edge, where the surface is all that is in view.
+    column = img[36:61, 48]
+    rises = (column[1:] > column[:-1]).nonzero().flatten()
+    assert rises.numel() == 0, f"seam at rows {(36 + rises + 1).tolist()}: {column.tolist()}"
+
+    # Same again either side of it, over the columns the 4.5 m strip still covers
+    # at the far end of the band: 20 joints, none of them visible anywhere.
+    band = img[36:61, 45:52]
+    assert (band[1:] > band[:-1]).sum() == 0
+
+
+@pytest.mark.skipif(not _cuda_rasterizer_available(), reason="CUDA rasterizer not built yet (Phase 3)")
+def test_cuda_matches_reference_on_ground_quads():
+    """Parity for the two cases above, which exercise clipping and the merge."""
+    from pufferlib.ocean.drive import raster_cuda
+
+    edges = torch.arange(7.0, 87.1, 4.0)
+    scenes = {
+        "straddling": _ground_quad(-10.0, 30.0),
+        "tiled": torch.cat([_ground_quad(edges[i], edges[i + 1]) for i in range(len(edges) - 1)]),
+        "tiled and straddling": torch.cat(
+            [_ground_quad(-6.0, 7.0)] + [_ground_quad(edges[i], edges[i + 1]) for i in range(6)]
+        ),
+    }
+    for name, roads in scenes.items():
+        want = R.render(NO_AGENTS, roads, EGO_AT_ORIGIN).int()
+        got = raster_cuda.render(NO_AGENTS.cuda(), roads.cuda(), EGO_AT_ORIGIN.cuda()).cpu().int()
+        assert (want - got).abs().max() <= 1, name
+
+
+def test_car_at_the_near_plane_still_renders():
+    """Clipping applies to agent boxes too, not just to the ground."""
+    touching = _car(1.0)  # 4.5 m long, so its back half is behind the camera
+    img = R.render(touching, NO_ROADS, EGO_AT_ORIGIN).int()
+    empty = R.render(NO_AGENTS, NO_ROADS, EGO_AT_ORIGIN).int()
+    assert (img - empty).abs().max() > 2
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

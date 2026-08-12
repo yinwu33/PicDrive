@@ -2598,11 +2598,36 @@ void fill_render_roads(Drive *env) {
             else if (e->type == ROAD_EDGE)
                 render_type = RENDER_YELLOW_ROAD_EDGE;
             for (int j = 0; j + 1 < e->array_size && n < cap; j++) {
+                float x0 = e->traj_x[j], y0 = e->traj_y[j];
+                float x1 = e->traj_x[j + 1], y1 = e->traj_y[j + 1];
+                // The lane area is drawn as one rectangle per segment. Abutting
+                // rectangles meet exactly at a joint, which leaves an uncovered
+                // wedge on the outside of every bend -- 0.34 m at the 90th
+                // percentile of WOMD's decimated centrelines and 0.8 m at the tail,
+                // wide enough to show the ground through the drivable surface.
+                // Extending each segment by half the strip width at both ends makes
+                // consecutive rectangles overlap instead, which covers the wedge for
+                // turns up to 90 degrees and also bridges the sub-strip gaps where
+                // one lane feature ends and its successor begins. The cost is that a
+                // lane that genuinely stops -- a dead end, or the edge of the mapped
+                // area -- reads as half a strip width longer than it is.
+                if (render_type == RENDER_LANE_AREA) {
+                    float dx = x1 - x0, dy = y1 - y0;
+                    float len = sqrtf(dx * dx + dy * dy);
+                    if (len > 1e-6f) {
+                        float ex = dx / len * width * 0.5f;
+                        float ey = dy / len * width * 0.5f;
+                        x0 -= ex;
+                        y0 -= ey;
+                        x1 += ex;
+                        y1 += ey;
+                    }
+                }
                 float *out = &env->render_roads[n * RENDER_ROAD_FEATURES];
-                out[0] = e->traj_x[j];
-                out[1] = e->traj_y[j];
-                out[2] = e->traj_x[j + 1];
-                out[3] = e->traj_y[j + 1];
+                out[0] = x0;
+                out[1] = y0;
+                out[2] = x1;
+                out[3] = y1;
                 out[4] = width;
                 out[5] = (float)render_type;
                 n++;
@@ -3917,6 +3942,10 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                     else
                         agent_color = BLUE;
                 }
+                // The camera panels show human_agent_idx, so distinguish that ego
+                // from the other policy-controlled agents in the BEV.
+                if (is_active_agent && agent_index == env->human_agent_idx)
+                    agent_color = LIGHTGREEN;
                 if (is_active_agent && env->entities[i].collision_state > 0)
                     agent_color = RED;
 

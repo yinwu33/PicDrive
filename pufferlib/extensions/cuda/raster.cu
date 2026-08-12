@@ -21,7 +21,9 @@
 // Visibility follows the reference's three layers: an analytic ray/ground-plane
 // background, road markings drawn over it (coplanar, so no depth test), and agent
 // boxes depth-tested against the ground intercept. Within a layer, fragments are
-// combined front to back with analytic edge coverage as alpha.
+// combined front to back with analytic edge coverage as alpha, except that road
+// fragments of one colour are folded together first: they tile a surface rather
+// than stack on it, so their coverages add.
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -37,6 +39,13 @@ namespace pufferlib {
 // u0,v0,z0, u1,v1,z1, u2,v2,z2, r,g,b, umin,umax,vmin,vmax
 #define TRI_STRIDE 16
 
+// Scratch slots reserved per source triangle. Clipping one triangle against the
+// near plane yields at most two, and slots are addressed by primitive index
+// rather than by an allocator, so each primitive owns a fixed pair. That doubles
+// the scratch buffer; the alternative, an atomic bump allocator, would make the
+// triangle ordering depend on thread scheduling.
+#define TRIS_PER_PRIM 2
+
 // Screen-space tile handled by one block.
 #define TILE_W 32
 #define TILE_H 16
@@ -50,6 +59,16 @@ namespace pufferlib {
 #define PALETTE_DEPTH_FALLOFF 60.0f
 #define PALETTE_DEPTH_MIN_SCALE 0.30f
 #define NEAR_EPS 1e-9f
+
+// Relative slack on the agent layer's ground-intercept bound. A box's bottom face
+// lies exactly on the ground plane, so its depth equals the intercept to within
+// rounding; comparing exactly decides that face by float noise, and the CPU
+// reference rounds it the other way. See raster_ref.GROUND_DEPTH_SLACK.
+#define GROUND_DEPTH_SLACK 1e-4f
+
+// Depth-ordering quantum, in metres; see frag_after and
+// raster_ref.DEPTH_ORDER_QUANTUM.
+#define DEPTH_ORDER_QUANTUM 1e-3f
 
 __device__ __forceinline__ float depth_scale(float depth) {
     float s = 1.0f - fmaxf(depth, 0.0f) / PALETTE_DEPTH_FALLOFF;
@@ -135,9 +154,14 @@ __device__ __forceinline__ void to_camera(const Cam &c, const float *ego, float 
     out[2] = c.rot[6] * ex + c.rot[7] * ey + c.rot[8] * ez;
 }
 
-// Emit one screen-space triangle, near-clipping by rejection. Triangles that
-// straddle the near plane are dropped rather than re-cut; at the 0.15 m near
-// plane used here that only affects geometry essentially inside the camera.
+// An inverted bounding box marks a slot empty; the tile test rejects it.
+__device__ __forceinline__ void mark_empty(float *scratch, int slot) {
+    float *t = scratch + (size_t)slot * TRI_STRIDE;
+    t[12] = 1.0f; t[13] = -1.0f; t[14] = 1.0f; t[15] = -1.0f;
+}
+
+// Emit one screen-space triangle. Every vertex must already be at or beyond the
+// near plane, which is what emit_clipped below guarantees.
 // Slots are assigned by primitive index rather than by an atomic counter, so the
 // triangle ordering is deterministic and identical to the reference's. Ties in
 // fragment depth are then broken by that index, which makes the composited result
@@ -145,11 +169,6 @@ __device__ __forceinline__ void to_camera(const Cam &c, const float *ego, float 
 __device__ __forceinline__ void emit_triangle(float *scratch, int slot, const Cam &c, const float *p0,
                                               const float *p1, const float *p2, const float *color) {
     float *t = scratch + (size_t)slot * TRI_STRIDE;
-    // An inverted bounding box marks the slot empty; the tile test rejects it.
-    if (p0[2] < c.near_z || p1[2] < c.near_z || p2[2] < c.near_z) {
-        t[12] = 1.0f; t[13] = -1.0f; t[14] = 1.0f; t[15] = -1.0f;
-        return;
-    }
 
     float u0 = c.fx * p0[0] / p0[2] + c.cx, v0 = c.fy * p0[1] / p0[2] + c.cy;
     float u1 = c.fx * p1[0] / p1[2] + c.cx, v1 = c.fy * p1[1] / p1[2] + c.cy;
@@ -167,6 +186,73 @@ __device__ __forceinline__ void emit_triangle(float *scratch, int slot, const Ca
     t[6] = u2; t[7] = v2; t[8] = p2[2];
     t[9] = color[0]; t[10] = color[1]; t[11] = color[2];
     t[12] = umin; t[13] = umax; t[14] = vmin; t[15] = vmax;
+}
+
+// Where the segment p_in -> p_out crosses the near plane. p_out is behind the
+// plane and p_in in front of it, so the denominator is negative by construction
+// and clamping its magnitude has to keep that sign.
+__device__ __forceinline__ void near_point(const float *p_in, const float *p_out, float near_z,
+                                           float *out) {
+    float den = p_out[2] - p_in[2];
+    if (den > -NEAR_EPS) den = -NEAR_EPS;
+    float t = (near_z - p_in[2]) / den;
+#pragma unroll
+    for (int k = 0; k < 3; k++) out[k] = p_in[k] + t * (p_out[k] - p_in[k]);
+}
+
+// Clip a camera-frame triangle against the near plane into the slot pair the
+// primitive owns.
+//
+// Dropping straddling triangles instead, which is what this used to do, blanks
+// whatever the camera is standing on. With the drivable area drawn as ground
+// quads that is the road right in front of the vehicle: the quad the ego sat in
+// vanished for as long as it was inside that segment -- up to 16 m of road on
+// WOMD's decimated centrelines -- and returned at the next one, so the surface
+// flickered off block by block as the car drove. The cut and the order the pieces
+// are emitted in mirror raster_ref._clip_near, so both implementations rasterize
+// the same geometry.
+__device__ __forceinline__ void emit_clipped(float *scratch, int slot, const Cam &c, const float *p0,
+                                             const float *p1, const float *p2, const float *color) {
+    const float *p[3] = {p0, p1, p2};
+    int inside[3];
+    int n_inside = 0;
+#pragma unroll
+    for (int i = 0; i < 3; i++) {
+        inside[i] = p[i][2] >= c.near_z;
+        n_inside += inside[i];
+    }
+
+    if (n_inside == 3) {
+        emit_triangle(scratch, slot, c, p0, p1, p2, color);
+        mark_empty(scratch, slot + 1);
+        return;
+    }
+    if (n_inside == 0) {
+        mark_empty(scratch, slot);
+        mark_empty(scratch, slot + 1);
+        return;
+    }
+
+    if (n_inside == 1) {
+        // One vertex inside: the triangle shrinks to a smaller triangle.
+        int i = inside[0] ? 0 : (inside[1] ? 1 : 2);
+        const float *a = p[i], *b = p[(i + 1) % 3], *d = p[(i + 2) % 3];
+        float ab[3], ad[3];
+        near_point(a, b, c.near_z, ab);
+        near_point(a, d, c.near_z, ad);
+        emit_triangle(scratch, slot, c, a, ab, ad, color);
+        mark_empty(scratch, slot + 1);
+        return;
+    }
+
+    // Two vertices inside: the triangle becomes a quad, emitted as two triangles.
+    int i = !inside[0] ? 0 : (!inside[1] ? 1 : 2);
+    const float *a = p[i], *b = p[(i + 1) % 3], *d = p[(i + 2) % 3];
+    float ab[3], ad[3];
+    near_point(b, a, c.near_z, ab);
+    near_point(d, a, c.near_z, ad);
+    emit_triangle(scratch, slot, c, b, d, ad, color);
+    emit_triangle(scratch, slot + 1, c, b, ad, ab, color);
 }
 
 // One block per (image, layer). Projects that layer's primitives into scratch.
@@ -196,14 +282,10 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
 
     // Slots past this scene's primitive count are marked empty so the tile scan,
     // which walks a fixed stride, skips them.
-    for (int i = num_roads * 2 + threadIdx.x; i < max_road_tris; i += blockDim.x) {
-        float *t = r_scratch + (size_t)i * TRI_STRIDE;
-        t[12] = 1.0f; t[13] = -1.0f; t[14] = 1.0f; t[15] = -1.0f;
-    }
-    for (int i = num_agents * 12 + threadIdx.x; i < max_agent_tris; i += blockDim.x) {
-        float *t = a_scratch + (size_t)i * TRI_STRIDE;
-        t[12] = 1.0f; t[13] = -1.0f; t[14] = 1.0f; t[15] = -1.0f;
-    }
+    for (int i = num_roads * 2 * TRIS_PER_PRIM + threadIdx.x; i < max_road_tris; i += blockDim.x)
+        mark_empty(r_scratch, i);
+    for (int i = num_agents * 12 * TRIS_PER_PRIM + threadIdx.x; i < max_agent_tris; i += blockDim.x)
+        mark_empty(a_scratch, i);
 
     for (int i = threadIdx.x; i < num_roads; i += blockDim.x) {
         const float *r = roads + (size_t)(road_lo + i) * RASTER_ROAD_FEATURES;
@@ -216,8 +298,9 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         float col[3];
         road_color((int)r[5], col);
 
-        // Keep the opaque teddy/giga lane area just below painted features so
-        // sub-pixel depth noise cannot hide their antialiased edges.
+        // The opaque teddy/giga lane area sits just below the painted features it
+        // carries. Which of the two is drawn on top comes from buffer order, not
+        // from this gap; see finalize_road_fragments.
         float road_z = ((int)r[5] == 11) ? -0.01f : 0.0f;
         float a[3], b[3], d[3], e[3];
         to_camera(c, ego, r[0] + nx, r[1] + ny, road_z, a);
@@ -225,8 +308,8 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         to_camera(c, ego, r[2] - nx, r[3] - ny, road_z, d);
         to_camera(c, ego, r[2] + nx, r[3] + ny, road_z, e);
         // Reference order is every first triangle, then every second.
-        emit_triangle(r_scratch, i, c, a, b, d, col);
-        emit_triangle(r_scratch, num_roads + i, c, a, d, e, col);
+        emit_clipped(r_scratch, TRIS_PER_PRIM * i, c, a, b, d, col);
+        emit_clipped(r_scratch, TRIS_PER_PRIM * (num_roads + i), c, a, d, e, col);
     }
 
     for (int i = threadIdx.x; i < num_agents; i += blockDim.x) {
@@ -234,8 +317,9 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         // written, marked empty, so indices stay aligned with the reference.
         if (i == self_index) {
             for (int t = 0; t < 12; t++) {
-                float *slot = a_scratch + (size_t)(t * num_agents + i) * TRI_STRIDE;
-                slot[12] = 1.0f; slot[13] = -1.0f; slot[14] = 1.0f; slot[15] = -1.0f;
+                int slot = TRIS_PER_PRIM * (t * num_agents + i);
+                mark_empty(a_scratch, slot);
+                mark_empty(a_scratch, slot + 1);
             }
             continue;
         }
@@ -261,8 +345,8 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         for (int t = 0; t < 12; t++) {
             float shade = FACE_SHADE[t / 2];
             float col[3] = {base[0] * shade, base[1] * shade, base[2] * shade};
-            emit_triangle(a_scratch, t * num_agents + i, c, corners[BOX_TRIS[t][0]],
-                          corners[BOX_TRIS[t][1]], corners[BOX_TRIS[t][2]], col);
+            emit_clipped(a_scratch, TRIS_PER_PRIM * (t * num_agents + i), c, corners[BOX_TRIS[t][0]],
+                         corners[BOX_TRIS[t][1]], corners[BOX_TRIS[t][2]], col);
         }
     }
 }
@@ -301,13 +385,26 @@ __device__ __forceinline__ float coverage_depth(const float *t, float px, float 
         cov *= fminf(fmaxf(ramp, 0.0f), 1.0f);
         if (cov <= 0.0f) return 0.0f;
     }
-    *depth_out = w[0] * t[2] + w[1] * t[5] + w[2] * t[8];
+    // Perspective-correct depth: screen-space barycentrics interpolate 1/z
+    // linearly, not z. Interpolating z directly is only accurate while a triangle
+    // covers little depth on screen, and the ground quad the camera stands on runs
+    // from the near plane to tens of metres -- shading that from an affine depth
+    // painted the haze of its far end across its near end. See
+    // raster_ref._coverage_and_depth.
+    float inv = w[0] / t[2] + w[1] / t[5] + w[2] / t[8];
+    *depth_out = inv > NEAR_EPS ? 1.0f / inv : INFINITY;
     return cov;
 }
 
-// Insert a fragment into a per-pixel list kept sorted nearest-first.
+// Fragment order for the agent layer: depth rounded to DEPTH_ORDER_QUANTUM, ties
+// to the lower primitive index. Two faces of a box meet along an edge where their
+// depths are equal in exact arithmetic, and ordering those on the raw float
+// decides which face shades the edge by rounding -- the CPU reference rounds it
+// the other way. See raster_ref.DEPTH_ORDER_QUANTUM.
 __device__ __forceinline__ bool frag_after(float da, int ia, float db, int ib) {
-    return da > db || (da == db && ia > ib);
+    float qa = rintf(da / DEPTH_ORDER_QUANTUM);
+    float qb = rintf(db / DEPTH_ORDER_QUANTUM);
+    return qa > qb || (qa == qb && ia > ib);
 }
 
 __device__ __forceinline__ void insert_fragment(float *fd, float *fc, int *fi, int &count, float depth,
@@ -328,6 +425,80 @@ __device__ __forceinline__ void insert_fragment(float *fd, float *fc, int *fi, i
     fc[pos * 4 + 2] = color[2];
     fc[pos * 4 + 3] = cov;
     if (count < MAX_FRAGS) count++;
+}
+
+// Accumulate one road fragment into the surface of its own colour at this pixel.
+//
+// Coplanar road primitives tile a surface rather than stack on it: two abutting
+// lane-area quads split the pixels along their shared joint between them, and so
+// do the two triangles each quad is made of. Compositing those with `over` leaves
+// 1 - (1 - a)(1 - b) of the pixel to the ground below, drawing a dark seam along
+// every joint and every quad diagonal -- which is what made the drivable area read
+// as a mosaic of tiles rather than one surface. Adding the coverages is exact
+// where the primitives tile and saturates where they overlap, which is what an
+// opaque surface wants either way.
+//
+// The accumulator holds the coverage sum, the coverage-weighted depth sum and the
+// lowest primitive index of the colour, in arrival order; finalize_road_fragments
+// turns it into fragments. Mirrors raster_ref._merge_coplanar.
+__device__ __forceinline__ void accumulate_road_fragment(float *fd, float *fc, int *fi, int &count,
+                                                         float depth, int tri, const float *color,
+                                                         float cov) {
+    for (int p = 0; p < count; p++) {
+        if (fc[p * 4 + 0] != color[0] || fc[p * 4 + 1] != color[1] || fc[p * 4 + 2] != color[2])
+            continue;
+        fc[p * 4 + 3] += cov;
+        fd[p] += cov * depth;
+        fi[p] = min(fi[p], tri);
+        return;
+    }
+    // The road palette holds fewer colours than there are fragment slots, so this
+    // only guards against a palette that outgrows them.
+    if (count == MAX_FRAGS) return;
+    fd[count] = cov * depth;
+    fc[count * 4 + 0] = color[0];
+    fc[count * 4 + 1] = color[1];
+    fc[count * 4 + 2] = color[2];
+    fc[count * 4 + 3] = cov;
+    fi[count] = tri;
+    count++;
+}
+
+// Coverage-weighted mean depth per surface, coverage saturated at one, ordered
+// the way composite() expects. The mean depth is exact for coplanar fragments and,
+// unlike picking the nearest of them, moves continuously with a coverage that is
+// itself only accurate to float rounding.
+//
+// The order is the primitive order, not the depth order: road fragments are decals
+// on one plane, so which of them is on top is a painter's-order decision that
+// fill_render_roads already encodes by emitting markings before the lane area they
+// are painted on. Their interpolated depths agree to within float noise, and
+// sorting on that would settle the order differently here than in the CPU
+// reference. See the order_key argument of raster_ref._composite_shaded.
+__device__ __forceinline__ void finalize_road_fragments(float *fd, float *fc, int *fi, int count) {
+    for (int p = 0; p < count; p++) {
+        fd[p] /= fmaxf(fc[p * 4 + 3], NEAR_EPS);
+        fc[p * 4 + 3] = fminf(fc[p * 4 + 3], 1.0f);
+    }
+    // Insertion sort; at most one fragment per road colour reaches here.
+    for (int p = 1; p < count; p++) {
+        float depth = fd[p], col[4];
+#pragma unroll
+        for (int k = 0; k < 4; k++) col[k] = fc[p * 4 + k];
+        int tri = fi[p];
+        int q = p - 1;
+        while (q >= 0 && fi[q] > tri) {
+            fd[q + 1] = fd[q];
+            fi[q + 1] = fi[q];
+#pragma unroll
+            for (int k = 0; k < 4; k++) fc[(q + 1) * 4 + k] = fc[q * 4 + k];
+            q--;
+        }
+        fd[q + 1] = depth;
+        fi[q + 1] = tri;
+#pragma unroll
+        for (int k = 0; k < 4; k++) fc[(q + 1) * 4 + k] = col[k];
+    }
 }
 
 // Front-to-back "over" compositing, with aerial perspective per fragment.
@@ -362,8 +533,8 @@ __global__ void raster_kernel(const float *roads, const float *egos, int ego_str
 
     int scene = ego_scene[image / num_cams];
     int road_lo = road_ranges[scene], road_hi = road_ranges[scene + 1];
-    int road_total = (road_hi - road_lo) * 2;
-    int agent_total = (agent_ranges[scene + 1] - agent_ranges[scene]) * 12;
+    int road_total = (road_hi - road_lo) * 2 * TRIS_PER_PRIM;
+    int agent_total = (agent_ranges[scene + 1] - agent_ranges[scene]) * 12 * TRIS_PER_PRIM;
     // fill_render_roads emits lane areas last. Their renderer-only tag opts only
     // teddy/giga into black non-road ground; ocean retains the original gray.
     bool black_ground = road_hi > road_lo && (int)roads[(size_t)(road_hi - 1) * RASTER_ROAD_FEATURES + 5] == 11;
@@ -442,9 +613,10 @@ __global__ void raster_kernel(const float *roads, const float *egos, int ego_str
             float depth;
             float cov = coverage_depth(t, px, py, &depth);
             if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z) continue;
-            insert_fragment(fd, fc, fi, count, depth, road_list[i], t + 9, cov);
+            accumulate_road_fragment(fd, fc, fi, count, depth, road_list[i], t + 9, cov);
         }
         if (count) {
+            finalize_road_fragments(fd, fc, fi, count);
             float acc[4] = {0.0f, 0.0f, 0.0f, 1.0f};
             composite(fd, fc, count, acc);
 #pragma unroll
@@ -458,7 +630,9 @@ __global__ void raster_kernel(const float *roads, const float *egos, int ego_str
             const float *t = a_scratch + (size_t)agent_list[i] * TRI_STRIDE;
             float depth;
             float cov = coverage_depth(t, px, py, &depth);
-            if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z || depth > ground_depth) continue;
+            if (cov <= 0.0f || depth <= 0.0f || depth > c.far_z ||
+                depth > ground_depth * (1.0f + GROUND_DEPTH_SLACK))
+                continue;
             insert_fragment(fd, fc, fi, count, depth, agent_list[i], t + 9, cov);
         }
         if (count) {
@@ -530,8 +704,8 @@ void drive_raster_cuda(torch::Tensor agents, torch::Tensor roads, torch::Tensor 
         max_scene_agents = std::max(max_scene_agents, arp[i + 1] - arp[i]);
         max_scene_roads = std::max(max_scene_roads, rrp[i + 1] - rrp[i]);
     }
-    int max_road_tris = std::max(max_scene_roads * 2, 1);
-    int max_agent_tris = std::max(max_scene_agents * 12, 1);
+    int max_road_tris = std::max(max_scene_roads * 2 * TRIS_PER_PRIM, 1);
+    int max_agent_tris = std::max(max_scene_agents * 12 * TRIS_PER_PRIM, 1);
     (void)opts_i;
     (void)num_roads;
     (void)num_agents;
