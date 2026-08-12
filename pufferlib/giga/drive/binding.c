@@ -296,6 +296,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_INT(max_controlled_agents);
     OVERRIDE_INT(obs_mode);
     OVERRIDE_INT(render_road_types);
+    OVERRIDE_INT(draw_lane_area);
+    OVERRIDE_FLOAT(lane_width);
     OVERRIDE_INT(agents_per_map_min);
     OVERRIDE_INT(agents_per_map_max);
     OVERRIDE_FLOAT(spawn_speed_max);
@@ -307,6 +309,11 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
+
+    if (conf.lane_width <= 0.0f) {
+        PyErr_SetString(PyExc_ValueError, "lane_width must be > 0 metres");
+        return -1;
+    }
 
     env->action_type = conf.action_type;
     env->dynamics_model = conf.dynamics_model;
@@ -331,6 +338,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     // default road-type mask.
     env->obs_mode = conf.obs_mode;
     env->render_road_types = conf.render_road_types;
+    env->draw_lane_area = conf.draw_lane_area;
+    env->lane_width = conf.lane_width;
     env->agents_per_map_min = conf.agents_per_map_min;
     env->agents_per_map_max = conf.agents_per_map_max;
     env->spawn_speed_max = conf.spawn_speed_max;

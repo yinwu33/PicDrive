@@ -169,6 +169,11 @@
 // Painted-marking width in meters, used for road primitives that carry no width.
 #define RENDER_ROAD_MARKING_WIDTH 0.15f
 
+// Renderer-only tags keep teddy/giga's experimental palette isolated from ocean,
+// which shares the CUDA rasterizer but still emits the original map type ids.
+#define RENDER_LANE_AREA 11
+#define RENDER_YELLOW_ROAD_EDGE 12
+
 // Which road entity types are drawn into the perspective view, as a type bitmask.
 // Lane centerlines (ROAD_LANE) are a map abstraction with no painted counterpart
 // on real asphalt, so drawing them would put privileged structure into the image.
@@ -514,6 +519,8 @@ struct Drive {
     // through the binding, so the rasterizer reads them without a copy.
     int obs_mode;
     int render_road_types;  // bitmask over entity types; see render_type_enabled()
+    int draw_lane_area;     // render ROAD_LANE centerlines as a drivable-area strip
+    float lane_width;       // total drivable-area strip width in metres
     float *render_agents;   // [render_max_agents * RENDER_AGENT_FEATURES]
     float *render_egos;     // [active_agent_count * RENDER_EGO_FEATURES]
     float *render_roads;    // [render_max_roads * RENDER_ROAD_FEATURES]
@@ -2531,6 +2538,8 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
 // ---------------------------------------------------------------------------
 
 static inline int render_type_enabled(Drive *env, int type) {
+    if (type == ROAD_LANE)
+        return env->draw_lane_area;
     if (type < 0 || type > 31)
         return 0;
     return (env->render_road_types >> type) & 1;
@@ -2538,7 +2547,9 @@ static inline int render_type_enabled(Drive *env, int type) {
 
 // Painted width in meters per road feature. Perspective alone makes near markings
 // read thicker than far ones; this only sets the world-space width.
-static inline float render_road_width(int type) {
+static inline float render_road_width(Drive *env, int type) {
+    if (type == ROAD_LANE)
+        return env->lane_width;
     switch (type) {
     case ROAD_EDGE:
         return 0.25f;
@@ -2571,20 +2582,31 @@ void fill_render_roads(Drive *env) {
         return;
     int n = 0;
     int cap = env->render_max_roads;
-    for (int i = 0; i < env->num_entities && n < cap; i++) {
-        Entity *e = &env->entities[i];
-        if (e->type < ROAD_LANE || !render_type_enabled(env, e->type))
-            continue;
-        float width = render_road_width(e->type);
-        for (int j = 0; j + 1 < e->array_size && n < cap; j++) {
-            float *out = &env->render_roads[n * RENDER_ROAD_FEATURES];
-            out[0] = e->traj_x[j];
-            out[1] = e->traj_y[j];
-            out[2] = e->traj_x[j + 1];
-            out[3] = e->traj_y[j + 1];
-            out[4] = width;
-            out[5] = (float)e->type;
-            n++;
+    // Coplanar primitives use buffer order as their tie-break. Emit markings and
+    // edges before the opaque lane area so they remain visible on top of it.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < env->num_entities && n < cap; i++) {
+            Entity *e = &env->entities[i];
+            if ((pass == 1) != (e->type == ROAD_LANE))
+                continue;
+            if (e->type < ROAD_LANE || !render_type_enabled(env, e->type))
+                continue;
+            float width = render_road_width(env, e->type);
+            int render_type = e->type;
+            if (e->type == ROAD_LANE)
+                render_type = RENDER_LANE_AREA;
+            else if (e->type == ROAD_EDGE)
+                render_type = RENDER_YELLOW_ROAD_EDGE;
+            for (int j = 0; j + 1 < e->array_size && n < cap; j++) {
+                float *out = &env->render_roads[n * RENDER_ROAD_FEATURES];
+                out[0] = e->traj_x[j];
+                out[1] = e->traj_y[j];
+                out[2] = e->traj_x[j + 1];
+                out[3] = e->traj_y[j + 1];
+                out[4] = width;
+                out[5] = (float)render_type;
+                n++;
+            }
         }
     }
     if (env->render_counts != NULL)
@@ -3221,7 +3243,7 @@ void c_step(Drive *env) {
 
 typedef struct Client Client;
 
-// Geometry of the camera strip drawn under the simulator view: panels side by
+// Geometry of the camera strip drawn above the simulator view: panels side by
 // side, in the order Python packed them, which is left to right across the rig.
 //
 // A pure function of the window width and the rig because make_client has to
@@ -3233,7 +3255,7 @@ typedef struct {
     int label_h;
     int margin;
     int gap;
-    int strip_h; // total height reserved along the bottom edge
+    int strip_h; // total height reserved along the top edge
     int x0;      // left edge of the first panel
 } CameraStrip;
 
@@ -3249,9 +3271,10 @@ static CameraStrip camera_strip_layout(int window_w, int n, int cam_w, int cam_h
     int avail = window_w - 2 * s.margin - (n - 1) * s.gap;
     s.panel_w = avail / n;
     // Cap the panel width so a one- or two-camera rig does not swallow the
-    // window. The views are 96 px wide, so beyond this it is mostly upscaling.
-    if (s.panel_w > 360)
-        s.panel_w = 360;
+    // window. A 640 px cap lets a three-camera rig use nearly the full width of
+    // a typical headless render while still bounding single-camera layouts.
+    if (s.panel_w > 640)
+        s.panel_w = 640;
     if (s.panel_w < 16)
         s.panel_w = 16;
     s.panel_h = (int)((float)s.panel_w * (float)cam_h / (float)cam_w + 0.5f);
@@ -3288,13 +3311,13 @@ struct Client {
     Texture2D camera_tex;
     int camera_tex_w;
     int camera_tex_h;
-    // Band reserved along the bottom edge for the camera panels, and the height
-    // left over above it for the simulator view. `cam_strip_h` is 0 when no rig
+    // Band reserved along the top edge for the camera panels, and the height
+    // left over below it for the simulator view. `cam_strip_h` is 0 when no rig
     // is bound, and then `view_h` is the full window height.
     int cam_strip_h;
     int view_h;
     // Off-screen target the simulator view is drawn into when the strip is
-    // present, so the panels sit beside the view rather than on top of it.
+    // present, so the panels sit above the view rather than on top of it.
     RenderTexture2D sim_view;
     pid_t xvfb_pid;
     int xvfb_display_num;
@@ -3377,7 +3400,7 @@ Client *make_client(Drive *env) {
         client->height = img_height;
     }
 
-    // Reserve a band along the bottom for the policy's camera views. The rig is
+    // Reserve a band along the top for the policy's camera views. The rig is
     // bound before the first render call, so its size is known here, and growing
     // the window rather than carving into it leaves the simulator view exactly the
     // size it had without cameras.
@@ -4074,7 +4097,7 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
 }
 
 // The simulator view is drawn off screen whenever a camera strip is reserved,
-// then blitted to the top of the window. Rendering into a target of exactly the
+// then blitted below the camera strip. Rendering into a target of exactly the
 // view's size is what keeps the projection's aspect ratio correct; clipping a
 // full-window render would crop the map instead of fitting it.
 static void begin_sim_view(Client *client) {
@@ -4091,10 +4114,10 @@ static void end_sim_view(Client *client) {
     // Render textures come out y-flipped, hence the negative source height.
     Rectangle src = {0.0f, 0.0f, (float)client->sim_view.texture.width,
                      -(float)client->sim_view.texture.height};
-    DrawTextureRec(client->sim_view.texture, src, (Vector2){0.0f, 0.0f}, WHITE);
+    DrawTextureRec(client->sim_view.texture, src, (Vector2){0.0f, (float)client->cam_strip_h}, WHITE);
 }
 
-// Draw the selected agent's camera views as a horizontal strip under the
+// Draw the selected agent's camera views as a horizontal strip above the
 // simulator view, in the rig's left-to-right order.
 //
 // These are the exact pixels handed to the policy, blitted from the rasterizer's
@@ -4129,11 +4152,11 @@ static void draw_camera_panels(Drive *env, Client *client) {
     // Same layout make_client sized the window with, so the strip fits the band
     // exactly.
     CameraStrip s = camera_strip_layout((int)client->width, n, cam_w, cam_h);
-    int strip_top = client->view_h;
+    int strip_top = 0;
 
     DrawRectangle(0, strip_top, (int)client->width, client->cam_strip_h, PUFF_BACKGROUND);
-    // A hairline against the view above, so the strip reads as its own area.
-    DrawRectangle(0, strip_top, (int)client->width, 1, PUFF_BACKGROUND2);
+    // A hairline against the view below, so the strip reads as its own area.
+    DrawRectangle(0, client->cam_strip_h - 1, (int)client->width, 1, PUFF_BACKGROUND2);
 
     int y = strip_top + s.margin;
     for (int i = 0; i < n; i++) {
@@ -4257,8 +4280,9 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
             env->human_agent_idx = (env->human_agent_idx + 1) % env->active_agent_count;
         }
 
-        DrawText(TextFormat("Timestep: %d", env->timestep), 10, 50, 20, PUFF_WHITE);
-        DrawText(TextFormat("Controlling agent: %d", env->human_agent_idx), 10, 70, 20, PUFF_WHITE);
+        int view_y = client->cam_strip_h;
+        DrawText(TextFormat("Timestep: %d", env->timestep), 10, view_y + 50, 20, PUFF_WHITE);
+        DrawText(TextFormat("Controlling agent: %d", env->human_agent_idx), 10, view_y + 70, 20, PUFF_WHITE);
         int human_idx = env->active_agent_indices[env->human_agent_idx];
 
         Color action_color = IsKeyDown(KEY_LEFT_SHIFT) ? YELLOW : PUFF_WHITE;
@@ -4274,8 +4298,8 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
                 float accel_value = ACCELERATION_VALUES[accel_idx];
                 float steer_value = STEERING_VALUES[steer_idx];
 
-                DrawText(TextFormat("Acceleration: %.2f m/s^2", accel_value), 10, 110, 20, action_color);
-                DrawText(TextFormat("Steering: %.3f", steer_value), 10, 130, 20, action_color);
+                DrawText(TextFormat("Acceleration: %.2f m/s^2", accel_value), 10, view_y + 110, 20, action_color);
+                DrawText(TextFormat("Steering: %.3f", steer_value), 10, view_y + 130, 20, action_color);
             } else if (env->dynamics_model == JERK) {
                 int num_lat = 3;
                 int jerk_long_idx = action_val / num_lat;
@@ -4283,17 +4307,20 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
                 float jerk_long_value = JERK_LONG[jerk_long_idx];
                 float jerk_lat_value = JERK_LAT[jerk_lat_idx];
 
-                DrawText(TextFormat("Longitudinal Jerk: %.2f m/s^3", jerk_long_value), 10, 110, 20, action_color);
-                DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, 130, 20, action_color);
+                DrawText(TextFormat("Longitudinal Jerk: %.2f m/s^3", jerk_long_value), 10, view_y + 110, 20,
+                         action_color);
+                DrawText(TextFormat("Lateral Jerk: %.2f m/s^3", jerk_lat_value), 10, view_y + 130, 20,
+                         action_color);
             }
         } else { // continuous
             float (*action_array_f)[2] = (float (*)[2])env->actions;
-            DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, 110, 20,
+            DrawText(TextFormat("Acceleration: %.2f", action_array_f[env->human_agent_idx][0]), 10, view_y + 110,
+                     20, action_color);
+            DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, view_y + 130, 20,
                      action_color);
-            DrawText(TextFormat("Steering: %.2f", action_array_f[env->human_agent_idx][1]), 10, 130, 20, action_color);
         }
 
-        int status_y = 150;
+        int status_y = view_y + 150;
         if (IsKeyDown(KEY_LEFT_SHIFT)) {
             DrawText("[shift pressed]", 10, status_y, 20, YELLOW);
             status_y += 20;
@@ -4308,7 +4335,7 @@ void c_render(Drive *env, int view_mode, int draw_traces) {
         }
 
         DrawText("Controls: SHIFT + W/S - Accelerate/Brake, SHIFT + A/D - Steer, TAB - Switch Agent", 10,
-                 client->view_h - 30, 20, PUFF_WHITE);
+                 view_y + client->view_h - 30, 20, PUFF_WHITE);
         DrawText(TextFormat("Grid Rows: %d", env->grid_map->grid_rows), 10, status_y, 20, PUFF_WHITE);
         DrawText(TextFormat("Grid Cols: %d", env->grid_map->grid_cols), 10, status_y + 20, 20, PUFF_WHITE);
         draw_camera_panels(env, client);

@@ -78,6 +78,8 @@ __device__ __forceinline__ void road_color(int type_id, float *out) {
     case 8:  out[0] = 0.92f; out[1] = 0.92f; out[2] = 0.92f; break;  // CROSSWALK
     case 9:  out[0] = 0.95f; out[1] = 0.80f; out[2] = 0.25f; break;  // SPEED_BUMP
     case 10: out[0] = 0.45f; out[1] = 0.45f; out[2] = 0.48f; break;  // DRIVEWAY
+    case 11: out[0] = 0.32f; out[1] = 0.32f; out[2] = 0.34f; break;  // teddy/giga lane area
+    case 12: out[0] = 1.00f; out[1] = 0.82f; out[2] = 0.00f; break;  // teddy/giga road edge
     default: out[0] = 0.95f; out[1] = 0.95f; out[2] = 0.95f; break;  // ROAD_LINE
     }
 }
@@ -214,11 +216,14 @@ __global__ void transform_kernel(const float *agents, const float *roads, const 
         float col[3];
         road_color((int)r[5], col);
 
+        // Keep the opaque teddy/giga lane area just below painted features so
+        // sub-pixel depth noise cannot hide their antialiased edges.
+        float road_z = ((int)r[5] == 11) ? -0.01f : 0.0f;
         float a[3], b[3], d[3], e[3];
-        to_camera(c, ego, r[0] + nx, r[1] + ny, 0.0f, a);
-        to_camera(c, ego, r[0] - nx, r[1] - ny, 0.0f, b);
-        to_camera(c, ego, r[2] - nx, r[3] - ny, 0.0f, d);
-        to_camera(c, ego, r[2] + nx, r[3] + ny, 0.0f, e);
+        to_camera(c, ego, r[0] + nx, r[1] + ny, road_z, a);
+        to_camera(c, ego, r[0] - nx, r[1] - ny, road_z, b);
+        to_camera(c, ego, r[2] - nx, r[3] - ny, road_z, d);
+        to_camera(c, ego, r[2] + nx, r[3] + ny, road_z, e);
         // Reference order is every first triangle, then every second.
         emit_triangle(r_scratch, i, c, a, b, d, col);
         emit_triangle(r_scratch, num_roads + i, c, a, d, e, col);
@@ -343,7 +348,7 @@ __device__ __forceinline__ void composite(const float *fd, const float *fc, int 
     acc[3] = trans;
 }
 
-__global__ void raster_kernel(const float *egos, int ego_stride, const float *rig, int num_cams,
+__global__ void raster_kernel(const float *roads, const float *egos, int ego_stride, const float *rig, int num_cams,
                               const int *ego_scene, const int *agent_ranges, const int *road_ranges,
                               const float *road_scratch, const float *agent_scratch, int max_road_tris,
                               int max_agent_tris, unsigned char *out, int tiles_x, int tiles_y) {
@@ -356,8 +361,12 @@ __global__ void raster_kernel(const float *egos, int ego_stride, const float *ri
     Cam c = load_cam(rig, cam_i);
 
     int scene = ego_scene[image / num_cams];
-    int road_total = (road_ranges[scene + 1] - road_ranges[scene]) * 2;
+    int road_lo = road_ranges[scene], road_hi = road_ranges[scene + 1];
+    int road_total = (road_hi - road_lo) * 2;
     int agent_total = (agent_ranges[scene + 1] - agent_ranges[scene]) * 12;
+    // fill_render_roads emits lane areas last. Their renderer-only tag opts only
+    // teddy/giga into black non-road ground; ocean retains the original gray.
+    bool black_ground = road_hi > road_lo && (int)roads[(size_t)(road_hi - 1) * RASTER_ROAD_FEATURES + 5] == 11;
 
     extern __shared__ int shared_idx[];
     int *road_list = shared_idx;
@@ -409,7 +418,11 @@ __global__ void raster_kernel(const float *egos, int ego_stride, const float *ri
         if (dez < -1e-6f) {
             ground_depth = -c.pos[2] / dez;  // dcz is 1, so the ray parameter is the depth
             float s = depth_scale(ground_depth);
-            const float ground[3] = {0.16f, 0.16f, 0.17f};
+            const float ground[3] = {
+                black_ground ? 0.0f : 0.16f,
+                black_ground ? 0.0f : 0.16f,
+                black_ground ? 0.0f : 0.17f,
+            };
 #pragma unroll
             for (int k = 0; k < 3; k++) rgb[k] = ground[k] * s + PALETTE_SKY[k] * (1.0f - s);
         } else {
@@ -537,7 +550,7 @@ void drive_raster_cuda(torch::Tensor agents, torch::Tensor roads, torch::Tensor 
     size_t shmem = 2 * MAX_TILE_TRIS * sizeof(int);
 
     raster_kernel<<<grid, 128, shmem>>>(
-        egos.data_ptr<float>(), ego_stride, rig.data_ptr<float>(), num_cams, ego_scene.data_ptr<int>(),
+        roads.data_ptr<float>(), egos.data_ptr<float>(), ego_stride, rig.data_ptr<float>(), num_cams, ego_scene.data_ptr<int>(),
         agent_ranges.data_ptr<int>(), road_ranges.data_ptr<int>(), road_scratch.data_ptr<float>(),
         agent_scratch.data_ptr<float>(), max_road_tris, max_agent_tris, out.data_ptr<unsigned char>(),
         tiles_x, tiles_y);

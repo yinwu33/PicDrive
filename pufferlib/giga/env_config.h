@@ -32,6 +32,8 @@ typedef struct {
     int max_controlled_agents;
     int obs_mode;
     int render_road_types;
+    int draw_lane_area;
+    float lane_width;
     char map_dir[256];
 
     // Gigaflow random initialization.
@@ -50,6 +52,8 @@ typedef struct {
 // agents per map, or a 0 m waypoint spacing, is a silently broken scene rather than
 // a conservative one. Call this before ini_parse so the INI overrides real values.
 static void env_config_set_giga_defaults(env_init_config *c) {
+    c->draw_lane_area = 0;
+    c->lane_width = 4.5f;
     c->agents_per_map_min = 1;
     c->agents_per_map_max = 120;
     c->spawn_speed_max = 12.0f;
@@ -95,6 +99,11 @@ static int handler(void *config, const char *section, const char *name, const ch
     } else if (MATCH("env", "render_road_types")) {
         // Bitmask over entity types. 0 means "use the built-in default".
         env_config->render_road_types = atoi(value);
+    } else if (MATCH("env", "draw_lane_area")) {
+        env_config->draw_lane_area =
+            strcmp(value, "true") == 0 || strcmp(value, "True") == 0 || atoi(value) != 0;
+    } else if (MATCH("env", "lane_width")) {
+        env_config->lane_width = atof(value);
     } else if (MATCH("env", "goal_behavior")) {
         env_config->goal_behavior = atoi(value);
     } else if (MATCH("env", "goal_target_distance")) {

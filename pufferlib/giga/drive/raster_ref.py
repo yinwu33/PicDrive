@@ -55,6 +55,10 @@ STOP_SIGN = 7
 CROSSWALK = 8
 SPEED_BUMP = 9
 DRIVEWAY = 10
+# Renderer-only tags emitted by teddy/giga's RenderState builder. Keeping these
+# separate avoids changing ocean, which shares the CUDA kernel.
+RENDER_LANE_AREA = 11
+RENDER_YELLOW_ROAD_EDGE = 12
 
 # Feature widths of the RenderState buffers, mirroring drive.h.
 RENDER_AGENT_FEATURES = 8
@@ -291,6 +295,8 @@ class Palette:
             CROSSWALK: (0.92, 0.92, 0.92),
             SPEED_BUMP: (0.95, 0.80, 0.25),
             DRIVEWAY: (0.45, 0.45, 0.48),
+            RENDER_LANE_AREA: (0.32, 0.32, 0.34),
+            RENDER_YELLOW_ROAD_EDGE: (1.0, 0.82, 0.0),
         }
     )
 
@@ -350,8 +356,17 @@ def _road_triangles(roads: torch.Tensor, ego: torch.Tensor, palette: Palette):
     c = p1 - normal * half_w
     d = p1 + normal * half_w
 
+    # The lane-area surface sits 1 cm below painted features. They are otherwise
+    # coplanar, and tiny interpolation differences can make an edge randomly lose
+    # the depth tie at its antialiased boundary.
+    road_z = torch.where(
+        roads[:, 5] == RENDER_LANE_AREA,
+        roads.new_full((roads.shape[0],), -0.01),
+        roads.new_zeros((roads.shape[0],)),
+    ).unsqueeze(-1)
+
     def lift(xy):
-        return torch.cat([xy, xy.new_zeros((xy.shape[0], 1))], dim=-1)
+        return torch.cat([xy, road_z], dim=-1)
 
     a, b, c, d = lift(a), lift(b), lift(c), lift(d)
     tris = torch.cat([torch.stack([a, b, c], dim=1), torch.stack([a, c, d], dim=1)], dim=0)
@@ -547,7 +562,9 @@ def _coverage_and_depth(screen, depth, px, py, eps=1e-9):
     return cov, z
 
 
-def _background(rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dtype):
+def _background(
+    rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dtype, ground_color=None
+):
     """Sky above the horizon, asphalt below, with exact ground depth per pixel.
 
     Returns (color [P, 3], depth [P]) where sky depth is +inf.
@@ -567,7 +584,9 @@ def _background(rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dt
     t = torch.where(denom < -1e-6, -cam_pos[2] / denom, torch.full_like(denom, float("inf")))
     depth = torch.where(torch.isfinite(t), t * dir_cam[:, 2], torch.full_like(t, float("inf")))
 
-    ground = torch.tensor(palette.ground, device=device, dtype=dtype)
+    ground = torch.tensor(
+        palette.ground if ground_color is None else ground_color, device=device, dtype=dtype
+    )
     sky = torch.tensor(palette.sky, device=device, dtype=dtype)
     hit = torch.isfinite(depth).unsqueeze(-1)
     color = torch.where(hit, ground, sky).expand(px.shape[0], 3).clone()
@@ -639,6 +658,9 @@ def render(
     height, width = heights.pop(), widths.pop()
 
     out = torch.empty((egos.shape[0], len(cameras), 3, height, width), dtype=torch.uint8, device=device)
+    # The renderer-only lane-area tag also opts teddy/giga into a black non-road
+    # ground. Ocean never emits this tag and keeps its original background.
+    ground_color = (0.0, 0.0, 0.0) if bool((roads[:, 5] == RENDER_LANE_AREA).any()) else None
 
     ys, xs = torch.meshgrid(
         torch.arange(height, device=device, dtype=dtype) + 0.5,
@@ -668,7 +690,7 @@ def render(
             fx, fy, cx, cy = cam.intrinsics()
 
             bg_color, bg_depth = _background(
-                rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dtype
+                rot, cam_pos, fx, fy, cx, cy, width, height, palette, device, dtype, ground_color
             )
             sky = torch.tensor(palette.sky, device=device, dtype=dtype)
 
