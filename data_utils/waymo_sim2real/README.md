@@ -10,6 +10,35 @@ The pipeline has a strict raw-data boundary:
 4. `train_distillation.py` reads only derived artifacts and the pinned teacher
    checkpoint; it never renders and never updates the simulation policy.
 
+## Optional: retain raw camera data without LiDAR
+
+`strip_lidar.py` removes only top-level `Frame.lasers` (protobuf field 5) while
+preserving images, calibrations, poses, maps, and the field 6 3D boxes consumed
+by `preprocess.py`. It rewrites one TFRecord beside the source, validates all
+input and output CRC32C checksums, then atomically replaces that source file.
+Both the per-file and overall progress bars include an ETA.
+
+```bash
+uv pip install --python .venv/bin/python google-crc32c
+
+# Non-mutating trial on the first sorted segment.
+.venv/bin/python -m data_utils.waymo_sim2real.strip_lidar \
+  --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
+  --dry-run --max-files 1
+
+# Destructive in-place conversion, one validated segment at a time.
+.venv/bin/python -m data_utils.waymo_sim2real.strip_lidar \
+  --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
+  --in-place
+```
+
+Until a temporary replacement has fully validated, an interrupted run leaves
+the current source untouched. Files atomically replaced before the interruption
+are already valid stripped TFRecords, and a rerun safely reports them as
+unchanged. A temporary copy needs at most the space of one raw segment; the
+original inode cannot be shortened directly because TFRecord lengths and
+checksums change when a protobuf field is removed.
+
 ## 1. Build processed data
 
 ```bash

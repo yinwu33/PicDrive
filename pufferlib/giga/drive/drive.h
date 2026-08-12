@@ -135,6 +135,7 @@
 #define GOAL_RESPAWN 0
 #define GOAL_GENERATE_NEW 1
 #define GOAL_STOP 2
+#define GOAL_REMOVE 3
 
 // Observation mode. VECTOR is the legacy privileged entity-set observation.
 // RENDER_STATE writes only the ego vector to the observation buffer and emits the
@@ -3166,6 +3167,18 @@ void c_step(Drive *env) {
             if (reached_goal) {
                 env->entities[agent_idx].stopped = 1;
                 env->entities[agent_idx].vx = env->entities[agent_idx].vy = 0.0f;
+            }
+        }
+    } else if (env->goal_behavior == GOAL_REMOVE) {
+        // Unlike GOAL_STOP, this ends the agent's life: terminal, same as GOAL_RESPAWN,
+        // so the value function does not bootstrap across the vanish.
+        for (int i = 0; i < env->active_agent_count; i++) {
+            int agent_idx = env->active_agent_indices[i];
+            int reached_goal = env->entities[agent_idx].metrics_array[REACHED_GOAL_IDX];
+            if (reached_goal) {
+                env->terminals[i] = 1;
+                env->entities[agent_idx].removed = 1;
+                env->entities[agent_idx].x = env->entities[agent_idx].y = -10000.0f;
             }
         }
     }
