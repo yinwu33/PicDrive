@@ -3932,6 +3932,10 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                     else
                         agent_color = BLUE;
                 }
+                // The camera panels show human_agent_idx, so distinguish that ego
+                // from the other policy-controlled agents in the BEV.
+                if (is_active_agent && agent_index == env->human_agent_idx)
+                    agent_color = LIGHTGREEN;
                 if (is_active_agent && env->entities[i].collision_state > 0)
                     agent_color = RED;
 
