@@ -76,7 +76,7 @@ static const float GIGA_COND_HI[GIGA_NUM_COND] = {
     20.0f,   // v_goal: maximum speed at final goal upper bound, m/s
     3.0f,    // alpha_collision: collision penalty weight upper bound
     3.0f,    // alpha_boundary: off-road penalty weight upper bound
-    0.1f,    // alpha_comfort: acceleration/jerk penalty weight upper bound
+    0.05f,    // alpha_comfort: acceleration/jerk penalty weight upper bound
     0.025f,    // alpha_l_align: lane-heading alignment weight; pinned to 0 (disabled)
     1.0f,    // alpha_vel_align: wrong-way motion multiplier; currently reward-inert
     0.075f,    // alpha_l_center: lane-centering weight; pinned to 0 (disabled)
