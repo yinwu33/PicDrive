@@ -10,7 +10,13 @@ import torch
 from PIL import Image
 
 from data_utils.waymo_sim2real.ego_state import ego_observations
-from data_utils.waymo_sim2real.giga_conditioning import GIGA_EGO_OBS_DIM, append_giga_conditioning, segment_conditioning
+from data_utils.waymo_sim2real.giga_conditioning import (
+    GIGA_EGO_OBS_DIM,
+    append_giga_conditioning,
+    conditioning_to_raw,
+    nominal_conditioning,
+    segment_conditioning,
+)
 from data_utils.waymo_sim2real.preprocess import SENSOR_TO_CV, _calibration_arrays
 from data_utils.waymo_sim2real.processed import (
     CAMERA_NAMES,
@@ -33,7 +39,7 @@ from data_utils.waymo_sim2real.real_perception import (
     ViTRealPerception,
     ViTRealPerceptionConfig,
 )
-from data_utils.waymo_sim2real.teacher import FrozenPlanningHead
+from data_utils.waymo_sim2real.teacher import FrozenPlanningHead, RecurrentPlanningRuntime
 from data_utils.waymo_sim2real.train_distillation import (
     PairedWaymoFeatureDataset,
     _wandb_epoch_payload,
@@ -208,6 +214,59 @@ def test_frozen_planner_matches_wrapper_first_frame_exactly():
     torch.testing.assert_close(actual, expected)
     assert head.planner_mode == "zero_state_lstm"
     assert all(not parameter.requires_grad for parameter in head.parameters())
+
+
+def test_recurrent_planning_runtime_matches_wrapper_cell_across_ticks_and_resets():
+    env = SimpleNamespace(
+        num_cameras=3,
+        height=SIM_HEIGHT,
+        width=SIM_WIDTH,
+        image_bytes=3 * 3 * SIM_HEIGHT * SIM_WIDTH,
+        ego_dim=EGO_OBS_DIM,
+        single_observation_space=gymnasium.spaces.Box(0, 255, shape=(1,), dtype=np.uint8),
+        single_action_space=gymnasium.spaces.MultiDiscrete([12]),
+    )
+    wrapper = LSTMWrapper(env, DriveCam(env), input_size=512, hidden_size=512)
+    recurrent = {
+        "weight_ih": wrapper.cell.weight_ih.detach().clone(),
+        "weight_hh": wrapper.cell.weight_hh.detach().clone(),
+        "bias_ih": wrapper.cell.bias_ih.detach().clone(),
+        "bias_hh": wrapper.cell.bias_hh.detach().clone(),
+    }
+    head = FrozenPlanningHead(wrapper.policy, recurrent)
+    runtime = RecurrentPlanningRuntime(head)
+    scenes = torch.randn(4, 2, 256)
+    egos = torch.randn(4, 2, EGO_OBS_DIM)
+    expected_h = expected_c = None
+    for scene, ego in zip(scenes, egos):
+        encoded = wrapper.policy.backbone(
+            torch.cat([scene, wrapper.policy.ego_encoder(ego)], dim=1)
+        )
+        if expected_h is None:
+            expected_h = torch.zeros(2, 512)
+            expected_c = torch.zeros(2, 512)
+        expected_h, expected_c = wrapper.cell(encoded, (expected_h, expected_c))
+        expected = wrapper.policy.actor(expected_h)
+        actual = torch.cat(runtime.step(scene, ego), dim=1)
+        torch.testing.assert_close(actual, expected)
+    assert runtime.initialized
+
+    runtime.reset()
+    assert not runtime.initialized
+    first_after_reset = torch.cat(runtime.step(scenes[0], egos[0]), dim=1)
+    zeros = torch.zeros(2, 512)
+    encoded = wrapper.policy.backbone(
+        torch.cat([scenes[0], wrapper.policy.ego_encoder(egos[0])], dim=1)
+    )
+    expected_h, _ = wrapper.cell(encoded, (zeros, zeros))
+    torch.testing.assert_close(first_after_reset, wrapper.policy.actor(expected_h))
+
+
+def test_nominal_conditioning_denormalizes_to_nominal_dynamics():
+    conditioning = nominal_conditioning()
+    assert conditioning.shape == (13,)
+    assert (conditioning >= 0).all() and (conditioning <= 1).all()
+    np.testing.assert_allclose(conditioning_to_raw(conditioning)[10:], 1.0, atol=1e-7)
 
 
 def test_feature_alignment_is_zero_for_identical_nonzero_features():

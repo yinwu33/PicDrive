@@ -16,6 +16,14 @@ import numpy as np
 import pytest
 
 from data_utils.carla_sim2real import EPISODE_FRAMES, REAL_HEIGHT, REAL_WIDTH
+from data_utils.carla_sim2real.closed_loop import (
+    ClosedLoopEvaluator,
+    JerkController,
+    RoutePlan,
+    RouteTracker,
+    base_ego_observation,
+    decode_jerk_action,
+)
 from data_utils.carla_sim2real.collect import (
     PEDESTRIAN,
     VEHICLE,
@@ -38,6 +46,7 @@ from data_utils.carla_sim2real.rig import (
 )
 from data_utils.carla_sim2real.roads import RoadIndex, town_roads, world_to_ego
 from data_utils.carla_sim2real.split_distillation import split_segments
+from data_utils.waymo_sim2real.giga_conditioning import nominal_conditioning
 from data_utils.waymo_sim2real.processed import (
     EGO_OBS_DIM,
     SIM_HEIGHT,
@@ -52,6 +61,133 @@ from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
 
 CARLA_XODR = Path("/home/tjhu78u/CARLA_0_9_16/CarlaUE4/Content/Carla/Maps/OpenDrive")
 PY123D = Path("data_utils/carla/carla_py123d")
+
+
+def test_closed_loop_action_decoder_and_controller_keep_policy_carla_signs_straight():
+    assert decode_jerk_action(0) == (-15.0, -4.0)
+    assert decode_jerk_action(7) == (0.0, 0.0)
+    assert decode_jerk_action(11) == (4.0, 4.0)
+    with pytest.raises(ValueError):
+        decode_jerk_action(12)
+
+    controller = JerkController(0.1, nominal_conditioning())
+    accelerate_left = controller.step(
+        11,
+        signed_speed=0.0,
+        measured_accel_long=0.0,
+        wheelbase=2.8,
+        max_wheel_steer=0.7,
+    )
+    assert accelerate_left.target_accel_long == pytest.approx(0.4)
+    assert accelerate_left.target_accel_lat > 0
+    assert accelerate_left.throttle > 0 and accelerate_left.brake == 0
+    # Policy-positive lateral is left, whereas CARLA-positive steer is right.
+    assert accelerate_left.target_steering_angle > 0
+    assert accelerate_left.steer < 0
+
+
+def test_online_ego_observation_matches_giga_normalization():
+    obs = base_ego_observation(
+        (100.0, -20.0),
+        signed_speed=10.0,
+        width=2.0,
+        length=5.0,
+        collision=True,
+        steering_angle=0.2,
+        accel_long=-3.0,
+        accel_lat=2.0,
+        respawn=True,
+    )
+    assert obs.shape == (11,) and obs.dtype == np.float32
+    np.testing.assert_allclose(
+        obs,
+        [0.5, -0.1, 0.1, 2 / 15, 5 / 30, 1, 0.2 / math.pi, -3 / 15, 0.5, 1, 1 / 3],
+        atol=1e-6,
+    )
+
+
+def test_route_tracker_advances_intermediate_goals_without_skipping_final():
+    points = np.stack([np.arange(0.0, 101.0, 10.0), np.zeros(11), np.zeros(11)], axis=1)
+    arc = np.arange(0.0, 101.0, 10.0)
+    plan = RoutePlan(points=points, arc_length=arc, goal_indices=(3, 7, 10))
+    tracker = RouteTracker(plan)
+    assert tracker.update(np.asarray([0.0, 0.0, 0.0]), 5.0) == 0
+    assert tracker.goal_cursor == 0
+    assert tracker.update(np.asarray([31.0, 0.0, 0.0]), 5.0) == 1
+    assert tracker.goal_cursor == 1
+    assert tracker.update(np.asarray([72.0, 0.0, 0.0]), 5.0) == 1
+    assert tracker.at_final_goal
+    # Reaching the final goal is reported to the evaluator; it never advances
+    # beyond the final index (and therefore cannot reset LSTM state implicitly).
+    assert tracker.update(np.asarray([100.0, 0.0, 0.0]), 5.0) == 0
+    assert tracker.goal_cursor == 2
+    assert tracker.completion == pytest.approx(1.0)
+
+
+def test_spectator_chase_pose_stays_behind_and_above_ego():
+    captured = []
+    spectator = SimpleNamespace(set_transform=captured.append)
+    fake_carla = SimpleNamespace(
+        Location=lambda **values: SimpleNamespace(**values),
+        Rotation=lambda **values: SimpleNamespace(**values),
+        Transform=lambda location, rotation: SimpleNamespace(location=location, rotation=rotation),
+    )
+    evaluator = ClosedLoopEvaluator.__new__(ClosedLoopEvaluator)
+    evaluator.args = SimpleNamespace(spectator=True)
+    evaluator.collector = SimpleNamespace(
+        carla=fake_carla,
+        world=SimpleNamespace(get_spectator=lambda: spectator),
+    )
+    ego_transform = SimpleNamespace(
+        location=SimpleNamespace(x=10.0, y=20.0, z=1.0),
+        rotation=SimpleNamespace(yaw=53.0),
+        get_forward_vector=lambda: SimpleNamespace(x=0.6, y=0.8),
+    )
+
+    evaluator._update_spectator(ego_transform)
+
+    assert len(captured) == 1
+    assert captured[0].location.x == pytest.approx(5.2)
+    assert captured[0].location.y == pytest.approx(13.6)
+    assert captured[0].location.z == pytest.approx(5.0)
+    assert captured[0].rotation.pitch == pytest.approx(-15.0)
+    assert captured[0].rotation.yaw == pytest.approx(53.0)
+
+
+def test_spectator_draws_only_the_current_goal_as_a_short_lived_marker():
+    calls = {}
+
+    def recorder(name):
+        def record(*args, **kwargs):
+            calls.setdefault(name, []).append((args, kwargs))
+
+        return record
+
+    fake_carla = SimpleNamespace(
+        Location=lambda **values: SimpleNamespace(**values),
+        Color=lambda red, green, blue: (red, green, blue),
+    )
+    debug = SimpleNamespace(
+        draw_point=recorder("point"),
+        draw_line=recorder("line"),
+        draw_string=recorder("string"),
+    )
+    evaluator = ClosedLoopEvaluator.__new__(ClosedLoopEvaluator)
+    evaluator.args = SimpleNamespace(spectator=True, dt=0.1)
+    evaluator.collector = SimpleNamespace(carla=fake_carla, world=SimpleNamespace(debug=debug))
+
+    evaluator._draw_active_goal(np.asarray([12.0, -3.0, 0.5]), final=False)
+
+    assert set(calls) == {"point", "line", "string"}
+    assert all(len(entries) == 1 for entries in calls.values())
+    point, point_options = calls["point"][0]
+    assert (point[0].x, point[0].y, point[0].z) == pytest.approx((12.0, -3.0, 0.85))
+    assert point_options["color"] == (0, 255, 80)
+    assert point_options["life_time"] == pytest.approx(0.125)
+    assert point_options["persistent_lines"] is False
+    label, label_options = calls["string"][0]
+    assert label[1] == "NEXT GOAL"
+    assert label_options["draw_shadow"] is True
 
 
 def test_distillation_split_is_town_stratified_deterministic_and_leak_free():

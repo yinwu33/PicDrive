@@ -287,6 +287,89 @@ The trainer reads only the shared `processed/`, `teacher_features/`, and
 model or dataset code changes are required. CARLA remains a pretraining source,
 while Waymo supplies the real-domain fine-tuning data.
 
+## 6. Closed-loop end-to-end evaluation
+
+`closed_loop.py` replaces only perception. At every 10 Hz CARLA tick it runs:
+
+```
+three 384x256 RGB cameras -> DINO student -> 256-D scene feature
+                                               + online 24-D giga ego vector
+                                               -> frozen trunk -> persistent LSTM -> 12-way jerk
+                                               -> CARLA throttle/brake/steer adapter
+```
+
+The LSTM starts from zero on the first frame after the ego is spawned and then
+persists for the entire route. It is **not** reset when the route tracker moves
+to an intermediate goal; it resets only when a vehicle life ends and the next
+goal/ego is spawned. This is deliberately different from offline distillation,
+where unrelated samples use the first-frame (`h0=c0=0`) planner path.
+
+The server command is unchanged. The evaluator also needs CARLA's `agents/`
+navigation package, so expose the 0.9.16 PythonAPI directory while allowing the
+installed 0.9.16 wheel in `.venv` to provide `carla`:
+
+```bash
+PYTHONPATH=/home/tjhu78u/CARLA_0_9_16/PythonAPI/carla \
+.venv/bin/python -m data_utils.carla_sim2real.closed_loop \
+  --student artifacts/waymo_sim2real/runs/dino_waymo_2hz_b32_e30/deployment.pt \
+  --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
+  --output artifacts/carla_sim2real/eval/student_town01 \
+  --town Town01 --episodes 10 --control student \
+  --vehicles 40 --walkers 20 --spectator --device cuda --amp bf16
+```
+
+`--spectator` keeps CARLA's third-person camera 8 m behind and 4 m above the
+ego, looking down by 15 degrees. It changes only the Unreal spectator and never
+the three policy cameras. The CARLA server must be started normally to see this
+window; a server launched with `-RenderOffScreen` still accepts the spectator
+updates but deliberately displays nothing. The active intermediate goal is a
+green point/light column labelled `NEXT GOAL`; the final goal is orange and
+labelled `FINAL GOAL`. Markers live for just over one tick, so a completed goal
+disappears as soon as the tracker advances instead of leaving the whole route
+painted on the map.
+
+`--shadow` is on by default. Ground-truth CARLA actors and roads are rendered
+through the exact 96x64 Waymo rig and teacher perception on the student's
+trajectory. Teacher and student have independent recurrent state, so the log
+contains online `feature_mse`, `feature_cosine`, `plan_kl`, and
+`action_agreement` without the teacher influencing the controlled car.
+
+Run the teacher-controlled baseline with the same seed and route schedule in a
+separate output directory:
+
+```bash
+PYTHONPATH=/home/tjhu78u/CARLA_0_9_16/PythonAPI/carla \
+.venv/bin/python -m data_utils.carla_sim2real.closed_loop \
+  --student artifacts/waymo_sim2real/runs/dino_waymo_2hz_b32_e30/deployment.pt \
+  --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
+  --output artifacts/carla_sim2real/eval/teacher_town01 \
+  --town Town01 --episodes 10 --control teacher \
+  --vehicles 40 --walkers 20 --device cuda --amp bf16
+```
+
+Each episode samples a reachable 80-200 m GlobalRoutePlanner route, exposes up
+to four route waypoints to the policy one at a time, and respawns after the
+final conditioned goal test, collision, route departure, stuck timeout, or
+episode timeout. Traffic Manager drives other vehicles; CARLA AI drives
+walkers. `--conditioning nominal` (default) keeps all three dynamics
+coefficients at exactly 1.0 for a stable A/B baseline. Use
+`--conditioning sampled` only after that baseline is healthy.
+
+Outputs are append-safe with `--resume`:
+
+- `steps.jsonl`: controls, route state, collision/lane events, inference time,
+  and shadow disagreement for every tick.
+- `episodes.jsonl`: success, termination reason, route completion, collision
+  and lane-invasion counts, average speed, and averaged shadow metrics.
+- `summary.json`: aggregate success rate and means across all completed runs.
+- `config.json`: exact checkpoint/deployment hashes, rig order, seeds and CLI.
+
+The first go/no-go metrics are teacher-vs-student `action_agreement` and
+`plan_kl`, followed by the closed-loop gap in success rate, route completion,
+collisions per episode and lane invasions. Feature MSE alone is diagnostic; it
+is not a deployment criterion because latent directions have unequal effect on
+the frozen planner.
+
 ## Legacy extraction and audit commands
 
 ```bash

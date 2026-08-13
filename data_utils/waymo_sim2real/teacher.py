@@ -195,6 +195,70 @@ class FrozenPlanningHead(nn.Module):
         return "zero_state_lstm" if self.recurrent is not None else "feed_forward"
 
 
+class RecurrentPlanningRuntime:
+    """Stateful online view of :class:`FrozenPlanningHead`.
+
+    Distillation deliberately evaluates every paired image as a first frame, so
+    :class:`FrozenPlanningHead.forward` always starts from ``h0=c0=0``.  A
+    closed-loop rollout is different: the checkpoint was trained with an LSTM
+    and its hidden state must survive from one simulator tick to the next.  This
+    small runtime owns that state without putting it in the module state dict or
+    changing the offline loss semantics.
+
+    Make one runtime per trajectory/branch.  In particular, teacher and student
+    shadow policies need independent instances even though they may share the
+    same frozen planning-head parameters.
+    """
+
+    def __init__(self, head: FrozenPlanningHead):
+        if head.recurrent is None:
+            raise ValueError("closed-loop inference requires a recurrent planning checkpoint")
+        self.head = head
+        self.hidden: torch.Tensor | None = None
+        self.cell: torch.Tensor | None = None
+
+    def reset(self) -> None:
+        """Start a new vehicle life. Intermediate route goals do not call this."""
+
+        self.hidden = None
+        self.cell = None
+
+    @torch.inference_mode()
+    def step(self, scene: torch.Tensor, ego: torch.Tensor) -> list[torch.Tensor]:
+        """Advance one tick and return the checkpoint's split action logits."""
+
+        if scene.ndim != 2 or ego.ndim != 2 or scene.shape[0] != ego.shape[0]:
+            raise ValueError(
+                f"scene and ego must be same-batch rank-2 tensors, got {scene.shape} and {ego.shape}"
+            )
+        if scene.shape[-1] != self.head.scene_dim:
+            raise ValueError(
+                f"scene feature must be {self.head.scene_dim}-D, got {scene.shape[-1]}"
+            )
+        if ego.shape[-1] != self.head.ego_features:
+            raise ValueError(f"ego vector must be {self.head.ego_features}-D, got {ego.shape[-1]}")
+
+        encoded = self.head.trunk(torch.cat([scene, self.head.ego_encoder(ego)], dim=1))
+        if self.hidden is not None and self.hidden.shape[0] != encoded.shape[0]:
+            raise ValueError(
+                "recurrent batch size changed without reset: "
+                f"{self.hidden.shape[0]} to {encoded.shape[0]}"
+            )
+        if self.hidden is None:
+            self.hidden = encoded.new_zeros((encoded.shape[0], self.head.recurrent.hidden_size))
+            self.cell = torch.zeros_like(self.hidden)
+        self.hidden, self.cell = self.head.recurrent(encoded, (self.hidden, self.cell))
+        # The runtime is inference-only, but detach explicitly so callers cannot
+        # accidentally retain a whole rollout if inference_mode is refactored.
+        self.hidden = self.hidden.detach()
+        self.cell = self.cell.detach()
+        return list(torch.split(self.head.actor(self.hidden), self.head.action_dims, dim=1))
+
+    @property
+    def initialized(self) -> bool:
+        return self.hidden is not None
+
+
 def load_frozen_planning_head(
     checkpoint: str | Path,
     device: torch.device | str = "cpu",
