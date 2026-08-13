@@ -52,12 +52,16 @@ Useful smoke-test flags are `--max-segments 1` and
 `--max-frames-per-segment 8`. Each processed NPZ contains only:
 
 - RGB images for `front`, `front_left`, and `front_right`, resized to 384x256;
-- drawable agent boxes and road segments in the ego box-center frame;
+- drawable agent boxes and canonical road segments in the ego box-center frame,
+  including `ROAD_LANE` centerlines;
 - the ego row and exact three-camera raster rig;
 - original camera calibration and frame identity for geometry audits.
 
 It does not retain lidar range images, 2D labels, unused side cameras, human
 trajectories, or the raw protobuf payload.
+
+The 2 Hz dataset uses the same command with `--frame-stride 5` and split-specific
+outputs under `artifacts/waymo_sim2real/2hz/{training,validation}/processed`.
 
 ## 2. Extract frozen teacher features
 
@@ -72,6 +76,11 @@ python -m data_utils.waymo_sim2real.extract_teacher_features \
 Every output NPZ contains the frozen 256-D scene feature and the three 96x64
 sim renders. The manifest pins the teacher checkpoint by SHA256 so cached targets
 cannot silently be mixed across teacher versions.
+
+Before either feature extraction or direct visualization, canonical roads are
+converted with the same camera-policy semantics as live ocean/teddy/giga:
+4.5-metre overlapping lane-area strips, yellow road edges, painted features
+first, and black non-road ground.
 
 ## 3. Plot the paired sample
 

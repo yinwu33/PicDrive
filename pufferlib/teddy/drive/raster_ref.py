@@ -55,8 +55,7 @@ STOP_SIGN = 7
 CROSSWALK = 8
 SPEED_BUMP = 9
 DRIVEWAY = 10
-# Renderer-only tags emitted by teddy/giga's RenderState builder. Keeping these
-# separate avoids changing ocean, which shares the CUDA kernel.
+# Renderer-only tags emitted by the shared ocean/teddy/giga RenderState builder.
 RENDER_LANE_AREA = 11
 RENDER_YELLOW_ROAD_EDGE = 12
 
@@ -368,11 +367,7 @@ def _road_triangles(roads: torch.Tensor, ego: torch.Tensor, palette: Palette):
     c = p1 - normal * half_w
     d = p1 + normal * half_w
 
-    # The lane-area surface sits 1 cm below painted features, which is where a
-    # painted line physically is relative to the surface carrying it. Which of the
-    # two the compositor draws on top no longer rests on that gap -- road decals
-    # are painted in buffer order, and fill_render_roads emits markings first --
-    # but the offset keeps their haze honest and the surfaces distinct.
+    # The drivable surface sits just below the markings painted on it.
     road_z = torch.where(
         roads[:, 5] == RENDER_LANE_AREA,
         roads.new_full((roads.shape[0],), -0.01),
@@ -747,8 +742,8 @@ def render(
     height, width = heights.pop(), widths.pop()
 
     out = torch.empty((egos.shape[0], len(cameras), 3, height, width), dtype=torch.uint8, device=device)
-    # The renderer-only lane-area tag also opts teddy/giga into a black non-road
-    # ground. Ocean never emits this tag and keeps its original background.
+    # A lane-area tag opts every environment into the shared black non-road
+    # background used by the camera policies.
     ground_color = (0.0, 0.0, 0.0) if bool((roads[:, 5] == RENDER_LANE_AREA).any()) else None
 
     ys, xs = torch.meshgrid(

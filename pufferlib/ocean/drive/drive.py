@@ -65,6 +65,8 @@ class Drive(pufferlib.PufferEnv):
         map_dir="resources/drive/binaries/training",
         obs_mode="vector",
         render_road_types=0,
+        draw_lane_area=False,
+        lane_width=4.5,
         ini_file=None,
     ):
         # env
@@ -109,6 +111,8 @@ class Drive(pufferlib.PufferEnv):
             raise ValueError(f"obs_mode must be 'vector' or 'render_state'. Got: {obs_mode}")
         self.obs_mode = obs_mode
         self.render_road_types = render_road_types
+        self.draw_lane_area = draw_lane_area
+        self.lane_width = lane_width
         self._obs_mode_flag = binding.OBS_MODE_VECTOR if obs_mode == "vector" else binding.OBS_MODE_RENDER_STATE
 
         if obs_mode == "render_state":
@@ -251,6 +255,8 @@ class Drive(pufferlib.PufferEnv):
                 render_mode=render_mode,
                 obs_mode=self._obs_mode_flag,
                 render_road_types=self.render_road_types,
+                draw_lane_area=self.draw_lane_area,
+                lane_width=self.lane_width,
             )
             self.env_ids.append(env_id)
 
@@ -357,6 +363,8 @@ class Drive(pufferlib.PufferEnv):
                 render_mode=self.render_mode,
                 obs_mode=self._obs_mode_flag,
                 render_road_types=self.render_road_types,
+                draw_lane_area=self.draw_lane_area,
+                lane_width=self.lane_width,
             )
             self.env_ids.append(env_id)
         self.c_envs = binding.vectorize(*self.env_ids)

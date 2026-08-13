@@ -16,10 +16,10 @@ Example:
 from __future__ import annotations
 
 import argparse
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -38,6 +38,7 @@ from .processed import (
     load_feature,
     load_render_input,
 )
+from .render_roads import prepare_runtime_roads
 from .teacher import load_teacher, scene_features, sha256_file
 
 
@@ -54,9 +55,7 @@ def _prefix_ranges(chunks: list[np.ndarray], device: torch.device) -> tuple[torc
     return values, ranges
 
 
-def _prefetched_samples(
-    files: list[Path], workers: int
-) -> tuple[Path, dict[str, np.ndarray]]:
+def _prefetched_samples(files: list[Path], workers: int) -> tuple[Path, dict[str, np.ndarray]]:
     """Yield ordered render inputs with a small, bounded read-ahead window."""
     if workers == 1:
         for source in files:
@@ -92,7 +91,7 @@ def _extract_batch(
     if not all(np.allclose(rig, rigs[0], atol=1e-5, rtol=1e-5) for rig in rigs[1:]):
         raise ValueError("a render batch crossed camera calibrations; group samples by segment")
     agents, agent_ranges = _prefix_ranges([sample["agents"] for _, sample in samples], device)
-    roads, road_ranges = _prefix_ranges([sample["roads"] for _, sample in samples], device)
+    roads, road_ranges = _prefix_ranges([prepare_runtime_roads(sample["roads"]) for _, sample in samples], device)
     egos = torch.from_numpy(np.stack([sample["ego"] for _, sample in samples])).to(device)
     ego_scene = torch.arange(len(samples), dtype=torch.int32, device=device)
     rig = torch.from_numpy(np.ascontiguousarray(rigs[0])).to(device)
@@ -127,9 +126,7 @@ def _flush_batch(
     for index, (source, sample) in enumerate(pending):
         destination = output / source.name
         if destination.exists() and not overwrite:
-            raise FileExistsError(
-                f"{destination} exists; pass --resume to keep it or --overwrite to replace it"
-            )
+            raise FileExistsError(f"{destination} exists; pass --resume to keep it or --overwrite to replace it")
         segment_id = str(np.asarray(sample["segment_id"]).item())
         timestamp = int(np.asarray(sample["timestamp_micros"]).item())
         atomic_savez(
@@ -203,9 +200,7 @@ def main() -> None:
             feature = load_feature(destination)
             saved_hash = str(np.asarray(feature["checkpoint_sha256"]).item())
             if saved_hash != checkpoint_hash:
-                raise ValueError(
-                    f"{destination} uses checkpoint {saved_hash}, expected {checkpoint_hash}"
-                )
+                raise ValueError(f"{destination} uses checkpoint {saved_hash}, expected {checkpoint_hash}")
             segment_id = str(np.asarray(feature["segment_id"]).item())
             timestamp = int(np.asarray(feature["timestamp_micros"]).item())
             entries.append(
@@ -217,31 +212,22 @@ def main() -> None:
                 }
             )
         elif destination.exists() and not args.overwrite:
-            raise FileExistsError(
-                f"{destination} exists; pass --resume to keep it or --overwrite to replace it"
-            )
+            raise FileExistsError(f"{destination} exists; pass --resume to keep it or --overwrite to replace it")
         else:
             todo.append(source)
         if sample_index % 1000 == 0:
             print(
-                f"[{sample_index}/{len(files)}] scanned; "
-                f"kept {len(entries)}, need {len(todo)}",
+                f"[{sample_index}/{len(files)}] scanned; kept {len(entries)}, need {len(todo)}",
                 flush=True,
             )
 
     kept = len(entries)
     pending: list[tuple[Path, dict[str, np.ndarray]]] = []
     pending_segment: str | None = None
-    for todo_index, (source, sample) in enumerate(
-        _prefetched_samples(todo, args.loader_workers), 1
-    ):
+    for todo_index, (source, sample) in enumerate(_prefetched_samples(todo, args.loader_workers), 1):
         segment = str(np.asarray(sample["segment_id"]).item())
         if pending and (segment != pending_segment or len(pending) >= args.batch_size):
-            entries.extend(
-                _flush_batch(
-                    teacher, pending, args.output, checkpoint_hash, device, args.overwrite
-                )
-            )
+            entries.extend(_flush_batch(teacher, pending, args.output, checkpoint_hash, device, args.overwrite))
             pending = []
         pending.append((source, sample))
         pending_segment = segment
@@ -263,10 +249,7 @@ def main() -> None:
         "samples": entries,
     }
     (args.output / "manifest.json").write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-    print(
-        f"extracted {len(entries)} teacher features into {args.output}; "
-        f"checkpoint sha256={checkpoint_hash}"
-    )
+    print(f"extracted {len(entries)} teacher features into {args.output}; checkpoint sha256={checkpoint_hash}")
 
 
 if __name__ == "__main__":

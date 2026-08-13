@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from pathlib import Path
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 
 
-PROCESSED_SCHEMA_VERSION = 1
+PROCESSED_SCHEMA_VERSION = 2
 FEATURE_SCHEMA_VERSION = 1
 EGO_SCHEMA_VERSION = 1
 

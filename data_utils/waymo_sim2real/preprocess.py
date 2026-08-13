@@ -16,12 +16,13 @@ Example (one segment, eight frames):
 from __future__ import annotations
 
 import argparse
-from collections import Counter
-from concurrent.futures import ProcessPoolExecutor
-from io import BytesIO
 import json
 import math
 import os
+from collections import Counter
+from concurrent.futures import ProcessPoolExecutor
+from io import BytesIO
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -49,26 +50,32 @@ from .proto import (
     repeated_bytes,
     repeated_doubles,
 )
+from .render_roads import CROSSWALK, DEFAULT_LANE_WIDTH, ROAD_EDGE, ROAD_LANE, ROAD_LINE, SPEED_BUMP
 
 
 # PufferDrive RenderState type IDs.
 VEHICLE = 1
 PEDESTRIAN = 2
 CYCLIST = 3
-ROAD_LINE = 5
-ROAD_EDGE = 6
-CROSSWALK = 8
-SPEED_BUMP = 9
-
 LABEL_TYPE_TO_RENDER = {1: VEHICLE, 2: PEDESTRIAN, 4: CYCLIST}
-MAP_FIELD_TO_RENDER = {4: ROAD_LINE, 5: ROAD_EDGE, 8: CROSSWALK, 9: SPEED_BUMP}
-ROAD_WIDTH = {ROAD_LINE: 0.15, ROAD_EDGE: 0.25, CROSSWALK: 0.50, SPEED_BUMP: 0.40}
+MAP_FIELD_TO_RENDER = {
+    3: (ROAD_LANE, 8),
+    4: (ROAD_LINE, 2),
+    5: (ROAD_EDGE, 2),
+    8: (CROSSWALK, 1),
+    9: (SPEED_BUMP, 1),
+}
+ROAD_WIDTH = {
+    ROAD_LANE: DEFAULT_LANE_WIDTH,
+    ROAD_LINE: 0.15,
+    ROAD_EDGE: 0.25,
+    CROSSWALK: 0.50,
+    SPEED_BUMP: 0.40,
+}
 
 # Waymo's mounting rotation is expressed in an x-forward/y-left/z-up camera
 # sensor frame. The CUDA rasterizer uses the CV x-right/y-down/z-forward frame.
-SENSOR_TO_CV = np.asarray(
-    [[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]], dtype=np.float64
-)
+SENSOR_TO_CV = np.asarray([[0.0, -1.0, 0.0], [0.0, 0.0, -1.0], [1.0, 0.0, 0.0]], dtype=np.float64)
 
 
 def _decode_text(value: bytes | None, fallback: str) -> str:
@@ -177,11 +184,11 @@ def _parse_map_features(frame: bytes) -> list[tuple[int, np.ndarray]]:
     features: list[tuple[int, np.ndarray]] = []
     for map_feature in repeated_bytes(frame, 10):
         for field in iter_fields(map_feature):
-            render_type = MAP_FIELD_TO_RENDER.get(field.number)
-            if render_type is None or field.wire_type != 2:
+            feature_spec = MAP_FIELD_TO_RENDER.get(field.number)
+            if feature_spec is None or field.wire_type != 2:
                 continue
+            render_type, point_field = feature_spec
             geometry = field.value
-            point_field = 2 if field.number in (4, 5) else 1
             points = [
                 point
                 for point in (_parse_point(raw) for raw in repeated_bytes(geometry, point_field))
@@ -211,7 +218,7 @@ def _roads_in_ego_frame(
         # p_vehicle = R^T (p_map - offset - t).
         points_vehicle = (points_global - map_pose_offset - translation) @ rotation
         points_vehicle[:, 0] -= WAYMO_REAR_AXLE_TO_BOX_CENTER
-        for p0, p1 in zip(points_vehicle[:-1], points_vehicle[1:]):
+        for p0, p1 in pairwise(points_vehicle):
             # Keep segments intersecting the renderer's square far-range region.
             lo = np.minimum(p0[:2], p1[:2])
             hi = np.maximum(p0[:2], p1[:2])
@@ -316,6 +323,12 @@ def process_segment(
         destination = output / filename
         if destination.exists() and resume and not overwrite:
             with np.load(destination, allow_pickle=False) as archive:
+                saved_version = int(np.asarray(archive["schema_version"]).item())
+                if saved_version != PROCESSED_SCHEMA_VERSION:
+                    raise ValueError(
+                        f"{destination} uses schema {saved_version}, expected "
+                        f"{PROCESSED_SCHEMA_VERSION}; rebuild it with --overwrite"
+                    )
                 saved_segment = str(np.asarray(archive["segment_id"]).item())
                 saved_timestamp = int(np.asarray(archive["timestamp_micros"]).item())
                 if (saved_segment, saved_timestamp) != (segment_id, timestamp):
@@ -344,9 +357,7 @@ def process_segment(
         ego = np.asarray([0.0, 0.0, 1.0, 0.0, -1.0], dtype=np.float32)
 
         if destination.exists() and not overwrite:
-            raise FileExistsError(
-                f"{destination} exists; pass --resume to keep it or --overwrite to replace it"
-            )
+            raise FileExistsError(f"{destination} exists; pass --resume to keep it or --overwrite to replace it")
         atomic_savez(
             destination,
             schema_version=np.asarray(PROCESSED_SCHEMA_VERSION, dtype=np.int32),

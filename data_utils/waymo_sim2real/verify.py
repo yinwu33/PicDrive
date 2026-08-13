@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
 import json
 import os
+from collections import deque
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import TypeVar
 
 import numpy as np
 from PIL import Image
@@ -19,9 +20,7 @@ from .processed import EGO_OBS_DIM, load_ego_state, load_feature, load_processed
 T = TypeVar("T")
 
 
-def _bounded_check(
-    paths: list[Path], check: Callable[[Path], T], workers: int, label: str
-) -> None:
+def _bounded_check(paths: list[Path], check: Callable[[Path], T], workers: int, label: str) -> None:
     with ThreadPoolExecutor(max_workers=workers) as executor:
         iterator = iter(paths)
         pending: deque[tuple[Path, Future[T]]] = deque()
@@ -64,10 +63,8 @@ def _check_feature(path: Path, checkpoint_hash: str) -> None:
 
 def _check_png_header(path: Path) -> None:
     with Image.open(path) as image:
-        if image.format != "PNG" or image.mode != "RGB" or image.size != (1264, 832):
-            raise ValueError(
-                f"expected 1264x832 RGB PNG, got {image.format} {image.mode} {image.size}"
-            )
+        if image.format != "PNG" or image.mode != "RGB" or image.size != (1280, 832):
+            raise ValueError(f"expected 1280x832 RGB PNG, got {image.format} {image.mode} {image.size}")
 
 
 def _check_processed(path: Path) -> None:
@@ -110,9 +107,7 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
     features_dir = split_root / "teacher_features"
     png_dir = split_root / "png"
     processed_entries = [
-        json.loads(line)
-        for line in (processed_dir / "manifest.jsonl").read_text().splitlines()
-        if line.strip()
+        json.loads(line) for line in (processed_dir / "manifest.jsonl").read_text().splitlines() if line.strip()
     ]
     feature_manifest = json.loads((features_dir / "manifest.json").read_text())
     expected = len(processed_entries)
@@ -137,10 +132,7 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
             f"processed={len(processed_files)} feature={len(feature_files)} "
             f"png={len(png_files)} expected={expected}"
         )
-    expected_png = {
-        f"{Path(name).stem.rsplit('__', 1)[0]}/{Path(name).stem}.png"
-        for name in processed_names
-    }
+    expected_png = {f"{Path(name).stem.rsplit('__', 1)[0]}/{Path(name).stem}.png" for name in processed_names}
     actual_png = {path.relative_to(png_dir).as_posix() for path in png_files}
     if actual_png != expected_png:
         raise ValueError("PNG paths are not a one-to-one mapping of processed files")
@@ -161,9 +153,7 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
     for entry in processed_entries:
         segment = entry["segment_id"]
         representative_processed.setdefault(segment, processed_dir / entry["file"])
-        representative_png.setdefault(
-            segment, png_dir / segment / f"{Path(entry['file']).stem}.png"
-        )
+        representative_png.setdefault(segment, png_dir / segment / f"{Path(entry['file']).stem}.png")
     _bounded_check(
         list(representative_processed.values()),
         _check_processed,
@@ -192,9 +182,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be >= 1")
-    summaries = {
-        split: verify_split(args.root / split, args.workers) for split in args.splits
-    }
+    summaries = {split: verify_split(args.root / split, args.workers) for split in args.splits}
     print(json.dumps(summaries, indent=2, sort_keys=True))
 
 

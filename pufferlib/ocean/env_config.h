@@ -34,8 +34,15 @@ typedef struct {
     float partner_obs_radius;
     int obs_mode;
     int render_road_types;
+    int draw_lane_area;
+    float lane_width;
     char map_dir[256];
 } env_init_config;
+
+static void env_config_set_ocean_defaults(env_init_config *c) {
+    c->draw_lane_area = 0;
+    c->lane_width = 4.5f;
+}
 
 // INI file parser handler - parses all environment configuration from drive.ini
 static int handler(void *config, const char *section, const char *name, const char *value) {
@@ -72,6 +79,11 @@ static int handler(void *config, const char *section, const char *name, const ch
     } else if (MATCH("env", "render_road_types")) {
         // Bitmask over entity types. 0 means "use the built-in default".
         env_config->render_road_types = atoi(value);
+    } else if (MATCH("env", "draw_lane_area")) {
+        env_config->draw_lane_area =
+            strcmp(value, "true") == 0 || strcmp(value, "True") == 0 || atoi(value) != 0;
+    } else if (MATCH("env", "lane_width")) {
+        env_config->lane_width = atof(value);
     } else if (MATCH("env", "goal_behavior")) {
         env_config->goal_behavior = atoi(value);
     } else if (MATCH("env", "goal_target_distance")) {

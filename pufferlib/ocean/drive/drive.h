@@ -157,6 +157,10 @@
 // Painted-marking width in meters, used for road primitives that carry no width.
 #define RENDER_ROAD_MARKING_WIDTH 0.15f
 
+// Renderer-only tags shared by ocean/teddy/giga.
+#define RENDER_LANE_AREA 11
+#define RENDER_YELLOW_ROAD_EDGE 12
+
 // Which road entity types are drawn into the perspective view, as a type bitmask.
 // Lane centerlines (ROAD_LANE) are a map abstraction with no painted counterpart
 // on real asphalt, so drawing them would put privileged structure into the image.
@@ -411,6 +415,8 @@ struct Drive {
     // through the binding, so the rasterizer reads them without a copy.
     int obs_mode;
     int render_road_types;  // bitmask over entity types; see render_type_enabled()
+    int draw_lane_area;     // render ROAD_LANE centerlines as a drivable-area strip
+    float lane_width;       // total drivable-area strip width in metres
     float *render_agents;   // [render_max_agents * RENDER_AGENT_FEATURES]
     float *render_egos;     // [active_agent_count * RENDER_EGO_FEATURES]
     float *render_roads;    // [render_max_roads * RENDER_ROAD_FEATURES]
@@ -1904,6 +1910,8 @@ void c_get_road_edge_polylines(Drive *env, float *x_out, float *y_out, int *leng
 // ---------------------------------------------------------------------------
 
 static inline int render_type_enabled(Drive *env, int type) {
+    if (type == ROAD_LANE)
+        return env->draw_lane_area;
     if (type < 0 || type > 31)
         return 0;
     return (env->render_road_types >> type) & 1;
@@ -1911,7 +1919,9 @@ static inline int render_type_enabled(Drive *env, int type) {
 
 // Painted width in meters per road feature. Perspective alone makes near markings
 // read thicker than far ones; this only sets the world-space width.
-static inline float render_road_width(int type) {
+static inline float render_road_width(Drive *env, int type) {
+    if (type == ROAD_LANE)
+        return env->lane_width;
     switch (type) {
     case ROAD_EDGE:
         return 0.25f;
@@ -1944,20 +1954,47 @@ void fill_render_roads(Drive *env) {
         return;
     int n = 0;
     int cap = env->render_max_roads;
-    for (int i = 0; i < env->num_entities && n < cap; i++) {
-        Entity *e = &env->entities[i];
-        if (e->type < ROAD_LANE || !render_type_enabled(env, e->type))
-            continue;
-        float width = render_road_width(e->type);
-        for (int j = 0; j + 1 < e->array_size && n < cap; j++) {
-            float *out = &env->render_roads[n * RENDER_ROAD_FEATURES];
-            out[0] = e->traj_x[j];
-            out[1] = e->traj_y[j];
-            out[2] = e->traj_x[j + 1];
-            out[3] = e->traj_y[j + 1];
-            out[4] = width;
-            out[5] = (float)e->type;
-            n++;
+    // Coplanar primitives use buffer order as their tie-break. Emit markings and
+    // edges before the opaque lane area so they remain visible on top of it.
+    for (int pass = 0; pass < 2; pass++) {
+        for (int i = 0; i < env->num_entities && n < cap; i++) {
+            Entity *e = &env->entities[i];
+            if ((pass == 1) != (e->type == ROAD_LANE))
+                continue;
+            if (e->type < ROAD_LANE || !render_type_enabled(env, e->type))
+                continue;
+            float width = render_road_width(env, e->type);
+            int render_type = e->type;
+            if (e->type == ROAD_LANE)
+                render_type = RENDER_LANE_AREA;
+            else if (e->type == ROAD_EDGE)
+                render_type = RENDER_YELLOW_ROAD_EDGE;
+            for (int j = 0; j + 1 < e->array_size && n < cap; j++) {
+                float x0 = e->traj_x[j], y0 = e->traj_y[j];
+                float x1 = e->traj_x[j + 1], y1 = e->traj_y[j + 1];
+                // Overlap consecutive lane strips at their joints so bends do not
+                // leave black wedges in the drivable surface.
+                if (render_type == RENDER_LANE_AREA) {
+                    float dx = x1 - x0, dy = y1 - y0;
+                    float len = sqrtf(dx * dx + dy * dy);
+                    if (len > 1e-6f) {
+                        float ex = dx / len * width * 0.5f;
+                        float ey = dy / len * width * 0.5f;
+                        x0 -= ex;
+                        y0 -= ey;
+                        x1 += ex;
+                        y1 += ey;
+                    }
+                }
+                float *out = &env->render_roads[n * RENDER_ROAD_FEATURES];
+                out[0] = x0;
+                out[1] = y0;
+                out[2] = x1;
+                out[3] = y1;
+                out[4] = width;
+                out[5] = (float)render_type;
+                n++;
+            }
         }
     }
     if (env->render_counts != NULL)

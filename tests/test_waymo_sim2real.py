@@ -1,15 +1,18 @@
-from pathlib import Path
 import json
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
-from PIL import Image
 import torch
+from PIL import Image
 
+from data_utils.waymo_sim2real.ego_state import ego_observations
 from data_utils.waymo_sim2real.preprocess import SENSOR_TO_CV, _calibration_arrays
 from data_utils.waymo_sim2real.processed import (
     CAMERA_NAMES,
+    EGO_OBS_DIM,
+    EGO_SCHEMA_VERSION,
     FEATURE_SCHEMA_VERSION,
     PROCESSED_SCHEMA_VERSION,
     SIM_HEIGHT,
@@ -20,17 +23,11 @@ from data_utils.waymo_sim2real.processed import (
     load_render_input,
 )
 from data_utils.waymo_sim2real.proto import iter_fields, repeated_doubles
-from data_utils.waymo_sim2real.ego_state import ego_observations
-from data_utils.waymo_sim2real.processed import EGO_OBS_DIM, EGO_SCHEMA_VERSION
-from data_utils.waymo_sim2real.real_perception import (
-    DistillationLoss,
-    RealPerception,
-    RealPerceptionConfig,
-)
+from data_utils.waymo_sim2real.real_perception import DistillationLoss, RealPerception, RealPerceptionConfig
 from data_utils.waymo_sim2real.train_distillation import (
     PairedWaymoFeatureDataset,
-    _within_segment_r2,
     _wandb_epoch_payload,
+    _within_segment_r2,
 )
 from data_utils.waymo_sim2real.visualize import plot_sample
 from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
@@ -60,8 +57,7 @@ def test_waymo_calibration_is_converted_to_raster_cv_frame():
     extrinsic = np.eye(4)
     extrinsic[:3, 3] = [1.54, 0.1, 2.1]
     calibrations = {
-        name: {"intrinsic": intrinsic, "extrinsic": extrinsic, "width": 1920, "height": 1280}
-        for name in (1, 2, 3)
+        name: {"intrinsic": intrinsic, "extrinsic": extrinsic, "width": 1920, "height": 1280} for name in (1, 2, 3)
     }
     rig, source_intrinsics, source_extrinsics, sizes = _calibration_arrays(calibrations)
     np.testing.assert_allclose(rig[0, :9].reshape(3, 3), SENSOR_TO_CV)
@@ -201,9 +197,7 @@ def test_target_standardization_reweights_the_residual():
     target = torch.zeros(4, 256)
     prediction = torch.ones(4, 256)
     plain, _ = DistillationLoss(cosine_weight=0.0, plan_weight=0.0)(prediction, target)
-    scaled, _ = DistillationLoss(cosine_weight=0.0, plan_weight=0.0, target_scale=scale)(
-        prediction, target
-    )
+    scaled, _ = DistillationLoss(cosine_weight=0.0, plan_weight=0.0, target_scale=scale)(prediction, target)
     # 128 dims divided by 0.5 and 128 by 2.0: 128*4 + 128*0.25 against 256*1.
     torch.testing.assert_close(plain, torch.tensor(256.0))
     torch.testing.assert_close(scaled, torch.tensor(128 * 4.0 + 128 * 0.25))
@@ -339,9 +333,8 @@ def _write_split(split: Path, segments: dict[str, list[int]], teacher_hash: str,
                 schema_version=np.asarray(EGO_SCHEMA_VERSION, dtype=np.int32),
                 segment_id=np.asarray(segment),
                 timestamp_micros=np.asarray(stamps, dtype=np.int64),
-                ego_obs=np.tile(
-                    np.arange(EGO_OBS_DIM, dtype=np.float32), (len(stamps), 1)
-                ) * np.asarray(stamps, dtype=np.float32)[:, None],
+                ego_obs=np.tile(np.arange(EGO_OBS_DIM, dtype=np.float32), (len(stamps), 1))
+                * np.asarray(stamps, dtype=np.float32)[:, None],
             )
 
 

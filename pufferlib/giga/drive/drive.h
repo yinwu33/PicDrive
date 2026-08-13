@@ -157,8 +157,7 @@
 // Painted-marking width in meters, used for road primitives that carry no width.
 #define RENDER_ROAD_MARKING_WIDTH 0.15f
 
-// Renderer-only tags keep teddy/giga's experimental palette isolated from ocean,
-// which shares the CUDA rasterizer but still emits the original map type ids.
+// Renderer-only tags shared by ocean/teddy/giga.
 #define RENDER_LANE_AREA 11
 #define RENDER_YELLOW_ROAD_EDGE 12
 

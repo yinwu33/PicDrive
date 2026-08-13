@@ -26,6 +26,7 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 from .processed import DISPLAY_CAMERA_NAMES, list_processed_files, load_feature, load_processed
+from .render_roads import prepare_runtime_roads
 
 
 class _PackedCamera:
@@ -67,7 +68,7 @@ def _render_sim_images(processed: dict[str, np.ndarray], device: str = "auto") -
     rig_array = np.ascontiguousarray(processed["rig"], dtype=np.float32)
     cameras = [_PackedCamera(name, row) for name, row in zip(names, rig_array)]
     agents = torch.from_numpy(np.ascontiguousarray(processed["agents"])).to(render_device)
-    roads = torch.from_numpy(np.ascontiguousarray(processed["roads"])).to(render_device)
+    roads = torch.from_numpy(prepare_runtime_roads(processed["roads"])).to(render_device)
     egos = torch.from_numpy(np.ascontiguousarray(processed["ego"][None])).to(render_device)
 
     with torch.inference_mode():

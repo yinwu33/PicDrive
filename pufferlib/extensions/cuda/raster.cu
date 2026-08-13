@@ -131,8 +131,8 @@ __device__ __forceinline__ void road_color(int type_id, float *out) {
     case 8:  out[0] = 0.92f; out[1] = 0.92f; out[2] = 0.92f; break;  // CROSSWALK
     case 9:  out[0] = 0.95f; out[1] = 0.80f; out[2] = 0.25f; break;  // SPEED_BUMP
     case 10: out[0] = 0.45f; out[1] = 0.45f; out[2] = 0.48f; break;  // DRIVEWAY
-    case 11: out[0] = 0.32f; out[1] = 0.32f; out[2] = 0.34f; break;  // teddy/giga lane area
-    case 12: out[0] = 1.00f; out[1] = 0.82f; out[2] = 0.00f; break;  // teddy/giga road edge
+    case 11: out[0] = 0.32f; out[1] = 0.32f; out[2] = 0.34f; break;  // shared lane area
+    case 12: out[0] = 1.00f; out[1] = 0.82f; out[2] = 0.00f; break;  // shared road edge
     default: out[0] = 0.95f; out[1] = 0.95f; out[2] = 0.95f; break;  // ROAD_LINE
     }
 }
@@ -336,7 +336,7 @@ __device__ __forceinline__ void project_image(int image, const float *agents, co
         float col[3];
         road_color((int)r[5], col);
 
-        // The opaque teddy/giga lane area sits just below the painted features it
+        // The opaque lane area sits just below the painted features it
         // carries. Which of the two is drawn on top comes from buffer order, not
         // from this gap; see finalize_road_fragments.
         float road_z = ((int)r[5] == 11) ? -0.01f : 0.0f;
@@ -615,8 +615,8 @@ __global__ void raster_kernel(const float *roads, const float *egos, int ego_str
 
     int scene = ego_scene[image / num_cams];
     int road_lo = road_ranges[scene], road_hi = road_ranges[scene + 1];
-    // fill_render_roads emits lane areas last. Their renderer-only tag opts only
-    // teddy/giga into black non-road ground; ocean retains the original gray.
+    // fill_render_roads emits lane areas last. Their renderer-only tag opts the
+    // shared ocean/teddy/giga camera path into black non-road ground.
     bool black_ground = road_hi > road_lo && (int)roads[(size_t)(road_hi - 1) * RASTER_ROAD_FEATURES + 5] == 11;
 
     int road_base = road_offsets[image];

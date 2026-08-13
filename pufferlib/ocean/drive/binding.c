@@ -298,6 +298,7 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     env->human_agent_idx = unpack(kwargs, "human_agent_idx");
     env->ini_file = unpack_str(kwargs, "ini_file");
     env_init_config conf = {0};
+    env_config_set_ocean_defaults(&conf);
     if (ini_parse(env->ini_file, handler, &conf) < 0) {
         printf("Error while loading %s", env->ini_file);
     }
@@ -340,9 +341,16 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     OVERRIDE_FLOAT(partner_obs_radius);
     OVERRIDE_INT(obs_mode);
     OVERRIDE_INT(render_road_types);
+    OVERRIDE_INT(draw_lane_area);
+    OVERRIDE_FLOAT(lane_width);
 
 #undef OVERRIDE_INT
 #undef OVERRIDE_FLOAT
+
+    if (conf.lane_width <= 0.0f) {
+        PyErr_SetString(PyExc_ValueError, "lane_width must be > 0 metres");
+        return -1;
+    }
 
     env->action_type = conf.action_type;
     env->dynamics_model = conf.dynamics_model;
@@ -371,6 +379,8 @@ static int my_init(Env *env, PyObject *args, PyObject *kwargs) {
     // default road-type mask.
     env->obs_mode = conf.obs_mode;
     env->render_road_types = conf.render_road_types;
+    env->draw_lane_area = conf.draw_lane_area;
+    env->lane_width = conf.lane_width;
     char *map_dir = unpack_str(kwargs, "map_dir");
     int map_id = unpack(kwargs, "map_id");
     int max_agents = unpack(kwargs, "max_agents");
