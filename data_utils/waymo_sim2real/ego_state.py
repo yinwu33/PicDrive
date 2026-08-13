@@ -66,10 +66,14 @@ def _yaw_from_poses(poses: np.ndarray) -> np.ndarray:
     return np.arctan2(poses[:, 1, 0], poses[:, 0, 0])
 
 
-def _box_centers(poses: np.ndarray) -> np.ndarray:
-    """Waymo poses sit at the rear axle; the simulator's entity is box-centred."""
+def _box_centers(poses: np.ndarray, axle_to_center: float = WAYMO_REAR_AXLE_TO_BOX_CENTER) -> np.ndarray:
+    """Waymo poses sit at the rear axle; the simulator's entity is box-centred.
+
+    Sources that already report the box centre -- CARLA's actor transforms, for
+    one -- pass ``axle_to_center=0.0``.
+    """
     yaw = _yaw_from_poses(poses)
-    offset = WAYMO_REAR_AXLE_TO_BOX_CENTER * np.stack([np.cos(yaw), np.sin(yaw)], axis=1)
+    offset = axle_to_center * np.stack([np.cos(yaw), np.sin(yaw)], axis=1)
     return poses[:, :2, 3] + offset
 
 
@@ -105,12 +109,24 @@ def ego_observations(
     length: float = WAYMO_SDC_LENGTH,
     width: float = WAYMO_SDC_WIDTH,
     goal_distance: float = GOAL_TARGET_DISTANCE,
+    axle_to_center: float = WAYMO_REAR_AXLE_TO_BOX_CENTER,
+    goal: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return the ``[N, 11]`` ego observation table for one segment.
 
     ``poses`` are the ``[N, 4, 4]`` vehicle-to-global transforms of consecutive
     frames and ``timestamps_micros`` their capture times.  Frames must be in
     chronological order; that is how they appear in a TFRecord.
+
+    ``axle_to_center`` is the platform's rear-axle-to-box-centre distance; pass
+    ``0.0`` when ``poses`` already carry box centres.
+
+    ``goal`` overrides the rolling ``goal_distance`` lookahead with an explicit
+    world point, held fixed for the whole segment.  That is what the frozen
+    planning head actually trained against: ``drive_3cam.ini`` sets
+    ``goal_behavior = 0``, so ``sample_new_goal`` is unreachable and the goal is
+    the logged track endpoint read from the map binary, which decays toward the
+    vehicle across the episode instead of receding ahead of it.
     """
     poses = np.asarray(poses, dtype=np.float64)
     times = np.asarray(timestamps_micros, dtype=np.float64) / 1e6
@@ -124,7 +140,7 @@ def ego_observations(
         raise ValueError("frame timestamps must be strictly increasing")
 
     yaw = _yaw_from_poses(poses)
-    centers = _box_centers(poses)
+    centers = _box_centers(poses, axle_to_center)
     heading = np.stack([np.cos(yaw), np.sin(yaw)], axis=1)
 
     if len(poses) == 1:
@@ -145,7 +161,10 @@ def ego_observations(
     curvature = np.where(moving, yaw_rate / np.where(moving, speed, 1.0), 0.0)
     steering = np.clip(np.arctan(curvature * 0.6 * length), -STEERING_LIMIT, STEERING_LIMIT)
 
-    goals = _goal_points(centers, yaw, goal_distance)
+    if goal is None:
+        goals = _goal_points(centers, yaw, goal_distance)
+    else:
+        goals = np.broadcast_to(np.asarray(goal, dtype=np.float64).reshape(2), centers.shape)
     delta = goals - centers
     relative_goal = np.stack(
         [

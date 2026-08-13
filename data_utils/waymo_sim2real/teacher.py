@@ -14,6 +14,7 @@ shared trunk and the actor -- is the planning head the paper keeps frozen.
 from __future__ import annotations
 
 import hashlib
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,10 +36,39 @@ def sha256_file(path: str | Path) -> str:
 
 
 def _load_state(checkpoint: str | Path) -> dict[str, torch.Tensor]:
+    """Unwrap a checkpoint down to the bare ``DriveCam`` state dict.
+
+    A run with ``rnn_name = Recurrent`` saves the policy nested under a
+    ``policy.`` prefix alongside the recurrent core's own ``lstm.``/``cell.``
+    tensors.  The scene encoder this module exists to serve is upstream of that
+    core and is bit-identical either way, so the prefix is stripped rather than
+    treated as a different network.
+
+    The recurrent tensors are dropped, and that is *not* free:
+    ``FrozenPlanningHead`` runs ``backbone -> actor``, so for a recurrent
+    checkpoint the planning term is evaluated through a feed-forward slice of a
+    policy whose real actions also depend on LSTM state.  Both the teacher and
+    student branches lose the same core, so ``plan_kl`` remains a valid measure
+    of how far a feature error moves the wheel -- it is just not the deployed
+    policy's action distribution.  Callers are warned so this never happens
+    silently.
+    """
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if not isinstance(state, dict):
         raise TypeError(f"{checkpoint} contains {type(state).__name__}, expected a state dict")
-    return {key.removeprefix("module."): value for key, value in state.items()}
+    state = {key.removeprefix("module."): value for key, value in state.items()}
+    recurrent = sorted(key for key in state if key.startswith(("lstm.", "cell.")))
+    if recurrent:
+        warnings.warn(
+            f"{checkpoint} is a recurrent checkpoint; dropping {len(recurrent)} tensors "
+            f"({', '.join(recurrent[:3])}...). The 256-D scene feature is unaffected, but the "
+            "planning head runs backbone->actor without the LSTM, so plan_kl and plan_agreement "
+            "are measured through a feed-forward slice of the policy.",
+            RuntimeWarning,
+            stacklevel=3,
+        )
+        state = {key: value for key, value in state.items() if key not in set(recurrent)}
+    return {key.removeprefix("policy."): value for key, value in state.items()}
 
 
 def load_teacher(checkpoint: str | Path, device: torch.device | str = "cpu") -> DriveCam:
