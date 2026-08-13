@@ -33,6 +33,7 @@ from data_utils.waymo_sim2real.train_distillation import (
     _wandb_epoch_payload,
 )
 from data_utils.waymo_sim2real.visualize import plot_sample
+from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
 
 
 def _varint(value):
@@ -91,7 +92,7 @@ def test_processed_feature_roundtrip_and_visualization(tmp_path: Path):
         agents=np.zeros((0, 8), dtype=np.float32),
         roads=np.zeros((0, 6), dtype=np.float32),
         ego=np.asarray([0, 0, 1, 0, -1], dtype=np.float32),
-        rig=np.zeros((3, 20), dtype=np.float32),
+        rig=rig_tensor(WAYMO_RIG).numpy(),
         source_intrinsics=np.zeros((3, 9), dtype=np.float64),
         source_extrinsics=np.zeros((3, 4, 4), dtype=np.float64),
         source_image_sizes=np.zeros((3, 2), dtype=np.int32),
@@ -115,6 +116,12 @@ def test_processed_feature_roundtrip_and_visualization(tmp_path: Path):
     output = tmp_path / "preview.png"
     plot_sample(processed_path, feature_path, output)
     with Image.open(output) as image:
+        assert image.format == "PNG"
+        assert image.width > image.height
+
+    direct_output = tmp_path / "preview-direct.png"
+    plot_sample(processed_path, None, direct_output, device="cpu")
+    with Image.open(direct_output) as image:
         assert image.format == "PNG"
         assert image.width > image.height
 

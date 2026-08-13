@@ -1713,26 +1713,6 @@ def load_config(env_name, config_dir=None):
     # Envs whose C side parses the config itself need the file this came from, not
     # a guess at it. See ENV_CONFIG_PATH_KWARG in load_env.
     args["config_path"] = os.path.realpath(config_path)
-
-
-    # Auto-generate wandb name: "<env_name>[-section.key-value ...]" for every
-    # section-scoped CLI override (--env.episode-length 100 → env.episode-length-100).
-    # Respects an explicit --wandb-name / ini wandb_name if already set.
-    if not args.get("wandb_name"):
-        overrides = []
-        argv = sys.argv[1:]
-        i = 0
-        while i < len(argv):
-            token = argv[i]
-            if token.startswith("--") and "." in token:
-                key = token[2:]
-                if i + 1 < len(argv) and not argv[i + 1].startswith("--"):
-                    overrides.append(f"{key}-{argv[i + 1]}")
-                    i += 2
-                    continue
-            i += 1
-        args["wandb_name"] = "-".join([env_name] + overrides)
-
     return args
 
 

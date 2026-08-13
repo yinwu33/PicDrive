@@ -78,14 +78,17 @@ cannot silently be mixed across teacher versions.
 ```bash
 python -m data_utils.waymo_sim2real.visualize \
   --processed artifacts/waymo_sim2real/full/training/processed \
-  --features artifacts/waymo_sim2real/full/training/teacher_features \
   --output-dir artifacts/waymo_sim2real/full/training/png \
-  --workers 8 --resume
+  --resume
 ```
 
 Columns are front-left, front, front-right. Rows are sim render, Waymo real, and
 a 50% alpha overlay. Bulk PNGs are grouped into one subdirectory per segment.
 Use `--output path/to/one.png` instead of `--output-dir` for a single preview.
+The sim row is rendered directly from each processed NPZ, so teacher features
+are not required. Pass `--features path/to/teacher_features` only to reuse sim
+images cached by feature extraction. Pass `--flat` to put every PNG directly in
+the output directory instead of grouping them by segment.
 
 All three commands support interruption-safe `--resume`; `--overwrite` is the
 explicit replacement mode. Run the same commands with `validation` substituted
