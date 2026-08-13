@@ -336,6 +336,9 @@ if not NO_TRAIN:
         "wandb",
         "matplotlib",
         "tqdm",
+        "timm==1.0.19",
+        "safetensors==0.5.3",
+        "huggingface-hub>=0.34,<2",
     ]
 
 setup(

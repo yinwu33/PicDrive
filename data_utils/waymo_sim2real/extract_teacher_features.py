@@ -150,6 +150,60 @@ def _flush_batch(
     return entries
 
 
+@torch.inference_mode()
+def _flush_cached_render_batch(
+    teacher: DriveCam,
+    sources: list[Path],
+    cached_features: Path,
+    output: Path,
+    checkpoint_hash: str,
+    device: torch.device,
+    overwrite: bool,
+) -> list[dict[str, int | str]]:
+    """Recompute targets from audited sim renders saved by an older teacher.
+
+    Rendering is checkpoint-independent. Reusing the saved uint8 renders is
+    therefore exact and lets a target refresh run on CPU when CUDA is absent.
+    The filename, segment, timestamp, camera order, shape and dtype are all
+    validated before the new teacher sees a pixel.
+    """
+
+    cached = [load_feature(cached_features / source.name) for source in sources]
+    images = torch.from_numpy(np.stack([row["sim_images"] for row in cached])).permute(0, 1, 4, 2, 3)
+    features = scene_features(teacher, images.to(device)).float().cpu().numpy()
+    entries: list[dict[str, int | str]] = []
+    for index, (source, row) in enumerate(zip(sources, cached)):
+        destination = output / source.name
+        if destination.exists() and not overwrite:
+            raise FileExistsError(f"{destination} exists; pass --resume to keep it or --overwrite to replace it")
+        segment_id = str(np.asarray(row["segment_id"]).item())
+        timestamp = int(np.asarray(row["timestamp_micros"]).item())
+        expected_stem = f"{segment_id}__{timestamp}"
+        if source.stem != expected_stem:
+            raise ValueError(
+                f"cached render identity {expected_stem} does not match processed file {source.name}"
+            )
+        atomic_savez(
+            destination,
+            schema_version=np.asarray(FEATURE_SCHEMA_VERSION, dtype=np.int32),
+            segment_id=np.asarray(segment_id),
+            timestamp_micros=np.asarray(timestamp, dtype=np.int64),
+            camera_names=np.asarray(CAMERA_NAMES),
+            teacher_feature=features[index],
+            sim_images=row["sim_images"],
+            checkpoint_sha256=np.asarray(checkpoint_hash),
+        )
+        entries.append(
+            {
+                "file": destination.name,
+                "processed_file": source.name,
+                "segment_id": segment_id,
+                "timestamp_micros": timestamp,
+            }
+        )
+    return entries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--processed", type=Path, required=True)
@@ -166,6 +220,11 @@ def main() -> None:
     parser.add_argument("--max-samples", type=int)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
+        "--reuse-sim-images",
+        type=Path,
+        help="Existing teacher_features directory whose audited sim_images are reused",
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Keep validated features made with the same checkpoint",
@@ -180,10 +239,12 @@ def main() -> None:
     if not args.checkpoint.is_file():
         parser.error(f"checkpoint does not exist: {args.checkpoint}")
     device = torch.device(args.device)
-    if device.type != "cuda":
+    if device.type != "cuda" and args.reuse_sim_images is None:
         parser.error("the production rasterizer is CUDA-only; use --device cuda")
-    if not torch.cuda.is_available():
+    if device.type == "cuda" and not torch.cuda.is_available():
         parser.error("CUDA is unavailable")
+    if args.reuse_sim_images is not None and not args.reuse_sim_images.is_dir():
+        parser.error(f"cached teacher features do not exist: {args.reuse_sim_images}")
 
     files = list_processed_files(args.processed, args.max_samples)
     if not files:
@@ -222,21 +283,38 @@ def main() -> None:
             )
 
     kept = len(entries)
-    pending: list[tuple[Path, dict[str, np.ndarray]]] = []
-    pending_segment: str | None = None
-    for todo_index, (source, sample) in enumerate(_prefetched_samples(todo, args.loader_workers), 1):
-        segment = str(np.asarray(sample["segment_id"]).item())
-        if pending and (segment != pending_segment or len(pending) >= args.batch_size):
-            entries.extend(_flush_batch(teacher, pending, args.output, checkpoint_hash, device, args.overwrite))
-            pending = []
-        pending.append((source, sample))
-        pending_segment = segment
-        if todo_index % 500 == 0:
-            print(
-                f"[{kept + todo_index}/{len(files)}] kept/loaded features",
-                flush=True,
+    if args.reuse_sim_images is not None:
+        for start in range(0, len(todo), args.batch_size):
+            batch = todo[start : start + args.batch_size]
+            entries.extend(
+                _flush_cached_render_batch(
+                    teacher,
+                    batch,
+                    args.reuse_sim_images,
+                    args.output,
+                    checkpoint_hash,
+                    device,
+                    args.overwrite,
+                )
             )
-    entries.extend(_flush_batch(teacher, pending, args.output, checkpoint_hash, device, args.overwrite))
+            if start % 500 == 0:
+                print(f"[{kept + min(start + len(batch), len(todo))}/{len(files)}] refreshed features", flush=True)
+    else:
+        pending: list[tuple[Path, dict[str, np.ndarray]]] = []
+        pending_segment: str | None = None
+        for todo_index, (source, sample) in enumerate(_prefetched_samples(todo, args.loader_workers), 1):
+            segment = str(np.asarray(sample["segment_id"]).item())
+            if pending and (segment != pending_segment or len(pending) >= args.batch_size):
+                entries.extend(_flush_batch(teacher, pending, args.output, checkpoint_hash, device, args.overwrite))
+                pending = []
+            pending.append((source, sample))
+            pending_segment = segment
+            if todo_index % 500 == 0:
+                print(
+                    f"[{kept + todo_index}/{len(files)}] kept/loaded features",
+                    flush=True,
+                )
+        entries.extend(_flush_batch(teacher, pending, args.output, checkpoint_hash, device, args.overwrite))
     entries.sort(key=lambda entry: entry["processed_file"])
 
     metadata = {

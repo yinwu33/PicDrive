@@ -17,13 +17,13 @@ import pytest
 
 from data_utils.carla_sim2real import EPISODE_FRAMES, REAL_HEIGHT, REAL_WIDTH
 from data_utils.carla_sim2real.collect import (
-    kept_indices,
     PEDESTRIAN,
     VEHICLE,
     Weather,
     _agent_type,
     _box_center,
     episode_seed,
+    kept_indices,
     write_episode,
 )
 from data_utils.carla_sim2real.ego import episode_ego_obs, pose_matrices
@@ -37,6 +37,7 @@ from data_utils.carla_sim2real.rig import (
     source_calibration,
 )
 from data_utils.carla_sim2real.roads import RoadIndex, town_roads, world_to_ego
+from data_utils.carla_sim2real.split_distillation import split_segments
 from data_utils.waymo_sim2real.processed import (
     EGO_OBS_DIM,
     SIM_HEIGHT,
@@ -48,8 +49,24 @@ from data_utils.waymo_sim2real.processed import (
 from data_utils.waymo_sim2real.render_roads import RENDER_LANE_AREA, ROAD_LANE, prepare_runtime_roads
 from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
 
+
 CARLA_XODR = Path("/home/tjhu78u/CARLA_0_9_16/CarlaUE4/Content/Carla/Maps/OpenDrive")
 PY123D = Path("data_utils/carla/carla_py123d")
+
+
+def test_distillation_split_is_town_stratified_deterministic_and_leak_free():
+    episodes = [
+        {"segment_id": f"{town}_{index:02d}", "town": town}
+        for town in ("Town01", "Town02", "Town10HD")
+        for index in range(10)
+    ]
+    first = split_segments(episodes, train_per_town=7, validation_per_town=3, seed=42)
+    second = split_segments(episodes, train_per_town=7, validation_per_town=3, seed=42)
+    assert first == second
+    assert not first["training"] & first["validation"]
+    for town in ("Town01", "Town02", "Town10HD"):
+        assert sum(segment.startswith(town) for segment in first["training"]) == 7
+        assert sum(segment.startswith(town) for segment in first["validation"]) == 3
 
 
 def _carla_map(town: str):
@@ -165,7 +182,7 @@ def test_camera_mounts_negate_carla_s_left_handed_yaw():
     cameras = {camera.name: camera for camera in rig_cameras()}
     box_offset = (0.05, 0.0)
 
-    (x, y, z), (pitch, yaw, roll) = mount(cameras["front"], box_offset)
+    (x, _y, z), (pitch, yaw, roll) = mount(cameras["front"], box_offset)
     assert (pitch, yaw, roll) == (0.0, 0.0, 0.0)
     assert z == pytest.approx(cameras["front"].pos[2])
     assert x == pytest.approx(box_offset[0] + cameras["front"].pos[0])

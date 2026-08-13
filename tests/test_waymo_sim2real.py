@@ -1,13 +1,16 @@
 import json
 import struct
 from pathlib import Path
+from types import SimpleNamespace
 
+import gymnasium
 import numpy as np
 import pytest
 import torch
 from PIL import Image
 
 from data_utils.waymo_sim2real.ego_state import ego_observations
+from data_utils.waymo_sim2real.giga_conditioning import GIGA_EGO_OBS_DIM, append_giga_conditioning, segment_conditioning
 from data_utils.waymo_sim2real.preprocess import SENSOR_TO_CV, _calibration_arrays
 from data_utils.waymo_sim2real.processed import (
     CAMERA_NAMES,
@@ -23,14 +26,23 @@ from data_utils.waymo_sim2real.processed import (
     load_render_input,
 )
 from data_utils.waymo_sim2real.proto import iter_fields, repeated_doubles
-from data_utils.waymo_sim2real.real_perception import DistillationLoss, RealPerception, RealPerceptionConfig
+from data_utils.waymo_sim2real.real_perception import (
+    DistillationLoss,
+    RealPerception,
+    RealPerceptionConfig,
+    ViTRealPerception,
+    ViTRealPerceptionConfig,
+)
+from data_utils.waymo_sim2real.teacher import FrozenPlanningHead
 from data_utils.waymo_sim2real.train_distillation import (
     PairedWaymoFeatureDataset,
     _wandb_epoch_payload,
     _within_segment_r2,
 )
 from data_utils.waymo_sim2real.visualize import plot_sample
+from pufferlib.models import LSTMWrapper
 from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
+from pufferlib.ocean.torch import DriveCam
 
 
 def _varint(value):
@@ -143,6 +155,61 @@ def test_real_perception_emits_teacher_sized_feature_and_backpropagates():
     assert any(parameter.grad is not None for parameter in model.parameters())
 
 
+def test_dino_register_student_only_trains_lora_registers_and_fusion():
+    config = ViTRealPerceptionConfig(
+        num_cameras=2,
+        image_height=28,
+        image_width=28,
+        num_scene_tokens=2,
+        lora_rank=2,
+        fusion_layers=1,
+        fusion_heads=6,
+        fusion_dropout=0.0,
+    )
+    model = ViTRealPerception(config, pretrained=False)
+    images = torch.randint(0, 256, (1, 2, 3, 28, 28), dtype=torch.uint8)
+    prediction = model(images)
+    assert prediction.shape == (1, 256)
+    prediction.square().mean().backward()
+    named = dict(model.named_parameters())
+    assert named["backbone.patch_embed.proj.weight"].requires_grad is False
+    assert named["backbone.patch_embed.proj.weight"].grad is None
+    assert any("lora_" in name and parameter.grad is not None for name, parameter in named.items())
+    assert model.scene_tokens.grad is not None
+    assert model.projection.weight.grad is not None
+    assert model.trainable_parameters < model.frozen_parameters
+
+
+def test_frozen_planner_matches_wrapper_first_frame_exactly():
+    env = SimpleNamespace(
+        num_cameras=3,
+        height=SIM_HEIGHT,
+        width=SIM_WIDTH,
+        image_bytes=3 * 3 * SIM_HEIGHT * SIM_WIDTH,
+        ego_dim=EGO_OBS_DIM,
+        single_observation_space=gymnasium.spaces.Box(0, 255, shape=(1,), dtype=np.uint8),
+        single_action_space=gymnasium.spaces.MultiDiscrete([12]),
+    )
+    wrapper = LSTMWrapper(env, DriveCam(env), input_size=512, hidden_size=512)
+    recurrent = {
+        "weight_ih": wrapper.cell.weight_ih.detach().clone(),
+        "weight_hh": wrapper.cell.weight_hh.detach().clone(),
+        "bias_ih": wrapper.cell.bias_ih.detach().clone(),
+        "bias_hh": wrapper.cell.bias_hh.detach().clone(),
+    }
+    head = FrozenPlanningHead(wrapper.policy, recurrent)
+    scene = torch.randn(3, 256)
+    ego = torch.randn(3, EGO_OBS_DIM)
+    trunk = wrapper.policy.backbone(torch.cat([scene, wrapper.policy.ego_encoder(ego)], dim=1))
+    zeros = torch.zeros(3, 512)
+    expected_hidden, _ = wrapper.cell(trunk, (zeros, zeros))
+    expected = wrapper.policy.actor(expected_hidden)
+    actual = torch.cat(head(scene, ego), dim=1)
+    torch.testing.assert_close(actual, expected)
+    assert head.planner_mode == "zero_state_lstm"
+    assert all(not parameter.requires_grad for parameter in head.parameters())
+
+
 def test_feature_alignment_is_zero_for_identical_nonzero_features():
     target = torch.randn(4, 256)
     loss, metrics = DistillationLoss(plan_weight=0.0)(target, target)
@@ -243,6 +310,19 @@ def test_ego_observation_extrapolates_a_goal_for_a_stationary_log():
     # Waiting at a light must not collapse the goal onto the vehicle.
     assert obs[0, 0] / 0.005 == pytest.approx(30.0, abs=1e-3)
     assert abs(obs[:, 2]).max() == pytest.approx(0.0, abs=1e-9)
+
+
+def test_giga_conditioning_is_reproducible_per_segment_and_in_range():
+    first = segment_conditioning("Town01_00000", seed=42)
+    second = segment_conditioning("Town01_00000", seed=42)
+    different = segment_conditioning("Town01_00001", seed=42)
+    np.testing.assert_array_equal(first, second)
+    assert not np.array_equal(first, different)
+    assert first.shape == (13,) and first.dtype == np.float32
+    assert np.all((0.0 <= first) & (first <= 1.0))
+    extended = append_giga_conditioning(np.zeros(11, dtype=np.float32), "Town01_00000")
+    assert extended.shape == (GIGA_EGO_OBS_DIM,)
+    np.testing.assert_array_equal(extended[11:], first)
 
 
 def test_paired_distillation_dataset_uses_manifest_mapping(tmp_path: Path):

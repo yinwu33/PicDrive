@@ -7,6 +7,7 @@ every downstream stage is the Waymo one, run unchanged against a different
 
 ```
 data_utils/carla_sim2real/collect.py     ->  processed/ + ego_state/
+data_utils/carla_sim2real/split_distillation.py  ->  leak-free train/validation
 data_utils/waymo_sim2real/extract_teacher_features.py  ->  teacher_features/
 data_utils/waymo_sim2real/visualize.py   ->  png/
 data_utils/waymo_sim2real/verify.py      ->  checks the tree
@@ -206,10 +207,90 @@ widens them into 4.5 m strips at render time. Waymo's 3.2-3.7 m lanes get the
 identical treatment, so the bias is *consistent across domains*, which is what
 distillation needs.
 
-## 2-4. The Waymo stages, unchanged
+## 2. Build the 1k distillation split
+
+The checked 1k sample contains 102 complete ten-frame segments, with 34 from
+each of Town01, Town02, and Town10HD. Split whole segments, not frames, so no
+near-identical temporal neighbours leak into validation:
 
 ```bash
-CKPT=experiments/puffer_drive_3cam_gwvaxkmh/model_puffer_drive_cam_007800.pt
+env -u PYTHONPATH .venv/bin/python -m data_utils.carla_sim2real.split_distillation \
+  --source artifacts/carla_sim2real/sample1k/training \
+  --output artifacts/carla_sim2real/sample1k_dino \
+  --train-per-town 27 --validation-per-town 7 --seed 42
+```
+
+This produces 810 training frames from 81 segments and 210 validation frames
+from 21 segments. Processed images and ego tables are hardlinked, so the split
+does not duplicate the camera data.
+
+## 3. Refresh the requested giga teacher targets
+
+The requested teacher is:
+
+```bash
+CKPT=experiments/skynet/model_puffer_giga_3cam_001400.pt
+ROOT=artifacts/carla_sim2real/sample1k_dino
+
+for split in training validation; do
+  env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.extract_teacher_features \
+    --processed $ROOT/$split/processed --checkpoint $CKPT \
+    --output $ROOT/$split/teacher_features \
+    --reuse-sim-images artifacts/carla_sim2real/sample1k/training/teacher_features
+done
+```
+
+`--reuse-sim-images` reuses the already audited abstract renders while
+recomputing the 256-D `scene_encoder` target with the new checkpoint. The
+feature manifest and every sample pin the teacher SHA256.
+
+## 4. Train the DINOv2 student
+
+The default student matches DrivoR's useful ingredients: a pretrained
+DINOv2-S/14 register model shared over three cameras, 16 learned scene tokens
+per camera, and rank-32 LoRA on Q and V in every attention block. Its frozen
+base has 21,735,936 parameters; LoRA, registers, two-layer fusion transformer,
+and 256-D projection contribute 4,256,512 trainable parameters. The simulation
+teacher's visual encoder has 896,544 parameters.
+
+```bash
+env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
+  --root artifacts/carla_sim2real/sample1k_dino \
+  --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
+  --output artifacts/carla_sim2real/runs/dino_carla1k_clean \
+  --backbone-weights artifacts/carla_sim2real/weights/dinov2_vits14_reg4/model.safetensors \
+  --backbone-revision c04b5193082a8d5b0c4856c7937384a48136c5de \
+  --epochs 10 --batch-size 4 --accumulation-steps 8 --workers 4 \
+  --amp bf16 --wandb-mode disabled
+```
+
+The giga planner expects 24 ego inputs: the existing 11-D vehicle state plus
+13 training-time conditioning values. Since recorded CARLA has no corresponding
+domain parameters, the trainer deterministically samples one valid normalized
+conditioning vector per segment. Changing `--conditioning-seed` changes this
+assignment; it is fixed across all frames and resumes for a given segment.
+
+The planning KL is not a feed-forward approximation. Both teacher and student
+latents pass through the frozen ego encoder, trunk, exact checkpoint LSTMCell
+with `h0 = c0 = 0`, and actor head. This implements the first-frame/no-memory
+assumption while keeping the planner frozen.
+
+The best epoch also writes a self-contained `deployment.pt`. Load it with
+`load_deployment_bundle` from `data_utils.waymo_sim2real.real_perception`; it
+returns an image encoder with input `[B, 3, 3, 256, 384]` and output `[B, 256]`.
+
+## 5. Reuse the same stages for Waymo
+
+The trainer reads only the shared `processed/`, `teacher_features/`, and
+`ego_state/` contract. Point `--root` at a tree under
+`artifacts/waymo_sim2real` after extracting targets with the same teacher; no
+model or dataset code changes are required. CARLA remains a pretraining source,
+while Waymo supplies the real-domain fine-tuning data.
+
+## Legacy extraction and audit commands
+
+```bash
+CKPT=experiments/skynet/model_puffer_giga_3cam_001400.pt
 ROOT=artifacts/carla_sim2real
 
 env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.extract_teacher_features \
@@ -222,9 +303,9 @@ env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.visualize \
 env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.verify --root $ROOT --workers 16
 ```
 
-Then `train_distillation.py --root artifacts/carla_sim2real` runs as-is for
-staged pretraining. Mixing CARLA and Waymo in one run would need a concat
-dataset in the trainer; staged needs nothing.
+These generic stages remain useful for a larger collected tree. Mixing CARLA
+and Waymo in one minibatch would need a concat dataset; staged CARLA pretraining
+followed by Waymo fine-tuning needs no format conversion.
 
 ## The geometry
 

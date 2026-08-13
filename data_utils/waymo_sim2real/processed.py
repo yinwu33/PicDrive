@@ -199,4 +199,7 @@ def load_feature(path: str | Path) -> dict[str, np.ndarray]:
         raise ValueError(f"{path} sim_images has invalid shape/dtype {sim.shape} {sim.dtype}")
     if feature["teacher_feature"].shape != (TEACHER_FEATURE_DIM,):
         raise ValueError(f"{path} teacher_feature must be [{TEACHER_FEATURE_DIM}]")
+    names = tuple(str(value) for value in feature["camera_names"].tolist())
+    if names != CAMERA_NAMES:
+        raise ValueError(f"{path} camera order {names}, expected {CAMERA_NAMES}")
     return feature

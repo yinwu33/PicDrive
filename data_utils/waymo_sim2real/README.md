@@ -141,12 +141,13 @@ vehicle. `verify.py` checks the join whenever `ego_state/` exists.
 
 ## 6. Distill real perception
 
-Install the torchvision build matching this repository's PyTorch/CUDA pair and
-cache the official ImageNet weights once:
+The default student is DINOv2 ViT-S/14 with 16 learned scene registers per
+camera and rank-32 Q/V LoRA. `setup.py` pins the required `timm`, `safetensors`,
+and Hugging Face client versions. Cache the pinned weights once, or pass a local
+`model.safetensors` using `--backbone-weights`.
 
 ```bash
-uv pip install --python .venv/bin/python torchvision==0.19.1 \
-  --index-url https://download.pytorch.org/whl/cu121 --no-deps
+uv pip install --python .venv/bin/python -e .
 ```
 
 ```bash
@@ -154,11 +155,10 @@ wandb login
 
 .venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
   --root artifacts/waymo_sim2real/full \
-  --checkpoint experiments/puffer_drive_cam_gwvaxkmh/model_puffer_drive_cam_007800.pt \
-  --output artifacts/waymo_sim2real/runs/real_perception_convnext_tiny \
-  --batch-size 32 --workers 8 --amp bf16 \
-  --learning-rate 3e-4 --backbone-learning-rate 3e-5 \
-  --wandb-name real_perception_convnext_tiny
+  --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
+  --output artifacts/waymo_sim2real/runs/real_perception_dinov2 \
+  --batch-size 4 --accumulation-steps 8 --workers 8 --amp bf16 \
+  --wandb-name real_perception_dinov2
 ```
 
 ### The objective
@@ -169,10 +169,16 @@ This is the sim-to-real stage of Rowe et al.'s Gigapixel recipe (arXiv
     L = feature_weight * ||E_real - E_sim||^2 + cosine_weight * (1 - cos) + plan_weight * KL_plan
 
 Two copies of the pinned policy share one **frozen** planning head -- the ego
-encoder, trunk and actor -- so the only thing the optimizer touches is the
-student's image backbone. `KL_plan` is the divergence between that head's
+encoder, trunk, LSTMCell, and actor. Each forward uses `h0 = c0 = 0`, making the
+objective the exact first-frame/no-memory recurrent policy rather than a
+feed-forward approximation. `KL_plan` is the divergence between that head's
 action distributions on the teacher's cached feature and on the student's
 prediction; `plan_agreement` reports how often their argmax actions match.
+
+The giga checkpoint expects a 24-D ego input rather than the stored 11-D base
+state. The remaining 13 normalized domain-conditioning values are drawn
+deterministically once per segment from the same valid training distributions;
+`--conditioning-seed` pins them across frames and resumes.
 
 The feature term alone weights every latent direction by its coordinate scale.
 The planner weights each direction by how much it actually moves the wheel,
@@ -204,10 +210,10 @@ within-segment number is the half that perception is actually for.
   logs at 10 Hz and neighbouring frames differ by about 1% of the feature
   variance, so `5` costs almost no information and makes epochs five times
   cheaper. The scene count, not the frame count, is the real dataset size.
-- `--freeze-backbone-stages N` holds the first N of ConvNeXt's four stages fixed.
-  The paired set covers a few hundred distinct scenes however many frames it
-  holds, and full fine-tuning of 30M parameters overfits inside one epoch; this
-  is the cheap counterpart to the LoRA the paper puts on its own backbone.
+- `--lora-rank`, `--num-scene-tokens`, and `--fusion-layers` control the DINO
+  adapter. The pretrained DINO base stays frozen; only Q/V LoRA, scene tokens,
+  fusion, and the final projection train. `--architecture convnext_tiny` and
+  `--freeze-backbone-stages` retain the older baseline as an ablation.
 - `--standardize-targets` divides the feature residual by each dimension's
   standard deviation so no single high-variance coordinate dominates. The
   prediction handed to the planning head stays unscaled.
@@ -217,8 +223,9 @@ within-segment number is the half that perception is actually for.
 
 ### Run directories
 
-Training writes `run.json`, append-only `metrics.jsonl`, and interruption-safe
-`last.pt`/`best.pt`. Starting a fresh run on top of an existing directory is
+Training writes `run.json`, append-only `metrics.jsonl`, interruption-safe
+`last.pt`/`best.pt`, and a self-contained `deployment.pt` whenever validation
+improves. Starting a fresh run on top of an existing directory is
 refused: it would append a second history to the same metrics file and reset the
 best-loss watermark, overwriting a good checkpoint with a worse first epoch. Use
 `--resume <run>/last.pt` to continue, `--overwrite` to discard, or a new

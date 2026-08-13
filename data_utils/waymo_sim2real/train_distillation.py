@@ -1,55 +1,60 @@
-"""Adapt real-image perception onto a frozen PufferDrive policy.
+"""Adapt real-image perception onto a frozen recurrent PufferDrive policy.
 
-This is the sim-to-real stage of Rowe et al.'s Gigapixel recipe, applied to
-PufferDrive's ``DriveCam``: the closed-loop behaviour already lives in the
-planning head, so only perception is retrained, and it is retrained to land in
-the latent space that head already acts on.  Two copies of the pinned policy
-share one frozen planning head -- a teacher reading the abstract render and a
-student reading the matching real cameras -- and the student's backbone is the
-only thing the optimizer touches.
+The default DrivoR-style student uses a pretrained DINOv2 ViT-S/14, 16 learned
+scene registers per camera, and rank-32 Q/V LoRA. It is trained to reproduce
+the frozen simulation perception's 256-D output immediately before the LSTM.
+The frozen teacher planner evaluates both latents with a fresh zero LSTM state,
+which gives the exact first-frame policy requested for recurrent checkpoints.
 
-The objective follows the paper:
-
-    L = lambda * ||E_real - E_sim||^2 + L_plan
+    L = feature_weight * ||E_real - E_sim||^2
+        + cosine_weight * (1 - cosine(E_real, E_sim))
+        + plan_weight * KL(pi_sim || pi_real)
 
 ``E_sim`` never has to be recomputed: it was extracted once and pinned by
 checkpoint SHA256 in ``teacher_features/manifest.json``, which also makes
-accidental teacher updates impossible.  ``L_plan`` is the KL between the frozen
-planner's action distributions on the two features.  The paper's ablation puts
-14.7 HD-Score points on the feature term and 2.7 more on freezing the head, so
-both are kept.
+accidental teacher updates impossible. The DINO base and complete recurrent
+planner are frozen; LoRA, camera registers, fusion, and projection are trained.
 
 Example:
 
     .venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
-        --root artifacts/waymo_sim2real/full \
-        --checkpoint experiments/puffer_drive_cam_gwvaxkmh/model_puffer_drive_cam_007800.pt \
-        --output artifacts/waymo_sim2real/runs/real_perception_convnext_tiny
+        --root artifacts/carla_sim2real/sample1k_dino \
+        --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
+        --output artifacts/carla_sim2real/runs/dino_carla1k
 """
 
 from __future__ import annotations
 
 import argparse
-from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import nullcontext
 import json
 import math
 import os
-from pathlib import Path
 import random
 import time
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
+from pathlib import Path
 
 import numpy as np
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
+from .giga_conditioning import GIGA_EGO_OBS_DIM, append_giga_conditioning
 from .processed import CAMERA_NAMES, EGO_OBS_DIM, TEACHER_FEATURE_DIM, load_ego_state
-from .real_perception import DistillationLoss, RealPerception
-from .teacher import FrozenPlanningHead, load_teacher, sha256_file
+from .real_perception import (
+    DistillationLoss,
+    RealPerception,
+    RealPerceptionConfig,
+    ViTRealPerception,
+    ViTRealPerceptionConfig,
+)
+from .teacher import load_frozen_planning_head, sha256_file
 
-CHECKPOINT_SCHEMA_VERSION = 2
+
+CHECKPOINT_SCHEMA_VERSION = 3
+DEPLOYMENT_SCHEMA_VERSION = 1
 
 # Changing any of these silently reshapes the learning-rate schedule or the
 # sample stream, so a resume that disagrees is a different run wearing the same
@@ -63,6 +68,7 @@ SCHEDULE_ARGS = (
     "warmup_fraction",
     "train_frame_stride",
     "max_train_samples",
+    "conditioning_seed",
 )
 
 
@@ -75,6 +81,8 @@ class PairedWaymoFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.
         max_samples: int | None = None,
         frame_stride: int = 1,
         require_ego: bool = True,
+        expected_ego_dim: int = EGO_OBS_DIM,
+        conditioning_seed: int = 42,
     ):
         self.split_root = Path(split_root)
         self.processed_dir = self.split_root / "processed"
@@ -152,6 +160,13 @@ class PairedWaymoFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.
             self.pairs.append((processed_path, feature_path))
             self.segments[index] = segment_index[str(entry["segment_id"])]
 
+        if expected_ego_dim not in (EGO_OBS_DIM, GIGA_EGO_OBS_DIM):
+            raise ValueError(
+                f"unsupported planner ego width {expected_ego_dim}; expected {EGO_OBS_DIM} "
+                f"or {GIGA_EGO_OBS_DIM}"
+            )
+        self.expected_ego_dim = expected_ego_dim
+        self.conditioning_seed = conditioning_seed
         self.ego = self._load_ego_table(kept) if require_ego else None
 
     def _load_ego_table(self, entries: list[dict[str, object]]) -> np.ndarray:
@@ -176,7 +191,7 @@ class PairedWaymoFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.
             state = load_ego_state(path)
             stamps = np.asarray(state["timestamp_micros"], dtype=np.int64)
             tables[segment] = dict(zip(stamps.tolist(), np.asarray(state["ego_obs"], dtype=np.float32)))
-        ego = np.empty((len(entries), EGO_OBS_DIM), dtype=np.float32)
+        ego = np.empty((len(entries), self.expected_ego_dim), dtype=np.float32)
         for index, entry in enumerate(entries):
             segment, timestamp = str(entry["segment_id"]), int(entry["timestamp_micros"])
             row = tables[segment].get(timestamp)
@@ -185,7 +200,11 @@ class PairedWaymoFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.
                     f"segment {segment} has no ego state at {timestamp}; the ego tables were "
                     f"built from different TFRecords than the processed samples"
                 )
-            ego[index] = row
+            ego[index] = (
+                append_giga_conditioning(row, segment, self.conditioning_seed)
+                if self.expected_ego_dim == GIGA_EGO_OBS_DIM
+                else row
+            )
         return ego
 
     def __len__(self) -> int:
@@ -214,7 +233,11 @@ class PairedWaymoFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.
         # so worker tensors own writable, contiguous storage.
         image_tensor = torch.from_numpy(images.copy()).permute(0, 3, 1, 2)
         target_tensor = torch.from_numpy(target.astype(np.float32, copy=True))
-        ego = self.ego[index] if self.ego is not None else np.zeros(EGO_OBS_DIM, dtype=np.float32)
+        ego = (
+            self.ego[index]
+            if self.ego is not None
+            else np.zeros(self.expected_ego_dim, dtype=np.float32)
+        )
         return image_tensor, target_tensor, torch.from_numpy(ego.copy()), int(self.segments[index])
 
 
@@ -253,7 +276,7 @@ def target_statistics(dataset: PairedWaymoFeatureDataset, sample: int, workers: 
     stats = {
         "checkpoint_sha256": dataset.teacher_checkpoint_sha256,
         "population": population,
-        "num_samples": int(len(features)),
+        "num_samples": len(features),
         "mean": features.mean(axis=0).tolist(),
         "std": features.std(axis=0).tolist(),
         "variance": float(features.var(axis=0).mean()),
@@ -388,7 +411,7 @@ def _wandb_epoch_payload(record: dict[str, object]) -> dict[str, float]:
 
 
 def _train_epoch(
-    model: RealPerception,
+    model: nn.Module,
     loader: DataLoader,
     criterion: DistillationLoss,
     optimizer: torch.optim.Optimizer,
@@ -465,7 +488,7 @@ def _train_epoch(
 
 @torch.inference_mode()
 def _validate(
-    model: RealPerception,
+    model: nn.Module,
     loader: DataLoader,
     criterion: DistillationLoss,
     device: torch.device,
@@ -511,7 +534,7 @@ def _atomic_torch_save(payload: dict[str, object], path: Path) -> None:
 
 
 def _checkpoint(
-    model: RealPerception,
+    model: nn.Module,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
@@ -535,10 +558,51 @@ def _checkpoint(
         "teacher_checkpoint_sha256": teacher_hash,
         "backbone_initialization": model.pretrained_source,
         "backbone_checkpoint_sha256": model.pretrained_sha256,
+        "backbone_revision": model.pretrained_revision,
         "wandb_run_id": wandb_run_id,
         "schedule": {name: getattr(args, name) for name in SCHEDULE_ARGS},
         "args": vars(args),
     }
+
+
+def _deployment_bundle(
+    model: nn.Module,
+    teacher_hash: str,
+    architecture: str,
+) -> dict[str, object]:
+    """Self-contained visual encoder artifact for replacing sim perception."""
+
+    return {
+        "schema_version": DEPLOYMENT_SCHEMA_VERSION,
+        "architecture": architecture,
+        "model_config": model.config.to_dict(),
+        "model": model.state_dict(),
+        "teacher_checkpoint_sha256": teacher_hash,
+        "backbone_initialization": model.pretrained_source,
+        "backbone_checkpoint_sha256": model.pretrained_sha256,
+        "backbone_revision": model.pretrained_revision,
+        "camera_names": list(CAMERA_NAMES),
+        "output": {"name": "scene_feature", "dimension": TEACHER_FEATURE_DIM},
+    }
+
+
+def _build_model(args: argparse.Namespace, *, resume: bool) -> nn.Module:
+    pretrained = not args.random_init and not resume
+    if args.architecture == "convnext_tiny":
+        return RealPerception(RealPerceptionConfig(), pretrained=pretrained)
+    config = ViTRealPerceptionConfig(
+        backbone_revision=args.backbone_revision,
+        num_scene_tokens=args.num_scene_tokens,
+        lora_rank=args.lora_rank,
+        fusion_layers=args.fusion_layers,
+        fusion_heads=args.fusion_heads,
+        fusion_dropout=args.fusion_dropout,
+    )
+    return ViTRealPerception(
+        config,
+        pretrained=pretrained,
+        weights_path=args.backbone_weights,
+    )
 
 
 def _loader(dataset: Dataset, args: argparse.Namespace, training: bool) -> DataLoader:
@@ -567,7 +631,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("artifacts/waymo_sim2real/full"))
     parser.add_argument(
-        "--output", type=Path, default=Path("artifacts/waymo_sim2real/runs/real_perception_convnext_tiny")
+        "--output", type=Path, default=Path("artifacts/waymo_sim2real/runs/real_perception_dinov2")
+    )
+    parser.add_argument(
+        "--architecture",
+        choices=("dino_vit_small", "convnext_tiny"),
+        default="dino_vit_small",
     )
     parser.add_argument(
         "--checkpoint",
@@ -580,8 +649,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--accumulation-steps", type=int, default=1)
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 1))
     parser.add_argument("--prefetch-factor", type=int, default=2)
-    parser.add_argument("--learning-rate", type=float, default=3e-4)
-    parser.add_argument("--backbone-learning-rate", type=float, default=3e-5)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--backbone-learning-rate", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--warmup-fraction", type=float, default=0.05)
     parser.add_argument("--feature-weight", type=float, default=1.0, help="lambda on the feature L2 term")
@@ -605,6 +674,17 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Freeze this many leading ConvNeXt stages (0-4) against overfitting",
     )
     parser.add_argument(
+        "--backbone-weights",
+        type=Path,
+        help="Local DINOv2 model.safetensors; otherwise download the pinned Hugging Face revision",
+    )
+    parser.add_argument("--backbone-revision", default="main")
+    parser.add_argument("--num-scene-tokens", type=int, default=16)
+    parser.add_argument("--lora-rank", type=int, default=32)
+    parser.add_argument("--fusion-layers", type=int, default=2)
+    parser.add_argument("--fusion-heads", type=int, default=6)
+    parser.add_argument("--fusion-dropout", type=float, default=0.1)
+    parser.add_argument(
         "--train-frame-stride",
         type=int,
         default=1,
@@ -613,6 +693,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-grad-norm", type=float, default=1.0)
     parser.add_argument("--amp", choices=("bf16", "fp16", "off"), default="bf16")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--conditioning-seed",
+        type=int,
+        default=42,
+        help="Deterministic per-segment giga conditioning draws for a 24-D planning head",
+    )
     parser.add_argument("--resume", type=Path)
     parser.add_argument(
         "--overwrite", action="store_true", help="Discard an existing run in --output and start over"
@@ -634,7 +720,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--random-init",
         action="store_true",
-        help="Disable ImageNet initialization (intended only as an ablation)",
+        help="Disable pretrained backbone initialization (intended only as an ablation)",
     )
     parser.add_argument("--max-train-samples", type=int)
     parser.add_argument("--max-validation-samples", type=int)
@@ -645,7 +731,17 @@ def main(argv: list[str] | None = None) -> None:
     parser = _build_parser()
     args = parser.parse_args(argv)
 
-    for name in ("epochs", "batch_size", "accumulation_steps", "prefetch_factor", "train_frame_stride"):
+    for name in (
+        "epochs",
+        "batch_size",
+        "accumulation_steps",
+        "prefetch_factor",
+        "train_frame_stride",
+        "num_scene_tokens",
+        "lora_rank",
+        "fusion_layers",
+        "fusion_heads",
+    ):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be >= 1")
     if args.workers < 0:
@@ -662,6 +758,12 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("loss weights must be non-negative")
     if not 0 <= args.freeze_backbone_stages <= 4:
         parser.error("--freeze-backbone-stages must be in [0, 4]")
+    if args.architecture != "convnext_tiny" and args.freeze_backbone_stages:
+        parser.error("--freeze-backbone-stages only applies to --architecture convnext_tiny")
+    if not 0 <= args.fusion_dropout < 1:
+        parser.error("--fusion-dropout must be in [0, 1)")
+    if args.backbone_weights is not None and not args.backbone_weights.is_file():
+        parser.error(f"DINOv2 weights do not exist: {args.backbone_weights}")
     if args.plan_weight > 0 and args.checkpoint is None:
         parser.error("--checkpoint is required for the planning loss; pass --plan-weight 0 to drop it")
     if args.checkpoint is not None and not args.checkpoint.is_file():
@@ -689,12 +791,27 @@ def main(argv: list[str] | None = None) -> None:
         parser.error("CUDA is unavailable")
     _seed_everything(args.seed)
 
-    needs_ego = args.plan_weight > 0
+    plan_head = None
+    expected_ego_dim = EGO_OBS_DIM
+    if args.plan_weight > 0:
+        plan_head = load_frozen_planning_head(args.checkpoint, device, require_recurrent=True)
+        expected_ego_dim = plan_head.ego_features
+    needs_ego = plan_head is not None
     training = PairedWaymoFeatureDataset(
-        args.root / "training", args.max_train_samples, args.train_frame_stride, needs_ego
+        args.root / "training",
+        args.max_train_samples,
+        args.train_frame_stride,
+        needs_ego,
+        expected_ego_dim,
+        args.conditioning_seed,
     )
     validation = PairedWaymoFeatureDataset(
-        args.root / "validation", args.max_validation_samples, 1, needs_ego
+        args.root / "validation",
+        args.max_validation_samples,
+        1,
+        needs_ego,
+        expected_ego_dim,
+        args.conditioning_seed,
     )
     if training.teacher_checkpoint_sha256 != validation.teacher_checkpoint_sha256:
         raise ValueError("training and validation features were extracted from different teachers")
@@ -714,20 +831,13 @@ def main(argv: list[str] | None = None) -> None:
     if args.standardize_targets:
         target_scale = torch.tensor(train_stats["std"], dtype=torch.float32).clamp_min(1e-6)
 
-    # A resume checkpoint overwrites the entire model, so it must not require a
-    # second network download. Fresh runs use official ImageNet weights unless
-    # the explicit ablation flag is provided.
-    model = RealPerception(pretrained=not args.random_init and args.resume is None).to(device)
-    frozen_parameters = model.freeze_backbone_stages(args.freeze_backbone_stages)
+    # A resume checkpoint overwrites the entire model, so it does not need a
+    # second backbone download. Fresh runs use the selected official weights.
+    model = _build_model(args, resume=args.resume is not None).to(device)
+    if isinstance(model, RealPerception):
+        model.freeze_backbone_stages(args.freeze_backbone_stages)
+    frozen_parameters = model.frozen_parameters
 
-    plan_head = None
-    if args.plan_weight > 0:
-        plan_head = FrozenPlanningHead(load_teacher(args.checkpoint, device))
-        if plan_head.ego_features != EGO_OBS_DIM:
-            raise ValueError(
-                f"the teacher expects a {plan_head.ego_features}-D ego vector but the "
-                f"reconstruction emits {EGO_OBS_DIM}; rebuild the ego state"
-            )
     criterion = DistillationLoss(
         feature_weight=args.feature_weight,
         cosine_weight=args.cosine_weight,
@@ -783,9 +893,11 @@ def main(argv: list[str] | None = None) -> None:
                 + ", ".join(f"{name} {was!r} -> {now!r}" for name, (was, now) in sorted(changed.items()))
             )
         model.load_state_dict(resume_state["model"], strict=True)
-        model.freeze_backbone_stages(args.freeze_backbone_stages)
+        if isinstance(model, RealPerception):
+            model.freeze_backbone_stages(args.freeze_backbone_stages)
         model.pretrained_source = str(resume_state.get("backbone_initialization", "unknown"))
         model.pretrained_sha256 = resume_state.get("backbone_checkpoint_sha256")
+        model.pretrained_revision = resume_state.get("backbone_revision")
         optimizer.load_state_dict(resume_state["optimizer"])
         scheduler.load_state_dict(resume_state["scheduler"])
         scaler.load_state_dict(resume_state["scaler"])
@@ -807,6 +919,7 @@ def main(argv: list[str] | None = None) -> None:
         "teacher_checkpoint_sha256": teacher_hash,
         "backbone_initialization": model.pretrained_source,
         "backbone_checkpoint_sha256": model.pretrained_sha256,
+        "backbone_revision": model.pretrained_revision,
         "training_samples": len(training),
         "training_segments": len(training.segment_ids),
         "validation_samples": len(validation),
@@ -819,6 +932,7 @@ def main(argv: list[str] | None = None) -> None:
             "plan_temperature": args.plan_temperature,
             "standardize_targets": args.standardize_targets,
             "action_dims": None if plan_head is None else plan_head.action_dims,
+            "planner_mode": None if plan_head is None else plan_head.planner_mode,
         },
         # The reference every metric should be read against: a constant
         # predictor scores mse = variance and r2 = 0.
@@ -844,7 +958,7 @@ def main(argv: list[str] | None = None) -> None:
             raise ImportError("W&B tracking is enabled by default; install the 'wandb' package") from error
         if wandb_run_id is None:
             wandb_run_id = wandb.util.generate_id()
-        fixed_tags = ("sim2real", "waymo", "convnext-tiny", "feature-distillation")
+        fixed_tags = ("sim2real", "waymo", args.architecture, "feature-distillation")
         try:
             wandb_run = wandb.init(
                 project=args.wandb_project,
@@ -954,6 +1068,10 @@ def main(argv: list[str] | None = None) -> None:
             _atomic_torch_save(payload, args.output / "last.pt")
             if improved:
                 _atomic_torch_save(payload, args.output / "best.pt")
+                _atomic_torch_save(
+                    _deployment_bundle(model, teacher_hash, args.architecture),
+                    args.output / "deployment.pt",
+                )
             if wandb_run is not None:
                 wandb_run.log(
                     {"global_step": global_step, **_wandb_epoch_payload(record)},

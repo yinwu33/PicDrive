@@ -102,7 +102,7 @@ def _verify_ego_state(ego_dir: Path, processed_entries: list[dict[str, object]])
             raise ValueError(f"{path} ego_obs is {obs.shape[1]}-D, expected {EGO_OBS_DIM}")
 
 
-def verify_split(split_root: Path, workers: int) -> dict[str, int]:
+def verify_split(split_root: Path, workers: int, require_png: bool = True) -> dict[str, int]:
     processed_dir = split_root / "processed"
     features_dir = split_root / "teacher_features"
     png_dir = split_root / "png"
@@ -126,16 +126,26 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
     processed_files = sorted(processed_dir.glob("*.npz"))
     feature_files = sorted(features_dir.glob("*.npz"))
     png_files = sorted(png_dir.glob("*/*.png"))
-    if not (len(processed_files) == len(feature_files) == len(png_files) == expected):
+    if len(processed_files) != expected or len(feature_files) != expected:
         raise ValueError(
             "artifact counts differ: "
             f"processed={len(processed_files)} feature={len(feature_files)} "
             f"png={len(png_files)} expected={expected}"
         )
-    expected_png = {f"{Path(name).stem.rsplit('__', 1)[0]}/{Path(name).stem}.png" for name in processed_names}
-    actual_png = {path.relative_to(png_dir).as_posix() for path in png_files}
-    if actual_png != expected_png:
-        raise ValueError("PNG paths are not a one-to-one mapping of processed files")
+    if require_png:
+        if len(png_files) != expected:
+            raise ValueError(
+                "artifact counts differ: "
+                f"processed={len(processed_files)} feature={len(feature_files)} "
+                f"png={len(png_files)} expected={expected}"
+            )
+        expected_png = {
+            f"{Path(name).stem.rsplit('__', 1)[0]}/{Path(name).stem}.png"
+            for name in processed_names
+        }
+        actual_png = {path.relative_to(png_dir).as_posix() for path in png_files}
+        if actual_png != expected_png:
+            raise ValueError("PNG paths are not a one-to-one mapping of processed files")
 
     _bounded_check(
         feature_files,
@@ -143,7 +153,8 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
         workers,
         f"{split_root.name} features",
     )
-    _bounded_check(png_files, _check_png_header, workers, f"{split_root.name} PNG headers")
+    if require_png:
+        _bounded_check(png_files, _check_png_header, workers, f"{split_root.name} PNG headers")
     _verify_ego_state(split_root / "ego_state", processed_entries)
 
     # Fully decode one processed sample and one PNG from every segment. This
@@ -153,7 +164,10 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
     for entry in processed_entries:
         segment = entry["segment_id"]
         representative_processed.setdefault(segment, processed_dir / entry["file"])
-        representative_png.setdefault(segment, png_dir / segment / f"{Path(entry['file']).stem}.png")
+        if require_png:
+            representative_png.setdefault(
+                segment, png_dir / segment / f"{Path(entry['file']).stem}.png"
+            )
     _bounded_check(
         list(representative_processed.values()),
         _check_processed,
@@ -165,12 +179,13 @@ def verify_split(split_root: Path, workers: int) -> dict[str, int]:
         with Image.open(path) as image:
             image.load()
 
-    _bounded_check(
-        list(representative_png.values()),
-        decode_png,
-        workers,
-        f"{split_root.name} representative PNG decode",
-    )
+    if require_png:
+        _bounded_check(
+            list(representative_png.values()),
+            decode_png,
+            workers,
+            f"{split_root.name} representative PNG decode",
+        )
     return {"frames": expected, "segments": len(representative_processed)}
 
 
@@ -179,10 +194,18 @@ def main() -> None:
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--splits", nargs="+", default=("training", "validation"))
     parser.add_argument("--workers", type=int, default=min(16, os.cpu_count() or 1))
+    parser.add_argument(
+        "--skip-png",
+        action="store_true",
+        help="Verify the training artifacts without requiring optional audit PNGs",
+    )
     args = parser.parse_args()
     if args.workers < 1:
         parser.error("--workers must be >= 1")
-    summaries = {split: verify_split(args.root / split, args.workers) for split in args.splits}
+    summaries = {
+        split: verify_split(args.root / split, args.workers, require_png=not args.skip_png)
+        for split in args.splits
+    }
     print(json.dumps(summaries, indent=2, sort_keys=True))
 
 
