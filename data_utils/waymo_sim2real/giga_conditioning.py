@@ -6,7 +6,6 @@ import hashlib
 
 import numpy as np
 
-
 GIGA_CONDITIONING_DIM = 13
 GIGA_EGO_OBS_DIM = 11 + GIGA_CONDITIONING_DIM
 
@@ -65,7 +64,9 @@ def segment_conditioning(segment_id: str, seed: int = 42) -> np.ndarray:
     return conditioning
 
 
-def append_giga_conditioning(ego: np.ndarray, segment_id: str, seed: int = 42) -> np.ndarray:
+def append_giga_conditioning(
+    ego: np.ndarray, segment_id: str, seed: int = 42
+) -> np.ndarray:
     if ego.shape[-1] != 11:
         raise ValueError(f"base ego observation must be 11-D, got {ego.shape[-1]}")
     conditioning = segment_conditioning(segment_id, seed)
@@ -82,7 +83,11 @@ def conditioning_to_raw(conditioning: np.ndarray) -> np.ndarray:
         raise ValueError(
             f"conditioning must end in {GIGA_CONDITIONING_DIM}, got {conditioning.shape}"
         )
-    if not np.isfinite(conditioning).all() or (conditioning < 0).any() or (conditioning > 1).any():
+    if (
+        not np.isfinite(conditioning).all()
+        or (conditioning < 0).any()
+        or (conditioning > 1).any()
+    ):
         raise ValueError("normalized conditioning must be finite and inside [0, 1]")
     return GIGA_CONDITIONING_LOW + conditioning * (
         GIGA_CONDITIONING_HIGH - GIGA_CONDITIONING_LOW
@@ -99,6 +104,32 @@ def nominal_conditioning() -> np.ndarray:
 
     raw = (GIGA_CONDITIONING_LOW + GIGA_CONDITIONING_HIGH) * 0.5
     raw[10:] = 1.0
-    return ((raw - GIGA_CONDITIONING_LOW) / (GIGA_CONDITIONING_HIGH - GIGA_CONDITIONING_LOW)).astype(
-        np.float32
+    return (
+        (raw - GIGA_CONDITIONING_LOW) / (GIGA_CONDITIONING_HIGH - GIGA_CONDITIONING_LOW)
+    ).astype(np.float32)
+
+
+def good_conditioning():
+    raw = np.asarray(
+        [
+            2.0,      # delta_goal
+            20.0,     # v_goal
+            3.0,      # alpha_collision
+            3.0,      # alpha_boundary
+            0.05,     # alpha_comfort
+            0.0025,  # alpha_l_align
+            1.0,      # alpha_vel_align
+            0.0075,  # alpha_l_center
+            0.0,      # alpha_center_bias
+            0.00025,  # alpha_reverse
+            1.0,      # C_throttle
+            1.0,      # C_steer
+            1.0,      # C_acc
+        ],
+        dtype=np.float32,
     )
+
+    return (
+        (raw - GIGA_CONDITIONING_LOW)
+        / (GIGA_CONDITIONING_HIGH - GIGA_CONDITIONING_LOW)
+    ).astype(np.float32)

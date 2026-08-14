@@ -14,15 +14,19 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from data_utils.carla_sim2real import EPISODE_FRAMES, REAL_HEIGHT, REAL_WIDTH
 from data_utils.carla_sim2real.closed_loop import (
+    CameraPreview,
     ClosedLoopEvaluator,
     JerkController,
     RoutePlan,
     RouteTracker,
     base_ego_observation,
     decode_jerk_action,
+    puffer_preview_images,
+    project_world_point_to_camera,
 )
 from data_utils.carla_sim2real.collect import (
     PEDESTRIAN,
@@ -154,7 +158,7 @@ def test_spectator_chase_pose_stays_behind_and_above_ego():
     assert captured[0].rotation.yaw == pytest.approx(53.0)
 
 
-def test_spectator_draws_only_the_current_goal_as_a_short_lived_marker():
+def test_spectator_goal_marker_is_hud_only_and_adds_no_world_geometry():
     calls = {}
 
     def recorder(name):
@@ -168,8 +172,6 @@ def test_spectator_draws_only_the_current_goal_as_a_short_lived_marker():
         Color=lambda red, green, blue: (red, green, blue),
     )
     debug = SimpleNamespace(
-        draw_point=recorder("point"),
-        draw_line=recorder("line"),
         draw_string=recorder("string"),
     )
     evaluator = ClosedLoopEvaluator.__new__(ClosedLoopEvaluator)
@@ -178,16 +180,93 @@ def test_spectator_draws_only_the_current_goal_as_a_short_lived_marker():
 
     evaluator._draw_active_goal(np.asarray([12.0, -3.0, 0.5]), final=False)
 
-    assert set(calls) == {"point", "line", "string"}
-    assert all(len(entries) == 1 for entries in calls.values())
-    point, point_options = calls["point"][0]
-    assert (point[0].x, point[0].y, point[0].z) == pytest.approx((12.0, -3.0, 0.85))
-    assert point_options["color"] == (0, 255, 80)
-    assert point_options["life_time"] == pytest.approx(0.125)
-    assert point_options["persistent_lines"] is False
+    assert set(calls) == {"string"}
     label, label_options = calls["string"][0]
+    assert (label[0].x, label[0].y, label[0].z) == pytest.approx((12.0, -3.0, 4.0))
     assert label[1] == "NEXT GOAL"
     assert label_options["draw_shadow"] is True
+    assert label_options["color"] == (0, 255, 80)
+    assert label_options["life_time"] == pytest.approx(0.125)
+    assert label_options["persistent_lines"] is False
+
+
+def test_world_goal_projection_uses_carla_forward_right_up_axes():
+    intrinsics = (100.0, 120.0, 192.0, 128.0)
+    center = project_world_point_to_camera(np.asarray([10.0, 0.0, 0.0]), np.eye(4), intrinsics)
+    right_up = project_world_point_to_camera(
+        np.asarray([10.0, 2.0, 1.0]), np.eye(4), intrinsics
+    )
+    behind_left = project_world_point_to_camera(
+        np.asarray([-10.0, -2.0, 0.0]), np.eye(4), intrinsics
+    )
+
+    assert (center.u, center.v) == pytest.approx((192.0, 128.0))
+    assert center.in_front
+    assert (right_up.u, right_up.v) == pytest.approx((212.0, 116.0))
+    assert right_up.in_front
+    assert not behind_left.in_front
+    assert behind_left.u < 0.0
+
+
+def test_camera_preview_displays_the_exact_policy_images_in_human_order(monkeypatch):
+    pygame = pytest.importorskip("pygame")
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    preview = CameraPreview()
+    try:
+        images = np.zeros((3, REAL_HEIGHT, REAL_WIDTH, 3), dtype=np.uint8)
+        images[0] = (255, 0, 0)  # front
+        images[1] = (0, 255, 0)  # front_left
+        images[2] = (0, 0, 255)  # front_right
+        puffer = np.zeros((3, SIM_HEIGHT, SIM_WIDTH, 3), dtype=np.uint8)
+        puffer[0] = (10, 20, 30)  # front
+        puffer[1] = (40, 50, 60)  # front_left
+        puffer[2] = (70, 80, 90)  # front_right
+
+        original = images.copy()
+        original_puffer = puffer.copy()
+        projections = (
+            project_world_point_to_camera(np.asarray([10.0, 0.0, 0.0]), np.eye(4), (100, 100, 192, 128)),
+            project_world_point_to_camera(np.asarray([10.0, 0.0, 0.0]), np.eye(4), (100, 100, 192, 128)),
+            project_world_point_to_camera(np.asarray([10.0, 0.0, 0.0]), np.eye(4), (100, 100, 192, 128)),
+        )
+        assert preview.update(
+            images, puffer, projections, goal_distance_m=42.5, final_goal=False
+        )
+        np.testing.assert_array_equal(images, original)
+        np.testing.assert_array_equal(puffer, original_puffer)
+        assert preview.screen.get_size() == (
+            3 * REAL_WIDTH,
+            2 * (REAL_HEIGHT + preview.HEADER_HEIGHT),
+        )
+        y = preview.HEADER_HEIGHT + 10
+        assert preview.screen.get_at((10, y))[:3] == (0, 255, 0)
+        assert preview.screen.get_at((REAL_WIDTH + 10, y))[:3] == (255, 0, 0)
+        assert preview.screen.get_at((2 * REAL_WIDTH + 10, y))[:3] == (0, 0, 255)
+        marker = preview.screen.get_at(
+            (REAL_WIDTH + REAL_WIDTH // 2 + 11, preview.HEADER_HEIGHT + REAL_HEIGHT // 2)
+        )[:3]
+        assert marker == (0, 255, 80)
+        puffer_y = preview.ROW_STRIDE + preview.HEADER_HEIGHT + 10
+        assert preview.screen.get_at((10, puffer_y))[:3] == (40, 50, 60)
+        assert preview.screen.get_at((REAL_WIDTH + 10, puffer_y))[:3] == (10, 20, 30)
+        assert preview.screen.get_at((2 * REAL_WIDTH + 10, puffer_y))[:3] == (70, 80, 90)
+
+        pygame.event.post(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_q))
+        assert not preview.update(images, puffer)
+        assert preview.closed
+    finally:
+        preview.close()
+
+
+def test_puffer_preview_converts_the_exact_teacher_tensor_to_rgb():
+    rendered = np.arange(1 * 3 * 3 * SIM_HEIGHT * SIM_WIDTH, dtype=np.uint8).reshape(
+        1, 3, 3, SIM_HEIGHT, SIM_WIDTH
+    )
+    rgb = puffer_preview_images(torch.from_numpy(rendered))
+
+    assert rgb.shape == (3, SIM_HEIGHT, SIM_WIDTH, 3)
+    assert rgb.dtype == np.uint8
+    np.testing.assert_array_equal(rgb[2, 7, 11], rendered[0, 2, :, 7, 11])
 
 
 def test_distillation_split_is_town_stratified_deterministic_and_leak_free():

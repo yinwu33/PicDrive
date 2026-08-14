@@ -31,6 +31,10 @@ dynamic = ["dependencies"]
 #'gymnasium==0.29.1',
 #'pettingzoo==1.24.1',
 [project.optional-dependencies]
+carla = [
+    'pygame>=2.6,<3',
+]
+
 avalon = [
     'gymnasium==0.29.1',
     'avalon-rl==1.0.0',
