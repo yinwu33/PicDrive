@@ -217,15 +217,10 @@ class RoadIndex:
     """
 
     def __init__(self, roads: np.ndarray):
-        roads = np.asarray(roads, dtype=np.float32)
-        if roads.ndim != 2 or roads.shape[1:] != (6,):
-            raise ValueError(f"roads must have shape [M,6], got {roads.shape}")
-        self.roads = np.ascontiguousarray(roads)
+        self.roads = np.ascontiguousarray(np.asarray(roads, dtype=np.float32))
 
     def crop(self, center: np.ndarray, yaw: float, radius: float) -> np.ndarray:
         """Return the roads within ``radius`` of ``center``, in the ego frame."""
-        if not len(self.roads):
-            return np.zeros((0, 6), dtype=np.float32)
         rows = self.roads.copy()
         rows[:, 0:2] = world_to_ego(rows[:, 0:2], center, yaw)
         rows[:, 2:4] = world_to_ego(rows[:, 2:4], center, yaw)

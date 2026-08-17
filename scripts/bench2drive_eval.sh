@@ -2,8 +2,11 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-export B2D_ROUTES="leaderboard/data/drivetransformer_bench2drive_dev10.xml"
-export B2D_OUTPUT="$PROJECT_ROOT/artifacts/carla_sim2real/bench2drive/dev10"
+
+export B2D_ROUTES="leaderboard/data/bench2drive220.xml"
+export B2D_OUTPUT="$PROJECT_ROOT/artifacts/carla_sim2real/bench2drive/b2d220"
+# export B2D_ROUTES="leaderboard/data/drivetransformer_bench2drive_dev10.xml"
+# export B2D_OUTPUT="$PROJECT_ROOT/artifacts/carla_sim2real/bench2drive/dev10"
 mkdir -p "$B2D_OUTPUT"
 
 export PYTHONPATH="$CARLA_ROOT/PythonAPI/carla:$B2D_ROOT/leaderboard:$B2D_ROOT/scenario_runner:$PROJECT_ROOT"

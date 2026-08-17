@@ -114,12 +114,6 @@ class TeacherRenderer:
 def puffer_preview_images(rendered: torch.Tensor) -> np.ndarray:
     """Move one Puffer raster batch into display-order-agnostic RGB arrays."""
 
-    expected = (1, 3, 3, SIM_HEIGHT, SIM_WIDTH)
-    if tuple(rendered.shape) != expected or rendered.dtype != torch.uint8:
-        raise ValueError(
-            f"Puffer preview expects uint8 raster shaped {expected}, got "
-            f"{rendered.dtype} {tuple(rendered.shape)}"
-        )
     return rendered[0].permute(0, 2, 3, 1).contiguous().cpu().numpy()
 
 
@@ -154,7 +148,7 @@ class PolicyBranches:
         # same tensor is reused for perception instead of rendering twice.
         self.renderer = (
             TeacherRenderer(self.device)
-            if self.need_teacher or getattr(args, "camera_preview", False)
+            if self.need_teacher or args.camera_preview
             else None
         )
         self.amp_dtype = {
@@ -196,10 +190,6 @@ class PolicyBranches:
         if self.teacher is not None:
             sim_images = rendered_teacher_images
             if sim_images is None:
-                if agents is None or roads is None:
-                    raise ValueError("teacher perception requires live agents and roads")
-                if self.renderer is None:
-                    raise AssertionError("teacher perception has no Puffer renderer")
                 sim_images = self.renderer.render(agents, roads)
             with torch.autocast(
                 device_type=self.device.type,
@@ -244,8 +234,7 @@ class MetricAccumulator:
 
     def add(self, **values: float) -> None:
         for key, value in values.items():
-            if math.isfinite(float(value)):
-                self.values.setdefault(key, []).append(float(value))
+            self.values.setdefault(key, []).append(float(value))
 
     def means(self) -> dict[str, float]:
         return {f"mean_{key}": float(np.mean(values)) for key, values in self.values.items() if values}
@@ -305,10 +294,6 @@ def project_world_point_to_camera(
 
     point = np.asarray(point, dtype=np.float64)
     matrix = np.asarray(world_to_camera, dtype=np.float64)
-    if point.shape != (3,) or matrix.shape != (4, 4):
-        raise ValueError(
-            f"expected point [3] and world_to_camera [4,4], got {point.shape} and {matrix.shape}"
-        )
     fx, fy, cx, cy = map(float, intrinsics)
     camera = matrix @ np.append(point, 1.0)
     depth, right, up = map(float, camera[:3])
@@ -420,20 +405,6 @@ class CameraPreview:
         goal_distance_m: float | None = None,
         final_goal: bool = False,
     ) -> bool:
-        carla_expected = (3, REAL_HEIGHT, REAL_WIDTH, 3)
-        if carla_images.shape != carla_expected or carla_images.dtype != np.uint8:
-            raise ValueError(
-                f"camera preview expects uint8 CARLA images shaped {carla_expected}, got "
-                f"{carla_images.dtype} {carla_images.shape}"
-            )
-        puffer_expected = (3, SIM_HEIGHT, SIM_WIDTH, 3)
-        if puffer_images.shape != puffer_expected or puffer_images.dtype != np.uint8:
-            raise ValueError(
-                f"camera preview expects uint8 Puffer images shaped {puffer_expected}, got "
-                f"{puffer_images.dtype} {puffer_images.shape}"
-            )
-        if goal_projections is not None and len(goal_projections) != 3:
-            raise ValueError(f"expected three goal projections, got {len(goal_projections)}")
         if self.closed:
             return False
 
@@ -534,11 +505,10 @@ class ClosedLoopEvaluator:
             raise RuntimeError(f"{self.collector.town} exposes fewer than two spawn points")
         for _ in range(self.args.route_attempts):
             start, destination = rng.sample(points, 2)
-            try:
-                trace = self.route_planner.trace_route(start.location, destination.location)
-                plan = RoutePlan.from_trace(trace, self.args.max_route_goals)
-            except (KeyError, RuntimeError, ValueError, IndexError):
+            trace = self.route_planner.trace_route(start.location, destination.location)
+            if len(trace) < 2:
                 continue
+            plan = RoutePlan.from_trace(trace, self.args.max_route_goals)
             if self.args.min_route_distance <= plan.length <= self.args.max_route_distance:
                 return start, plan, destination
         raise RuntimeError(
@@ -737,8 +707,6 @@ class ClosedLoopEvaluator:
 
                 rendered_teacher_images = None
                 if self.camera_preview is not None:
-                    if agents is None or roads is None or self.branches.renderer is None:
-                        raise AssertionError("camera preview has no live Puffer scene")
                     rendered_teacher_images = self.branches.renderer.render(agents, roads)
                     puffer_images = puffer_preview_images(rendered_teacher_images)
                     projection_point = np.asarray(goal, dtype=np.float64).copy()
@@ -912,21 +880,12 @@ class ClosedLoopEvaluator:
         finally:
             self.collector._mute(camera_sensors, camera_queues)
             for sensor in event_sensors:
-                try:
-                    sensor.stop()
-                except RuntimeError:
-                    pass
+                sensor.stop()
             for sensor in (*camera_sensors, *event_sensors):
-                try:
-                    sensor.destroy()
-                except RuntimeError:
-                    pass
+                sensor.destroy()
             if controllers:
                 for controller_actor in world.get_actors(controllers):
-                    try:
-                        controller_actor.stop()
-                    except RuntimeError:
-                        pass
+                    controller_actor.stop()
                 self.collector.client.apply_batch(
                     [carla.command.DestroyActor(actor_id) for actor_id in controllers]
                 )
@@ -934,10 +893,7 @@ class ClosedLoopEvaluator:
                 self.collector.client.apply_batch(
                     [carla.command.DestroyActor(actor_id) for actor_id in spawned]
                 )
-            try:
-                world.tick()
-            except RuntimeError:
-                pass
+            world.tick()
 
 
 def _aggregate(summaries: list[dict[str, Any]]) -> dict[str, Any]:

@@ -31,13 +31,6 @@ JERK_LONG_LABELS = ("brake--", "brake", "coast", "accel")
 JERK_LAT_LABELS = ("right", "straight", "left")
 
 
-def _fourcc(code: str) -> int:
-    # OpenCV moved the helper onto VideoWriter in 5.0 and kept the old module
-    # level name only in the 4.x line.
-    factory = getattr(cv2.VideoWriter, "fourcc", None) or cv2.VideoWriter_fourcc
-    return factory(*code)
-
-
 def _bar(canvas: np.ndarray, x: int, y: int, width: int, value: float, color) -> None:
     """A signed [-1, 1] bar filled from its centre, for steer/throttle/brake."""
 
@@ -52,31 +45,31 @@ def _annotate(frame: np.ndarray, meta: dict, index: int, total: int) -> np.ndarr
     canvas[: frame.shape[0]] = frame
     top = frame.shape[0]
 
-    action = int(meta.get("action", 0))
+    action = int(meta["action"])
     label = f"{JERK_LONG_LABELS[action // 3]}/{JERK_LAT_LABELS[action % 3]}"
     line = (
-        f"t {index:4d}/{total}  speed {meta.get('speed', 0.0):5.2f} m/s"
-        f"  target {meta.get('target_speed', 0.0):5.2f}"
+        f"t {index:4d}/{total}  speed {meta['speed']:5.2f} m/s"
+        f"  target {meta['target_speed']:5.2f}"
         f"  action {action:2d} {label}"
     )
     cv2.putText(canvas, line, (8, top + 20), FONT, 0.45, (235, 235, 235), 1, cv2.LINE_AA)
 
     route = (
-        f"route {100.0 * meta.get('route_completion', 0.0):5.1f}%"
-        f"  goal {meta.get('goal_index', 0)}/{max(0, meta.get('num_goals', 1) - 1)}"
-        f"  deviation {meta.get('route_deviation', 0.0):5.2f} m"
-        f"  collisions {meta.get('collisions', 0)}"
+        f"route {100.0 * meta['route_completion']:5.1f}%"
+        f"  goal {meta['goal_index']}/{meta['num_goals'] - 1}"
+        f"  deviation {meta['route_deviation']:5.2f} m"
+        f"  collisions {meta['collisions']}"
     )
-    colour = (120, 120, 255) if meta.get("collisions", 0) else (200, 200, 200)
+    colour = (120, 120, 255) if meta["collisions"] else (200, 200, 200)
     cv2.putText(canvas, route, (8, top + 40), FONT, 0.45, colour, 1, cv2.LINE_AA)
 
     cv2.putText(canvas, "steer", (8, top + 64), FONT, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
-    _bar(canvas, 58, top + 54, 120, meta.get("steer", 0.0), (255, 200, 90))
+    _bar(canvas, 58, top + 54, 120, meta["steer"], (255, 200, 90))
     cv2.putText(canvas, "throt", (190, top + 64), FONT, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
-    _bar(canvas, 240, top + 54, 120, meta.get("throttle", 0.0), (110, 230, 110))
+    _bar(canvas, 240, top + 54, 120, meta["throttle"], (110, 230, 110))
     cv2.putText(canvas, "brake", (372, top + 64), FONT, 0.4, (180, 180, 180), 1, cv2.LINE_AA)
-    _bar(canvas, 422, top + 54, 120, meta.get("brake", 0.0), (110, 110, 240))
-    if meta.get("reverse"):
+    _bar(canvas, 422, top + 54, 120, meta["brake"], (110, 110, 240))
+    if meta["reverse"]:
         cv2.putText(canvas, "REVERSE", (556, top + 64), FONT, 0.45, (90, 90, 255), 1, cv2.LINE_AA)
     return canvas
 
@@ -85,14 +78,14 @@ def render_route(route_dir: Path, output: Path, fps: float, source: str) -> int:
     frames = sorted((route_dir / source).glob("*.jpg"))
     if not frames:
         return 0
-    first = _annotate(cv2.imread(str(frames[0])), {}, 0, len(frames))
-    writer = cv2.VideoWriter(str(output), _fourcc("mp4v"), fps, (first.shape[1], first.shape[0]))
+    height, width = cv2.imread(str(frames[0])).shape[:2]
+    fourcc = cv2.VideoWriter.fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(output), fourcc, fps, (width, height + HUD_HEIGHT))
     if not writer.isOpened():
         raise RuntimeError(f"OpenCV refused to open {output} for writing")
     try:
         for index, frame_path in enumerate(frames):
-            meta_path = route_dir / "meta" / f"{frame_path.stem}.json"
-            meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+            meta = json.loads((route_dir / "meta" / f"{frame_path.stem}.json").read_text())
             writer.write(_annotate(cv2.imread(str(frame_path)), meta, index, len(frames)))
     finally:
         writer.release()

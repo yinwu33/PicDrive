@@ -216,7 +216,9 @@ def _stray_fraction(frames: list[dict], threshold: float, stride: int = 10) -> f
         distance = np.linalg.norm(start[None] + t[..., None] * along[None] - vehicles[:, None, 0:2], axis=2)
         stray += int((distance.min(1) > threshold).sum())
         total += len(vehicles)
-    return stray / total if total else 0.0
+    if not total:
+        raise DegenerateTraffic("no vehicle was recorded in view, so there is no traffic to score")
+    return stray / total
 
 
 class Collector:
@@ -239,8 +241,6 @@ class Collector:
         # Tracked so muting an already-muted rig does not make the server warn.
         self._listening = False
 
-    # -- session -----------------------------------------------------------
-
     def load_town(self, town: str) -> None:
         if self.town == town:
             return
@@ -251,10 +251,7 @@ class Collector:
         # actor registry. That is what made the third town collected behave far
         # worse than the same town collected first.
         if self.traffic_manager is not None:
-            try:
-                self.traffic_manager.shut_down()
-            except RuntimeError:
-                pass
+            self.traffic_manager.shut_down()
             self.traffic_manager = None
 
         self.world = self.client.load_world(town)
@@ -288,16 +285,11 @@ class Collector:
         """Hand the server back asynchronous, or the next client hangs on tick."""
         if self.world is None:
             return
-        try:
-            self.traffic_manager.set_synchronous_mode(False)
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            settings.fixed_delta_seconds = None
-            self.world.apply_settings(settings)
-        except RuntimeError:
-            pass
-
-    # -- one episode -------------------------------------------------------
+        self.traffic_manager.set_synchronous_mode(False)
+        settings = self.world.get_settings()
+        settings.synchronous_mode = False
+        settings.fixed_delta_seconds = None
+        self.world.apply_settings(settings)
 
     def record_episode(self, base_index: int, rng: random.Random) -> list[dict]:
         carla = self.carla
@@ -567,14 +559,10 @@ class Collector:
             waypoint = lane_map.get_waypoint(
                 transform.location, project_to_road=True, lane_type=carla.LaneType.Driving
             )
-            distance = (
-                transform.location.distance(waypoint.transform.location)
-                if waypoint is not None
-                else math.inf
-            )
+            distance = transform.location.distance(waypoint.transform.location)
             offroad.append(distance > self.args.max_offroad)
         if not offroad:
-            return 0.0, 0.0
+            raise DegenerateTraffic(f"{self.town} has no traffic vehicle, so there is no fleet to score")
         return float(np.mean(offroad)), float(np.median(speeds))
 
     def _static_geometry(self, ego) -> list[_Actor]:
@@ -652,9 +640,6 @@ class Collector:
                 yaws.append(yaw)
                 stamps.append(stamp)
 
-                # Every tick is simulated -- the ego track has to stay at the
-                # simulator's 10 Hz for the finite differences behind obs[6..8]
-                # to mean anything -- but only every stride-th frame is kept.
                 if not keep:
                     continue
                 frames.append(
@@ -708,10 +693,7 @@ class Collector:
         rows = []
         radius_sq = self.args.radius**2
         for actor in actors:
-            actor_snapshot = snapshot.find(actor.id)
-            if actor_snapshot is None:
-                continue
-            transform = actor_snapshot.get_transform()
+            transform = snapshot.find(actor.id).get_transform()
             world_xy = _box_center(transform, actor.offset)
             dx, dy = world_xy[0] - center[0], world_xy[1] - center[1]
             if dx * dx + dy * dy > radius_sq:
@@ -812,7 +794,7 @@ def episode_record(episode: dict, town: str, seed: int) -> dict:
         "max_offroad": max(_nearest_lane_distance(f["roads"]) for f in episode["frames"]),
         # Where the segment opened, in world metres, so segments sharing a spawn
         # can be checked for overlap after the fact.
-        "start_xy": [float(v) for v in episode.get("start_xy", (float("nan"),) * 2)],
+        "start_xy": [float(v) for v in episode["start_xy"]],
     }
 
 
@@ -974,7 +956,8 @@ def main(argv=None) -> int:
             existing = len(done := _existing_segments(output))
             print(f"--overwrite: discarding {existing} segments under {output}", flush=True)
             for name in ("processed", "ego_state"):
-                shutil.rmtree(output / name, ignore_errors=True)
+                if (output / name).exists():
+                    shutil.rmtree(output / name)
             (output / "episodes.jsonl").unlink(missing_ok=True)
             done = set()
         else:

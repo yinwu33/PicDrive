@@ -86,22 +86,24 @@ class PicDriveAgent(AutonomousAgent):
         if bundle_dir.is_file():
             bundle_dir = bundle_dir.parent
         self.bundle = json.loads((bundle_dir / "bundle.json").read_text())
-        if int(self.bundle.get("schema_version", 0)) != 1:
+        if int(self.bundle["schema_version"]) != 1:
             raise ValueError(f"{bundle_dir}/bundle.json is not a supported policy bundle")
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if not torch.cuda.is_available():
+            raise RuntimeError("the leaderboard agent needs CUDA; a CPU score is not comparable")
+        self.device = torch.device("cuda")
         self.encoder = torch.jit.load(str(bundle_dir / "encoder.ts"), map_location=self.device).eval()
         self.planner = torch.jit.load(str(bundle_dir / "planner.ts"), map_location=self.device).eval()
-        self.amp_dtype = torch.bfloat16 if self.device.type == "cuda" else None
 
         self.dt = float(self.bundle["dt"])
         # Read the simulator's own step rather than assuming the leaderboard's
         # 20 Hz: this is the number the policy is actually being decimated
         # against, and a fork that changes frame_rate must not silently halve
         # every acceleration ramp.
-        tick_period = float(self.hero_actor.get_world().get_settings().fixed_delta_seconds or 0.0)
-        if tick_period <= 0.0:
+        tick_period = self.hero_actor.get_world().get_settings().fixed_delta_seconds
+        if not tick_period or tick_period <= 0.0:
             raise ValueError("the world is not in fixed-delta mode; the policy has no tick period")
+        tick_period = float(tick_period)
         stride = self.dt / tick_period
         if abs(stride - round(stride)) > 1e-6 or round(stride) < 1:
             raise ValueError(
@@ -124,7 +126,6 @@ class PicDriveAgent(AutonomousAgent):
         self.geometry: tuple[float, float] | None = None
         self.last_control = carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0)
         self.collisions = 0
-        self.collision_sensor = None
         self._attach_collision_sensor()
         self._setup_viz()
         # "chase" is the only mode this agent drives. Under "bev" (and when
@@ -138,8 +139,6 @@ class PicDriveAgent(AutonomousAgent):
             else None
         )
 
-    # ------------------------------------------------------------------ setup
-
     def _attach_collision_sensor(self) -> None:
         """Feed ``obs[5]`` the same collision flag the offline rollout had.
 
@@ -149,17 +148,12 @@ class PicDriveAgent(AutonomousAgent):
         read-only telemetry: it feeds the ego vector and nothing else.
         """
 
-        if self.hero_actor is None:
-            return
-        try:
-            world = self.hero_actor.get_world()
-            blueprint = world.get_blueprint_library().find("sensor.other.collision")
-            self.collision_sensor = world.spawn_actor(
-                blueprint, carla.Transform(), attach_to=self.hero_actor
-            )
-            self.collision_sensor.listen(self._on_collision)
-        except RuntimeError:
-            self.collision_sensor = None
+        world = self.hero_actor.get_world()
+        blueprint = world.get_blueprint_library().find("sensor.other.collision")
+        self.collision_sensor = world.spawn_actor(
+            blueprint, carla.Transform(), attach_to=self.hero_actor
+        )
+        self.collision_sensor.listen(self._on_collision)
 
     def _on_collision(self, event) -> None:
         self.collisions += 1
@@ -222,8 +216,6 @@ class PicDriveAgent(AutonomousAgent):
         ]
         self.tracker = RouteTracker(RoutePlan.from_trace(trace, MAX_ROUTE_GOALS))
 
-    # ------------------------------------------------------------------- step
-
     def _images(self, input_data: dict) -> np.ndarray:
         """Stack the rig into the ``[3, H, W, 3]`` RGB uint8 the student wants."""
 
@@ -241,11 +233,7 @@ class PicDriveAgent(AutonomousAgent):
     @torch.inference_mode()
     def _policy_action(self, images: np.ndarray, ego: np.ndarray) -> int:
         tensor = torch.from_numpy(images).permute(0, 3, 1, 2).unsqueeze(0).to(self.device)
-        with torch.autocast(
-            device_type=self.device.type,
-            dtype=self.amp_dtype or torch.float32,
-            enabled=self.amp_dtype is not None,
-        ):
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             scene = self.encoder(tensor)
         ego_tensor = torch.from_numpy(ego).unsqueeze(0).to(self.device)
         logits, self.hidden, self.cell = self.planner(
@@ -305,8 +293,6 @@ class PicDriveAgent(AutonomousAgent):
         self.policy_steps += 1
         return self.last_control
 
-    # -------------------------------------------------------------- debugging
-
     def _dump(self, input_data, telemetry, command, action: int) -> None:
         import cv2
 
@@ -357,5 +343,4 @@ class PicDriveAgent(AutonomousAgent):
         self.cell = None
         self.encoder = None
         self.planner = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        torch.cuda.empty_cache()

@@ -14,7 +14,7 @@ from typing import Any
 
 import numpy as np
 
-from data_utils.sim2real.waymo.giga_conditioning import GIGA_EGO_OBS_DIM, conditioning_to_raw
+from data_utils.sim2real.waymo.giga_conditioning import conditioning_to_raw
 from data_utils.sim2real.waymo.processed import (
     GOAL_OBS_SCALE,
     JERK_LAT_MAX,
@@ -179,9 +179,7 @@ class JerkController:
         speed_target = float(np.clip(speed_target, *SPEED_RANGE))
 
         curvature = next_lat / max(speed_target * speed_target, 1e-5)
-        if abs(curvature) < 1e-5:
-            curvature = math.copysign(1e-5, curvature if curvature else 1.0)
-        requested_steer = math.atan(curvature * max(wheelbase, 0.1))
+        requested_steer = math.atan(curvature * wheelbase)
         steer_delta = float(
             np.clip(
                 requested_steer - self.steering_angle,
@@ -193,7 +191,7 @@ class JerkController:
             np.clip(self.steering_angle + steer_delta, -STEERING_LIMIT, STEERING_LIMIT)
         )
         # drive.h recomputes lateral acceleration after the steering limiter.
-        next_lat = speed_target * speed_target * math.tan(steering_angle) / max(wheelbase, 0.1)
+        next_lat = speed_target * speed_target * math.tan(steering_angle) / wheelbase
 
         # Reverse is sticky around zero to avoid flipping CARLA's gearbox each
         # tick while a braking trajectory crosses rest.
@@ -225,7 +223,7 @@ class JerkController:
             throttle = 0.0
             brake = max(brake, 0.35)
         # Policy-positive is left; CARLA control-positive is right.
-        steer = float(np.clip(-steering_angle / max(max_wheel_steer, 0.1), -1.0, 1.0))
+        steer = float(np.clip(-steering_angle / max_wheel_steer, -1.0, 1.0))
 
         self.accel_long = next_long
         self.accel_lat = next_lat
@@ -260,8 +258,6 @@ def base_ego_observation(
     """Build giga's normalized 11-D JERK observation from online telemetry."""
 
     relative_goal = np.asarray(relative_goal, dtype=np.float64)
-    if relative_goal.shape != (2,):
-        raise ValueError(f"relative_goal must be [2], got {relative_goal.shape}")
     signed_speed = float(np.clip(signed_speed, *SPEED_RANGE))
     accel_long = float(np.clip(accel_long, *ACCEL_LONG_RANGE))
     accel_lat = float(np.clip(accel_lat, *ACCEL_LAT_RANGE))
@@ -297,32 +293,21 @@ class EgoTelemetry:
 def _vehicle_geometry(vehicle) -> tuple[float, float]:
     """Return wheelbase and maximum wheel angle in metres/radians."""
 
-    length = 2.0 * vehicle.bounding_box.extent.x
-    fallback_wheelbase = max(1.5, 0.6 * length)
-    try:
-        wheels = list(vehicle.get_physics_control().wheels)
-        xs = [float(wheel.position.x) for wheel in wheels]
-        # WheelPhysicsControl positions are centimetres in CARLA's API.
-        wheelbase = (max(xs) - min(xs)) / 100.0 if len(xs) >= 2 else fallback_wheelbase
-        steerable = [math.radians(float(wheel.max_steer_angle)) for wheel in wheels if wheel.max_steer_angle > 0]
-        max_steer = max(steerable) if steerable else STEERING_LIMIT
-        if not 1.0 <= wheelbase <= 6.0:
-            wheelbase = fallback_wheelbase
-        return wheelbase, max(max_steer, 0.1)
-    except (AttributeError, RuntimeError, ValueError):
-        return fallback_wheelbase, STEERING_LIMIT
+    wheels = list(vehicle.get_physics_control().wheels)
+    # WheelPhysicsControl positions are centimetres in CARLA's API.
+    xs = [float(wheel.position.x) for wheel in wheels]
+    wheelbase = (max(xs) - min(xs)) / 100.0
+    max_steer = max(
+        math.radians(float(wheel.max_steer_angle)) for wheel in wheels if wheel.max_steer_angle > 0
+    )
+    return wheelbase, max_steer
 
 
-def _physical_steering_angle(vehicle, carla, max_wheel_steer: float) -> float:
-    try:
-        locations = (carla.VehicleWheelLocation.FL_Wheel, carla.VehicleWheelLocation.FR_Wheel)
-        angles = [math.radians(float(vehicle.get_wheel_steer_angle(location))) for location in locations]
-        # CARLA-positive is right; policy-positive is left.
-        return float(np.clip(-np.mean(angles), -STEERING_LIMIT, STEERING_LIMIT))
-    except (AttributeError, RuntimeError):
-        return float(
-            np.clip(-vehicle.get_control().steer * max_wheel_steer, -STEERING_LIMIT, STEERING_LIMIT)
-        )
+def _physical_steering_angle(vehicle, carla) -> float:
+    locations = (carla.VehicleWheelLocation.FL_Wheel, carla.VehicleWheelLocation.FR_Wheel)
+    angles = [math.radians(float(vehicle.get_wheel_steer_angle(location))) for location in locations]
+    # CARLA-positive is right; policy-positive is left.
+    return float(np.clip(-np.mean(angles), -STEERING_LIMIT, STEERING_LIMIT))
 
 
 def read_ego_telemetry(
@@ -359,7 +344,7 @@ def read_ego_telemetry(
     goal_right_handed = np.asarray([goal_carla_xy[0], -goal_carla_xy[1]], dtype=np.float64)
     relative_goal = world_to_ego(goal_right_handed, center, yaw)
     wheelbase, max_wheel_steer = geometry
-    steering = _physical_steering_angle(vehicle, carla, max_wheel_steer)
+    steering = _physical_steering_angle(vehicle, carla)
     base = base_ego_observation(
         relative_goal,
         signed_speed=signed_speed,
@@ -372,8 +357,6 @@ def read_ego_telemetry(
         respawn=respawn,
     )
     observation = np.concatenate((base, conditioning)).astype(np.float32, copy=False)
-    if observation.shape != (GIGA_EGO_OBS_DIM,):
-        raise AssertionError(f"expected {GIGA_EGO_OBS_DIM}-D ego vector, got {observation.shape}")
     return EgoTelemetry(
         observation=observation,
         center_right_handed=center,
