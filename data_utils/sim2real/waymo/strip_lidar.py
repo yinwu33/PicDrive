@@ -18,9 +18,9 @@ full dataset::
 
 Dry-run one file, then strip the directory::
 
-    python -m data_utils.waymo_sim2real.strip_lidar \
+    python -m data_utils.sim2real.waymo.strip_lidar \
         --input /path/to/training --dry-run --max-files 1
-    python -m data_utils.waymo_sim2real.strip_lidar \
+    python -m data_utils.sim2real.waymo.strip_lidar \
         --input /path/to/training --in-place
 
 Both the overall file bar and the per-file rewrite/verification bars show an

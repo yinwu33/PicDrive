@@ -17,7 +17,7 @@ planner are frozen; LoRA, camera registers, fusion, and projection are trained.
 
 Example:
 
-    .venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
+    .venv/bin/python -m data_utils.sim2real.waymo.train_distillation \
         --root artifacts/carla_sim2real/sample1k_dino \
         --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
         --output artifacts/carla_sim2real/runs/dino_carla1k
@@ -178,7 +178,7 @@ class PairedWaymoFeatureDataset(Dataset[tuple[torch.Tensor, torch.Tensor, torch.
         if not self.ego_dir.is_dir():
             raise FileNotFoundError(
                 f"missing {self.ego_dir}; the planning loss needs the reconstructed ego state. Run\n"
-                f"  python -m data_utils.waymo_sim2real.extract_ego_state "
+                f"  python -m data_utils.sim2real.waymo.extract_ego_state "
                 f"--input <raw tfrecords> --output {self.ego_dir} --workers 8 --resume\n"
                 f"or pass --plan-weight 0 to train on the feature term alone."
             )

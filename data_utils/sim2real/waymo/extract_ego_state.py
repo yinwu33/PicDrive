@@ -14,7 +14,7 @@ path, so this writes one table per segment rather than one file per frame.
 
 Example:
 
-    python -m data_utils.waymo_sim2real.extract_ego_state \
+    python -m data_utils.sim2real.waymo.extract_ego_state \
         --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
         --output artifacts/waymo_sim2real/full/training/ego_state \
         --workers 8 --resume

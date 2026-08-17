@@ -1,7 +1,7 @@
 """CARLA-to-simulation paired-data pipeline.
 
 This package is the producer half only.  It writes the *same* artifact tree as
-``data_utils.waymo_sim2real``, so teacher-feature extraction, visualization,
+``data_utils.sim2real.waymo``, so teacher-feature extraction, visualization,
 verification and distillation training all run against a CARLA dataset without
 a single change.
 """

@@ -1,13 +1,13 @@
 """Render processed Waymo scenes and extract frozen DriveCam teacher features.
 
 This stage never opens TFRecord files. It consumes only compact samples emitted
-by :mod:`data_utils.waymo_sim2real.preprocess`, renders their abstract scene with
+by :mod:`data_utils.sim2real.waymo.preprocess`, renders their abstract scene with
 the existing CUDA rasterizer, and stores the frozen teacher's 256-D scene
 embedding plus the three rendered views needed for audit visualization.
 
 Example:
 
-    python -m data_utils.waymo_sim2real.extract_teacher_features \
+    python -m data_utils.sim2real.waymo.extract_teacher_features \
         --processed artifacts/waymo_sim2real/processed \
         --checkpoint experiments/puffer_drive_cam_gwvaxkmh/model_puffer_drive_cam_007800.pt \
         --output artifacts/waymo_sim2real/teacher_features

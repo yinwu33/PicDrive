@@ -1,7 +1,7 @@
 """Record paired CARLA-image / simulator-scene samples from a running server.
 
 This is the only module that talks to CARLA.  It writes the *same* artifact tree
-as ``data_utils.waymo_sim2real.preprocess`` plus ``extract_ego_state``, so the
+as ``data_utils.sim2real.waymo.preprocess`` plus ``extract_ego_state``, so the
 whole downstream half -- teacher features, audit PNGs, the verifier, the
 distillation trainer -- runs against a CARLA dataset unchanged.
 
@@ -10,14 +10,15 @@ and ``dt = 0.1`` in config/ocean/drive_3cam.ini.  Traffic Manager drives the ego
 and all traffic; this process only observes, which makes it the direct analogue
 of Waymo log replay.
 
-    python -m data_utils.carla_sim2real.collect \
+    python -m data_utils.sim2real.carla.collect \
         --output artifacts/carla_sim2real/training \
         --town Town01 --town Town02 --town Town10HD \
         --episodes 100 --resume
 
-The server must already be up:
+The server must already be up (``define_env.sh`` points CARLA_ROOT at 0.9.15):
 
-    /home/tjhu78u/CARLA_0_9_16/CarlaUE4.sh -RenderOffScreen -carla-rpc-port=2000
+    source scripts/define_env.sh
+    "$CARLA_ROOT"/CarlaUE4.sh -RenderOffScreen -carla-rpc-port=2000
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from pathlib import Path
 
 import numpy as np
 
-from data_utils.waymo_sim2real.processed import (
+from data_utils.sim2real.waymo.processed import (
     CAMERA_NAMES,
     EGO_SCHEMA_VERSION,
     MAX_SPEED,
@@ -45,6 +46,7 @@ from data_utils.waymo_sim2real.processed import (
 )
 
 from . import EPISODE_FRAMES, FRAME_INTERVAL_MICROS, REAL_HEIGHT, REAL_WIDTH
+from .control import box_center as _box_center
 from .ego import episode_ego_obs
 from .rig import mount, rig_array, rig_cameras, sensor_fov_deg, source_calibration
 from .roads import ROAD_LANE, RoadIndex, town_roads, world_to_ego
@@ -215,18 +217,6 @@ def _stray_fraction(frames: list[dict], threshold: float, stride: int = 10) -> f
         stray += int((distance.min(1) > threshold).sum())
         total += len(vehicles)
     return stray / total if total else 0.0
-
-
-def _box_center(transform, offset) -> tuple[float, float]:
-    """World box centre in the right-handed frame, y negated out of CARLA's."""
-    yaw = math.radians(transform.rotation.yaw)
-    cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
-    location = transform.location
-    # Only the yaw term matters: pitch and roll of a grounded vehicle move the
-    # box centre by millimetres, and the renderer is planar anyway.
-    x = location.x + offset[0] * cos_yaw - offset[1] * sin_yaw
-    y = location.y + offset[0] * sin_yaw + offset[1] * cos_yaw
-    return x, -y
 
 
 class Collector:

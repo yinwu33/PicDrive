@@ -5,7 +5,7 @@ assigns whole segments to training or validation, stratified by town, and
 hardlinks the large processed NPZ files so no camera data is duplicated.
 
 Example:
-    python -m data_utils.carla_sim2real.split_distillation \
+    python -m data_utils.sim2real.carla.split_distillation \
       --source artifacts/carla_sim2real/sample1k/training \
       --output artifacts/carla_sim2real/sample1k_dino \
       --train-per-town 27 --validation-per-town 7 --seed 42

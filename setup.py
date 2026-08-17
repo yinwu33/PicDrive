@@ -1,6 +1,6 @@
 # Debug command:
 #    DEBUG=1 python setup.py build_ext --inplace --force
-#    CUDA_VISIBLE_DEVICES=None LD_PRELOAD=$(gcc -print-file-name=libasan.so) python3.12 -m pufferlib.clean_pufferl eval --train.device cpu
+#    CUDA_VISIBLE_DEVICES=None LD_PRELOAD=$(gcc -print-file-name=libasan.so) python3.10 -m pufferlib.clean_pufferl eval --train.device cpu
 
 from setuptools import find_packages, find_namespace_packages, setup, Extension
 import numpy

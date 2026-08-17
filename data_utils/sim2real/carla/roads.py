@@ -25,7 +25,7 @@ import math
 
 import numpy as np
 
-from data_utils.waymo_sim2real.render_roads import CROSSWALK, ROAD_EDGE, ROAD_LANE, ROAD_LINE
+from data_utils.sim2real.waymo.render_roads import CROSSWALK, ROAD_EDGE, ROAD_LANE, ROAD_LINE
 
 # Canonical widths at extraction time, matching preprocess.ROAD_WIDTH. Only the
 # painted ones survive: prepare_runtime_roads rewrites every width it renders.

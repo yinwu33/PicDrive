@@ -1,6 +1,6 @@
 """The 11-D ego observation for a CARLA episode.
 
-The vector is not rebuilt here.  ``waymo_sim2real.ego_state.ego_observations``
+The vector is not rebuilt here.  ``sim2real.waymo.ego_state.ego_observations``
 already encodes every normalizer and every clip that keeps the reconstruction
 inside the JERK integrator's reachable set, and it is the exact code the Waymo
 branch runs.  Sharing it is the point: a bias in the finite differences is then
@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from data_utils.waymo_sim2real.ego_state import ego_observations
+from data_utils.sim2real.waymo.ego_state import ego_observations
 
 
 def pose_matrices(centers: np.ndarray, yaws: np.ndarray) -> np.ndarray:

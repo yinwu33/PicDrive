@@ -1,6 +1,6 @@
 """Dependency-light reader for the legacy Waymo Perception TFRecord format.
 
-PufferDrive's Python 3.12 environment is newer than the official legacy Waymo
+PufferDrive's Python 3.10 environment is newer than the official legacy Waymo
 wheel.  Pulling TensorFlow into the training environment just to decode proto
 messages would also make the offline preprocessing unnecessarily fragile.  This
 module therefore implements the small protobuf/TFRecord subset needed by the

@@ -5,13 +5,16 @@ distillation the Waymo pipeline feeds. It writes the **same artifact tree**, so
 every downstream stage is the Waymo one, run unchanged against a different
 `--processed` / `--root`.
 
+Every command below uses `$PICDRIVE_PYTHON` and assumes `source
+scripts/define_env.sh` has been run once in the shell (see [Setup](#setup)).
+
 ```
-data_utils/carla_sim2real/collect.py     ->  processed/ + ego_state/
-data_utils/carla_sim2real/split_distillation.py  ->  leak-free train/validation
-data_utils/waymo_sim2real/extract_teacher_features.py  ->  teacher_features/
-data_utils/waymo_sim2real/visualize.py   ->  png/
-data_utils/waymo_sim2real/verify.py      ->  checks the tree
-data_utils/waymo_sim2real/train_distillation.py  ->  trains the student
+data_utils/sim2real/carla/collect.py     ->  processed/ + ego_state/
+data_utils/sim2real/carla/split_distillation.py  ->  leak-free train/validation
+data_utils/sim2real/waymo/extract_teacher_features.py  ->  teacher_features/
+data_utils/sim2real/waymo/visualize.py   ->  png/
+data_utils/sim2real/waymo/verify.py      ->  checks the tree
+data_utils/sim2real/waymo/train_distillation.py  ->  trains the student
 ```
 
 ## Why
@@ -32,28 +35,50 @@ CARLA-to-Waymo gap. This is a pretraining/regularization source.
 
 ## Setup
 
-The CARLA Python API must match this venv's Python 3.12. A stale 0.9.13 egg on
-`PYTHONPATH` shadows it and fails with `undefined symbol: _Py_tracemalloc_config`,
-so unset the variable for these commands.
+One CARLA version (**0.9.15**) and one interpreter (**Python 3.10.16**) for
+everything in this repository, including Bench2Drive. `scripts/define_env.sh` is
+the single source of `CARLA_ROOT` and `PYTHONPATH`; source it first.
 
 ```bash
-uv pip install --python .venv/bin/python \
-  /home/tjhu78u/CARLA_0_9_16/PythonAPI/carla/dist/carla-0.9.16-cp312-cp312-manylinux_2_31_x86_64.whl
-
-env -u PYTHONPATH .venv/bin/python -c "import carla; print(carla.__file__)"
+source scripts/define_env.sh
+"$PICDRIVE_PYTHON" -c "import carla, pufferlib; print(carla.__file__)"
 ```
+
+`import carla` must resolve to the cp310 wheel inside `.venv`. CARLA 0.9.15
+ships only cp27/cp37 artifacts under `PythonAPI/carla/dist`, so `define_env.sh`
+deliberately keeps that directory off `PYTHONPATH` and exposes only
+`PythonAPI/carla`, which is where CARLA's pure-python `agents` package lives.
+
+To rebuild the venv from scratch:
+
+```bash
+uv venv --python 3.10.16 .venv
+uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cu121 \
+  --extra-index-url https://pypi.org/simple torch==2.4.1 torchvision==0.19.1
+uv pip install --python .venv/bin/python 'numpy<2.0' 'setuptools<81' wheel Cython
+uv pip install --python .venv/bin/python --no-build-isolation -e '.[carla]'
+uv pip install --python .venv/bin/python 'carla==0.9.15' 'opencv-python-headless<4.12' \
+  'networkx>=3' 'shapely==1.8.5.post1' 'py-trees==0.8.3' 'xmlschema==1.0.18' \
+  dictor ephem tabulate pexpect transforms3d pydot simple-watchdog-timer \
+  imageio-ffmpeg google-crc32c pytest ruff
+```
+
+`numpy<2.0` is not optional: the C extensions are compiled against it, which is
+why OpenCV is pinned below 4.12 (4.12+ requires numpy 2). `setuptools<81` is for
+the leaderboard's `pkg_resources` import, and `networkx>=3` because 2.2 imports
+`collections.Mapping`.
 
 Start the server (needs ~3-4 GiB of VRAM; check `nvidia-smi` first if a training
 job is sharing the card):
 
 ```bash
-/home/tjhu78u/CARLA_0_9_16/CarlaUE4.sh -RenderOffScreen -carla-rpc-port=2000
+"$CARLA_ROOT"/CarlaUE4.sh -RenderOffScreen -carla-rpc-port=2000
 ```
 
 ## 1. Collect
 
 ```bash
-env -u PYTHONPATH .venv/bin/python -m data_utils.carla_sim2real.collect \
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.carla.collect \
   --output artifacts/carla_sim2real/training \
   --town Town01 --town Town02 --town Town10HD \
   --episodes 300 --vehicles 60 --walkers 30 --seed 0 --resume
@@ -214,7 +239,7 @@ each of Town01, Town02, and Town10HD. Split whole segments, not frames, so no
 near-identical temporal neighbours leak into validation:
 
 ```bash
-env -u PYTHONPATH .venv/bin/python -m data_utils.carla_sim2real.split_distillation \
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.carla.split_distillation \
   --source artifacts/carla_sim2real/sample1k/training \
   --output artifacts/carla_sim2real/sample1k_dino \
   --train-per-town 27 --validation-per-town 7 --seed 42
@@ -233,7 +258,7 @@ CKPT=experiments/skynet/model_puffer_giga_3cam_001400.pt
 ROOT=artifacts/carla_sim2real/sample1k_dino
 
 for split in training validation; do
-  env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.extract_teacher_features \
+  "$PICDRIVE_PYTHON" -m data_utils.sim2real.waymo.extract_teacher_features \
     --processed $ROOT/$split/processed --checkpoint $CKPT \
     --output $ROOT/$split/teacher_features \
     --reuse-sim-images artifacts/carla_sim2real/sample1k/training/teacher_features
@@ -254,7 +279,7 @@ and 256-D projection contribute 4,256,512 trainable parameters. The simulation
 teacher's visual encoder has 896,544 parameters.
 
 ```bash
-env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.waymo.train_distillation \
   --root artifacts/carla_sim2real/sample1k_dino \
   --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
   --output artifacts/carla_sim2real/runs/dino_carla1k_clean \
@@ -276,7 +301,7 @@ with `h0 = c0 = 0`, and actor head. This implements the first-frame/no-memory
 assumption while keeping the planner frozen.
 
 The best epoch also writes a self-contained `deployment.pt`. Load it with
-`load_deployment_bundle` from `data_utils.waymo_sim2real.real_perception`; it
+`load_deployment_bundle` from `data_utils.sim2real.waymo.real_perception`; it
 returns an image encoder with input `[B, 3, 3, 256, 384]` and output `[B, 256]`.
 
 ## 5. Reuse the same stages for Waymo
@@ -289,7 +314,7 @@ while Waymo supplies the real-domain fine-tuning data.
 
 ## 6. Closed-loop end-to-end evaluation
 
-`closed_loop.py` replaces only perception. At every 10 Hz CARLA tick it runs:
+`demo/closed_loop.py` replaces only perception. At every 10 Hz CARLA tick it runs:
 
 ```
 three 384x256 RGB cameras -> DINO student -> 256-D scene feature
@@ -305,12 +330,11 @@ goal/ego is spawned. This is deliberately different from offline distillation,
 where unrelated samples use the first-frame (`h0=c0=0`) planner path.
 
 The server command is unchanged. The evaluator also needs CARLA's `agents/`
-navigation package, so expose the 0.9.16 PythonAPI directory while allowing the
-installed 0.9.16 wheel in `.venv` to provide `carla`:
+navigation package, which `define_env.sh` already puts on `PYTHONPATH`:
 
 ```bash
-PYTHONPATH=/home/tjhu78u/CARLA_0_9_16/PythonAPI/carla \
-.venv/bin/python -m data_utils.carla_sim2real.closed_loop \
+source scripts/define_env.sh
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.carla.demo.closed_loop \
   --student artifacts/waymo_sim2real/runs/dino_waymo_2hz_b32_e30/deployment.pt \
   --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
   --output artifacts/carla_sim2real/eval/student_town01 \
@@ -338,8 +362,7 @@ Run the teacher-controlled baseline with the same seed and route schedule in a
 separate output directory:
 
 ```bash
-PYTHONPATH=/home/tjhu78u/CARLA_0_9_16/PythonAPI/carla \
-.venv/bin/python -m data_utils.carla_sim2real.closed_loop \
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.carla.demo.closed_loop \
   --student artifacts/waymo_sim2real/runs/dino_waymo_2hz_b32_e30/deployment.pt \
   --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
   --output artifacts/carla_sim2real/eval/teacher_town01 \
@@ -376,14 +399,14 @@ the frozen planner.
 CKPT=experiments/skynet/model_puffer_giga_3cam_001400.pt
 ROOT=artifacts/carla_sim2real
 
-env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.extract_teacher_features \
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.waymo.extract_teacher_features \
   --processed $ROOT/training/processed --checkpoint $CKPT \
   --output $ROOT/training/teacher_features --batch-size 128 --loader-workers 8 --resume
 
-env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.visualize \
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.waymo.visualize \
   --processed $ROOT/training/processed --output-dir $ROOT/training/png --resume
 
-env -u PYTHONPATH .venv/bin/python -m data_utils.waymo_sim2real.verify --root $ROOT --workers 16
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.waymo.verify --root $ROOT --workers 16
 ```
 
 These generic stages remain useful for a larger collected tree. Mixing CARLA
@@ -449,7 +472,7 @@ them — cheap, no image reprocessing, but it changes the existing baseline.
 ## Verification
 
 ```bash
-env -u PYTHONPATH .venv/bin/python -m pytest tests/test_carla_sim2real.py -q
+"$PICDRIVE_PYTHON" -m pytest tests/test_carla_sim2real.py -q
 ```
 
 All offline — `carla.Map(name, xodr_content)` builds a full road network from an
@@ -568,3 +591,120 @@ The progress line reports mean speed and flags anything under 0.5 m/s as
 9.1 s is exactly the case Waymo's own notes call out as a fifth of its training
 set. Check the overlay before assuming a bug — but do check, because a pinned ego
 still yields 91 perfectly well-formed frames and is otherwise invisible.
+
+## Bench2Drive
+
+`demo/closed_loop.py` scores the policy on routes this repository generates. Bench2Drive
+scores it on 220 published safety-critical routes with the CARLA leaderboard 2.0
+criteria, which is the number other papers report. Same policy, different host.
+
+Nothing about the 4 TB Bench2Drive dataset is involved: that is training data for
+UniAD/VAD-style baselines. Closed-loop evaluation generates its own observations.
+
+### Layout
+
+| what | where |
+| --- | --- |
+| CARLA 0.9.15 + AdditionalMaps | `/mnt/disk/tjhu78u/CARLA_0_9_15` (Town01-07, 10HD, 11-13, 15) |
+| Bench2Drive (leaderboard + scenario_runner) | `/mnt/disk/tjhu78u/workspace/test/Bench2Drive` |
+| Python 3.10.16 venv (shared with the rest of the repo) | `.venv` |
+| exported policy | `artifacts/carla_sim2real/b2d_bundle` |
+
+One interpreter. The evaluator runs in `.venv` alongside `pufferlib`, so nothing
+forces the TorchScript hand-off any more -- the bundle is kept because it pins
+the scored policy at export time, not because the import would fail.
+
+### Run it
+
+```bash
+./scripts/bench2drive_eval.sh --routes dev10          # 10 routes, ~30 min
+./scripts/bench2drive_eval.sh --routes b2d220         # the official 220
+./scripts/bench2drive_eval.sh --subset 25378 --viz    # one route, dumping frames
+```
+
+The script starts and stops its own CARLA server. Results land in
+`artifacts/carla_sim2real/bench2drive/<routes>/eval.json`; scoring is Bench2Drive's:
+
+```bash
+cd /mnt/disk/tjhu78u/workspace/test/Bench2Drive
+"$PICDRIVE_PYTHON" tools/ability_benchmark.py -r <eval.json>
+```
+
+`--resume` is on, so a rerun **skips routes already in `eval.json`** -- including
+ones recorded as crashed. Delete the output directory to rerun from scratch.
+
+### Re-export after retraining
+
+The bundle is a frozen copy of the student and the planning head, so a new
+checkpoint needs a new export:
+
+```bash
+"$PICDRIVE_PYTHON" -m data_utils.sim2real.carla.b2d.export \
+  --student artifacts/carla_sim2real/runs/puffer_giga_3cam_distillation/deployment.pt \
+  --checkpoint experiments/skynet/puffer_giga_3cam_20260813_105022_0ejcqldx.pt \
+  --output artifacts/carla_sim2real/b2d_bundle
+```
+
+The export checks both traces against the eager modules before writing, so a
+graph that does not reproduce the rollout fails here rather than in the scores.
+
+### Watching it live
+
+CARLA is started manually before the evaluator, and the evaluator attaches to
+that server through `PICDRIVE_EXTERNAL_CARLA`. Load the shared configuration
+once so CARLA and the evaluator use the same RPC port:
+
+```bash
+# in scripts/define_env.sh, adjust paths or ports if needed
+source scripts/define_env.sh
+
+# in a terminal inside the RDP/XFCE session:
+scripts/carla_window.sh
+
+# anywhere, including a plain SSH shell:
+./scripts/bench2drive_eval.sh
+```
+
+The default RPC port is `2000`; set `B2D_PORT` in `define_env.sh` if another
+port is required. The evaluator no longer starts a second headless CARLA.
+
+The agent then drives CARLA's spectator 8 m behind the ego every tick
+(`PICDRIVE_SPECTATOR`), because leaderboard 2.0 sets `spectator_as_ego=False`
+and never moves it -- the window would otherwise show a fixed corner of the map.
+
+The eval script does a real client handshake before starting, not a port check:
+CARLA binds its RPC port before its streaming port, so it can be listening and
+already dying, and the evaluator's reconnect loop turns that into a twenty-round
+hang rather than an error.
+
+The server survives the run and is left in async mode, so the window stays open
+for the next one. Window rendering shares the GPU with inference; `QUALITY=Low
+scripts/carla_window.sh` if the run feels slow.
+
+### Videos
+
+`--viz` writes `rgb_front/`, `rgb_strip/` and `meta/` per route under
+`<output>/dump`, one frame per **policy** tick:
+
+```bash
+PYTHONPATH=$PWD "$PICDRIVE_PYTHON" \
+  -m data_utils.sim2real.carla.b2d.video --dump <output>/dump
+```
+
+10 fps is wall-clock speed, since the policy runs at 10 Hz. Leave `--viz` off for
+the full 220: it writes a few thousand frames per route.
+
+### Three things that bite
+
+* **`scripts/define_env.sh` is the only place `CARLA_ROOT` and `PYTHONPATH` are
+  set.** The login profile used to export a 0.9.13 egg on `PYTHONPATH`, which is
+  what made `env -u PYTHONPATH` necessary on every client command; those exports
+  are gone. Source `define_env.sh` and nothing else.
+* **The Bench2Drive clone is patched.** `scripts/bench2drive_local.patch` is the
+  diff, to reapply after a fresh clone: three `Element.getchildren()` calls that
+  Python 3.9 removed, plus the `PICDRIVE_EXTERNAL_CARLA` branch below. `networkx`
+  must be >= 3 (2.2 imports `collections.Mapping`) and `setuptools` < 81 (the
+  leaderboard imports `pkg_resources`).
+* **The leaderboard ticks at 20 Hz and the policy is 10 Hz.** The agent reads
+  `fixed_delta_seconds` and decimates; it does not assume the ratio. Running the
+  policy every tick halves every acceleration ramp the jerk integrator commands.

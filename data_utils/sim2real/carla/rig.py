@@ -23,6 +23,7 @@ import numpy as np
 from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, Camera, rig_tensor
 
 from . import REAL_HEIGHT, REAL_WIDTH
+from .control import carla_mount
 
 # Waymo's sensor frame is x-forward/y-left/z-up; the rasterizer uses the CV
 # x-right/y-down/z-forward frame.  Same matrix as preprocess.SENSOR_TO_CV, but
@@ -82,11 +83,7 @@ def mount(camera: Camera, box_offset=(0.0, 0.0, 0.0)):
     Roll passes through unchanged.  Every camera in ``WAYMO_RIG`` has zero roll,
     so that leg is untested -- revisit it before adding a rolled camera.
     """
-    x, y, z = camera.pos
-    return (
-        (box_offset[0] + x, box_offset[1] - y, z),
-        (-camera.pitch_deg, -camera.yaw_deg, camera.roll_deg),
-    )
+    return carla_mount(camera.pos, camera.pitch_deg, camera.yaw_deg, camera.roll_deg, box_offset)
 
 
 def source_calibration(width: int = REAL_WIDTH, height: int = REAL_HEIGHT):

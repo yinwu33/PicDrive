@@ -7,7 +7,7 @@ Teacher extraction and visualization consume only the resulting ``.npz`` files.
 
 Example (one segment, eight frames):
 
-    python -m data_utils.waymo_sim2real.preprocess \
+    python -m data_utils.sim2real.waymo.preprocess \
         --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
         --output artifacts/waymo_sim2real/processed \
         --max-segments 1 --max-frames-per-segment 8

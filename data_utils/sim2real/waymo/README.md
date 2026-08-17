@@ -22,12 +22,12 @@ Both the per-file and overall progress bars include an ETA.
 uv pip install --python .venv/bin/python google-crc32c
 
 # Non-mutating trial on the first sorted segment.
-.venv/bin/python -m data_utils.waymo_sim2real.strip_lidar \
+.venv/bin/python -m data_utils.sim2real.waymo.strip_lidar \
   --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
   --dry-run --max-files 1
 
 # Destructive in-place conversion, one validated segment at a time.
-.venv/bin/python -m data_utils.waymo_sim2real.strip_lidar \
+.venv/bin/python -m data_utils.sim2real.waymo.strip_lidar \
   --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
   --in-place
 ```
@@ -42,7 +42,7 @@ checksums change when a protobuf field is removed.
 ## 1. Build processed data
 
 ```bash
-python -m data_utils.waymo_sim2real.preprocess \
+python -m data_utils.sim2real.waymo.preprocess \
   --input /mnt/disk/data/public/waymo/perception_1_4_3/training \
   --output artifacts/waymo_sim2real/full/training/processed \
   --workers 8 --resume
@@ -66,7 +66,7 @@ outputs under `artifacts/waymo_sim2real/2hz/{training,validation}/processed`.
 ## 2. Extract frozen teacher features
 
 ```bash
-python -m data_utils.waymo_sim2real.extract_teacher_features \
+python -m data_utils.sim2real.waymo.extract_teacher_features \
   --processed artifacts/waymo_sim2real/full/training/processed \
   --checkpoint experiments/puffer_drive_cam_gwvaxkmh/model_puffer_drive_cam_007800.pt \
   --output artifacts/waymo_sim2real/full/training/teacher_features \
@@ -85,7 +85,7 @@ first, and black non-road ground.
 ## 3. Plot the paired sample
 
 ```bash
-python -m data_utils.waymo_sim2real.visualize \
+python -m data_utils.sim2real.waymo.visualize \
   --processed artifacts/waymo_sim2real/full/training/processed \
   --output-dir artifacts/waymo_sim2real/full/training/png \
   --resume
@@ -106,7 +106,7 @@ for `training` to build the validation split.
 ## 4. Verify a complete artifact tree
 
 ```bash
-python -m data_utils.waymo_sim2real.verify \
+python -m data_utils.sim2real.waymo.verify \
   --root artifacts/waymo_sim2real/full --workers 16
 ```
 
@@ -124,7 +124,7 @@ runs at roughly a segment per five seconds per worker.
 
 ```bash
 for split in training validation; do
-  python -m data_utils.waymo_sim2real.extract_ego_state \
+  python -m data_utils.sim2real.waymo.extract_ego_state \
     --input /mnt/disk/data/public/waymo/perception_1_4_3/$split \
     --output artifacts/waymo_sim2real/full/$split/ego_state \
     --workers 8 --resume
@@ -153,7 +153,7 @@ uv pip install --python .venv/bin/python -e .
 ```bash
 wandb login
 
-.venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
+.venv/bin/python -m data_utils.sim2real.waymo.train_distillation \
   --root artifacts/waymo_sim2real/full \
   --checkpoint experiments/skynet/model_puffer_giga_3cam_001400.pt \
   --output artifacts/waymo_sim2real/runs/real_perception_dinov2 \
@@ -248,7 +248,7 @@ checkpoint, so `--resume` reconnects to the same online run. Use
 For a short launch check before a full run:
 
 ```bash
-.venv/bin/python -m data_utils.waymo_sim2real.train_distillation \
+.venv/bin/python -m data_utils.sim2real.waymo.train_distillation \
   --root artifacts/waymo_sim2real/full \
   --checkpoint experiments/puffer_drive_cam_gwvaxkmh/model_puffer_drive_cam_007800.pt \
   --output /tmp/waymo_distill_smoke --epochs 1 --batch-size 4 --workers 0 \
