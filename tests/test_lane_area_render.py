@@ -15,6 +15,7 @@ from pufferlib.pufferl import load_config
         "puffer_teddy_3cam",
         "puffer_giga_cam",
         "puffer_giga_3cam",
+        "puffer_giga_b2d_2cam",
     ),
 )
 def test_camera_configs_enable_lane_area(env_name):

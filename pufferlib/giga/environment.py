@@ -6,10 +6,12 @@ the Gigaflow-style random initialization can diverge from the dataset-driven env
 serving WOSAC and human-replay evaluation, which need logged trajectories.
 
 Env names are `puffer_giga` (privileged vector observations), `puffer_giga_cam`
-(a single front camera), `puffer_giga_3cam` (Waymo's three front-facing cameras)
-and `puffer_giga_debug` (the single-car, single-map overfitting rig). All three are the same C simulator in different observation modes,
-exactly as in `ocean`, where the counterparts are `puffer_drive`,
-`puffer_drive_cam` and `puffer_drive_3cam`.
+(a single front camera), `puffer_giga_3cam` (Waymo's three front-facing cameras),
+`puffer_giga_b2d_2cam` (front + back, the rig sized for a Bench2Drive run on one
+card) and `puffer_giga_debug` (the single-car, single-map overfitting rig). All of
+them are the same C simulator in different observation modes, exactly as in
+`ocean`, where the counterparts are `puffer_drive`, `puffer_drive_cam` and
+`puffer_drive_3cam`.
 """
 
 import importlib
@@ -24,10 +26,11 @@ MAKE_FUNCTIONS = {
     # version of it silently trains something else.
     "giga_debug": "Drive",
     # Same simulator, configured for perspective observations and wrapped by
-    # PerspectiveVecEnv below. These two differ only in the camera rig named by
+    # PerspectiveVecEnv below. These three differ only in the camera rig named by
     # their config, so they share this entry point.
     "giga_cam": "Drive",
     "giga_3cam": "Drive",
+    "giga_b2d_2cam": "Drive",
 }
 
 # Environments that reuse another environment's module.
@@ -36,7 +39,7 @@ MODULE_ALIASES = {name: "drive" for name in MAKE_FUNCTIONS}
 # Envs whose observations are rendered rather than privileged. Matched exactly:
 # every name here starts with "giga", so a substring test would wrap the
 # vector-observation env too.
-CAMERA_ENVS = {"puffer_giga_cam", "puffer_giga_3cam"}
+CAMERA_ENVS = {"puffer_giga_cam", "puffer_giga_3cam", "puffer_giga_b2d_2cam"}
 
 
 def env_creator(name="giga", *args, **kwargs):

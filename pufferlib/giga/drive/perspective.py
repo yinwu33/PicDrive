@@ -42,7 +42,8 @@ def display_order(cameras: list[Camera]) -> list[int]:
     rig comes out front_left, front, front_right. This only orders what the
     viewer blits -- the policy sees the rig in config order either way. A rear
     camera has nowhere natural to go in a left-to-right strip and lands at the
-    left end; the rigs in use have none.
+    left end, which is where giga_b2d_2cam's "back" ends up; each view is
+    captioned with its camera name, so the strip stays readable regardless.
     """
     return sorted(range(len(cameras)), key=lambda i: -cameras[i].yaw_deg)
 
