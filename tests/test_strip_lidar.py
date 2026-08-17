@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from data_utils.waymo_sim2real.strip_lidar import (
+from data_utils.sim2real.waymo.strip_lidar import (
     _field_spans,
     _read_record,
     _scan_file,

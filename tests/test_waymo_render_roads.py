@@ -2,8 +2,8 @@ import struct
 
 import numpy as np
 
-from data_utils.waymo_sim2real.preprocess import _parse_map_features
-from data_utils.waymo_sim2real.render_roads import RENDER_LANE_AREA, RENDER_YELLOW_ROAD_EDGE, prepare_runtime_roads
+from data_utils.sim2real.waymo.preprocess import _parse_map_features
+from data_utils.sim2real.waymo.render_roads import RENDER_LANE_AREA, RENDER_YELLOW_ROAD_EDGE, prepare_runtime_roads
 
 
 def _varint(value):

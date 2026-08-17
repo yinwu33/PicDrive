@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -16,19 +17,21 @@ import numpy as np
 import pytest
 import torch
 
-from data_utils.carla_sim2real import EPISODE_FRAMES, REAL_HEIGHT, REAL_WIDTH
-from data_utils.carla_sim2real.closed_loop import (
+from data_utils.sim2real.carla import EPISODE_FRAMES, REAL_HEIGHT, REAL_WIDTH
+from data_utils.sim2real.carla.demo.closed_loop import (
     CameraPreview,
     ClosedLoopEvaluator,
+    puffer_preview_images,
+    project_world_point_to_camera,
+)
+from data_utils.sim2real.carla.control import (
     JerkController,
     RoutePlan,
     RouteTracker,
     base_ego_observation,
     decode_jerk_action,
-    puffer_preview_images,
-    project_world_point_to_camera,
 )
-from data_utils.carla_sim2real.collect import (
+from data_utils.sim2real.carla.collect import (
     PEDESTRIAN,
     VEHICLE,
     Weather,
@@ -38,8 +41,8 @@ from data_utils.carla_sim2real.collect import (
     kept_indices,
     write_episode,
 )
-from data_utils.carla_sim2real.ego import episode_ego_obs, pose_matrices
-from data_utils.carla_sim2real.rig import (
+from data_utils.sim2real.carla.ego import episode_ego_obs, pose_matrices
+from data_utils.sim2real.carla.rig import (
     SENSOR_TO_CV,
     mount,
     rig_array,
@@ -48,10 +51,10 @@ from data_utils.carla_sim2real.rig import (
     sensor_intrinsics,
     source_calibration,
 )
-from data_utils.carla_sim2real.roads import RoadIndex, town_roads, world_to_ego
-from data_utils.carla_sim2real.split_distillation import split_segments
-from data_utils.waymo_sim2real.giga_conditioning import nominal_conditioning
-from data_utils.waymo_sim2real.processed import (
+from data_utils.sim2real.carla.roads import RoadIndex, town_roads, world_to_ego
+from data_utils.sim2real.carla.split_distillation import split_segments
+from data_utils.sim2real.waymo.giga_conditioning import nominal_conditioning
+from data_utils.sim2real.waymo.processed import (
     EGO_OBS_DIM,
     SIM_HEIGHT,
     SIM_WIDTH,
@@ -59,11 +62,12 @@ from data_utils.waymo_sim2real.processed import (
     load_processed,
     validate_processed,
 )
-from data_utils.waymo_sim2real.render_roads import RENDER_LANE_AREA, ROAD_LANE, prepare_runtime_roads
+from data_utils.sim2real.waymo.render_roads import RENDER_LANE_AREA, ROAD_LANE, prepare_runtime_roads
 from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
 
 
-CARLA_XODR = Path("/home/tjhu78u/CARLA_0_9_16/CarlaUE4/Content/Carla/Maps/OpenDrive")
+CARLA_ROOT = Path(os.environ.get("CARLA_ROOT", "/mnt/disk/tjhu78u/CARLA_0_9_15"))
+CARLA_XODR = CARLA_ROOT / "CarlaUE4/Content/Carla/Maps/OpenDrive"
 PY123D = Path("data_utils/carla/carla_py123d")
 
 
@@ -630,7 +634,7 @@ def test_weather_sampling_stays_inside_carla_s_ranges_and_favours_daylight():
 
 
 def test_nearest_lane_distance_reads_the_ego_frame_road_array():
-    from data_utils.carla_sim2real.collect import _nearest_lane_distance
+    from data_utils.sim2real.carla.collect import _nearest_lane_distance
 
     roads = np.asarray(
         [
@@ -650,7 +654,7 @@ def test_episode_record_captures_the_sky_and_the_offroad_excursion():
     It is applied per episode and would otherwise be lost the moment the frames
     are written, leaving no way to condition on it or ablate it later.
     """
-    from data_utils.carla_sim2real.collect import episode_record
+    from data_utils.sim2real.carla.collect import episode_record
 
     episode = _synthetic_episode(frames=2)
     episode["weather"] = {"sun_altitude_angle": 35.0, "precipitation": 12.0}
@@ -672,7 +676,7 @@ def test_episode_record_captures_the_sky_and_the_offroad_excursion():
 
 
 def test_kept_indices_thins_writes_without_touching_the_simulated_span():
-    from data_utils.carla_sim2real.collect import kept_indices
+    from data_utils.sim2real.carla.collect import kept_indices
 
     assert kept_indices(91, 1) == list(range(91))
     assert kept_indices(91, 10) == [0, 10, 20, 30, 40, 50, 60, 70, 80, 90]
@@ -691,7 +695,7 @@ def test_striding_never_changes_an_ego_value():
     between two kept frames is simply invisible at 1 s spacing, and obs[7] is
     exactly the slot the planning head reads to know the car is braking.
     """
-    from data_utils.carla_sim2real.collect import kept_indices
+    from data_utils.sim2real.carla.collect import kept_indices
 
     frames, stride = 91, 10
     times = (np.arange(frames) * 100_000).astype(np.int64)
@@ -727,7 +731,7 @@ def test_deduplicate_drops_repeats_of_a_stopped_ego_but_keeps_the_stop():
     stopped traffic is about a fifth of Waymo's training set and deleting it
     would bias the data away from exactly the case the goal term exercises.
     """
-    from data_utils.carla_sim2real.collect import Collector
+    from data_utils.sim2real.carla.collect import Collector
 
     def segments(points):
         return [{"segment_id": f"T_{i:05d}", "start_xy": p} for i, p in enumerate(points)]

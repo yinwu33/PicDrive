@@ -9,16 +9,16 @@ import pytest
 import torch
 from PIL import Image
 
-from data_utils.waymo_sim2real.ego_state import ego_observations
-from data_utils.waymo_sim2real.giga_conditioning import (
+from data_utils.sim2real.waymo.ego_state import ego_observations
+from data_utils.sim2real.waymo.giga_conditioning import (
     GIGA_EGO_OBS_DIM,
     append_giga_conditioning,
     conditioning_to_raw,
     nominal_conditioning,
     segment_conditioning,
 )
-from data_utils.waymo_sim2real.preprocess import SENSOR_TO_CV, _calibration_arrays
-from data_utils.waymo_sim2real.processed import (
+from data_utils.sim2real.waymo.preprocess import SENSOR_TO_CV, _calibration_arrays
+from data_utils.sim2real.waymo.processed import (
     CAMERA_NAMES,
     EGO_OBS_DIM,
     EGO_SCHEMA_VERSION,
@@ -31,21 +31,21 @@ from data_utils.waymo_sim2real.processed import (
     load_processed,
     load_render_input,
 )
-from data_utils.waymo_sim2real.proto import iter_fields, repeated_doubles
-from data_utils.waymo_sim2real.real_perception import (
+from data_utils.sim2real.waymo.proto import iter_fields, repeated_doubles
+from data_utils.sim2real.waymo.real_perception import (
     DistillationLoss,
     RealPerception,
     RealPerceptionConfig,
     ViTRealPerception,
     ViTRealPerceptionConfig,
 )
-from data_utils.waymo_sim2real.teacher import FrozenPlanningHead, RecurrentPlanningRuntime
-from data_utils.waymo_sim2real.train_distillation import (
+from data_utils.sim2real.waymo.teacher import FrozenPlanningHead, RecurrentPlanningRuntime
+from data_utils.sim2real.waymo.train_distillation import (
     PairedWaymoFeatureDataset,
     _wandb_epoch_payload,
     _within_segment_r2,
 )
-from data_utils.waymo_sim2real.visualize import plot_sample
+from data_utils.sim2real.waymo.visualize import plot_sample
 from pufferlib.models import LSTMWrapper
 from pufferlib.ocean.drive.raster_ref import WAYMO_RIG, rig_tensor
 from pufferlib.ocean.torch import DriveCam
