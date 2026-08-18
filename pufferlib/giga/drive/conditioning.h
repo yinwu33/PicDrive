@@ -43,6 +43,16 @@
 #define GIGA_ALPHA_TIMESTEP 0.000025f
 #define GIGA_V_GOAL 3.0f
 
+// Saturation distance for R_l-center, metres. Not a tuning knob so much as the
+// limit of what the simulator can see: find_closest_lane only sweeps the 5x5 grid
+// neighbourhood (GRID_CELL_SIZE = 5 m), so past roughly 10 m there is no nearest
+// centerline to measure against at all. It must stay above the largest offset the
+// 4 m lane_valid gate can produce -- |offset| <= 4 m plus |center_bias| <= 0.5 m,
+// so d <= 4.5 -- which is what keeps every state that was already being rewarded
+// unchanged to the bit, and below the search horizon so the cap is actually
+// reached before the reference disappears.
+#define GIGA_LANE_D_CAP 6.0f
+
 // The three indicator penalties (collision, off-road, comfort) are the paper's values
 // divided by 3. They are not scaled by dt, so at dt=0.1 they would be charged three
 // times as often per second as at the paper's dt=0.3. Note R_collision's 0.1*|v| term
@@ -53,10 +63,13 @@
 // both arrays are indexed positionally, and LO == HI keeps giga_cond_norm at 0 so
 // drive.h can write the is_final flag over it. Give it a range and that breaks.
 //
-// Known issue: R_l-align and R_l-center are at their paper ranges, but both sit
-// inside `if (a->lane_valid)` in drive.h, which drops 4 m from the nearest
-// centerline. Leaving the lane is therefore still cheaper than driving inside one.
-// The fix is to extend them past the gate, not to change these bounds.
+// R_l-align and R_l-center are at their paper ranges. They used to sit inside
+// `if (a->lane_valid)` in drive.h, which drops 4 m from the nearest centerline, and
+// that made leaving the lane cheaper than driving imperfectly inside one: measured
+// at -0.0039/step outside against -0.0073/step inside, and a trained policy duly
+// collapsed to lane_alignment_rate 0.035 for 700 epochs. Both terms now extend past
+// the gate -- see the reward block in drive.h -- so these bounds are live as
+// written rather than describing a term the agent can switch off by leaving.
 static const float GIGA_COND_LO[GIGA_NUM_COND] = {
     2.0f,        // delta_goal: goal-reach radius lower bound, m
     0.0f,        // COND_SLOT_IS_FINAL placeholder: must equal HI

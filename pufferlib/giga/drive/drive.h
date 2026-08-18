@@ -297,7 +297,14 @@ struct Entity {
     // these, and nothing computed them before.
     float lane_heading_error;
     float lane_lateral_offset;
+    // Two flags, deliberately not one. lane_valid is the original strict test --
+    // within 4 m of a centerline -- and LANE_ALIGNED_IDX, the lane_alignment_rate
+    // log and the debug row are all defined against it, so it must keep that
+    // meaning for runs to stay comparable. lane_ref_valid says only that
+    // find_closest_lane had some centerline to measure the Frenet pair against, at
+    // whatever distance. The lane-relative rewards use the second.
     int lane_valid;
+    int lane_ref_valid;
 
     // Gigaflow route: waypoints[0..num_waypoints-1] are visited in order, the last
     // one being the final goal. goal_position_x/y always mirrors the *current*
@@ -1385,24 +1392,22 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         }
     }
 
-    // check if aligned with closest lane and set current lane
-    // 4.0m threshold: agents more than 4 meters from any lane are considered off-road
-    if (min_distance > 4.0f || closest_lane_entity_idx == -1) {
-        agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f;
-        agent->current_lane_idx = -1;
-        agent->lane_valid = 0;
-        agent->lane_heading_error = 0.0f;
-        agent->lane_lateral_offset = 0.0f;
-    } else {
-        agent->current_lane_idx = closest_lane_entity_idx;
-        int lane_aligned =
-            check_lane_aligned(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
-        agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
-
-        // Frenet frame of the closest segment: heading error wrapped to [-pi, pi] and
-        // lateral offset signed by which side of the lane the agent sits on (positive
-        // left). The sign matters -- alpha_center_bias picks a side, so an unsigned
-        // offset would make the left and right halves of the lane indistinguishable.
+    // Frenet frame of the closest segment: heading error wrapped to [-pi, pi] and
+    // lateral offset signed by which side of the lane the agent sits on (positive
+    // left). The sign matters -- alpha_center_bias picks a side, so an unsigned
+    // offset would make the left and right halves of the lane indistinguishable.
+    //
+    // Computed at whatever distance the neighbourhood search found a segment, not
+    // only inside the 4 m threshold below. It used to live in the else branch, so
+    // the pair was zeroed the moment the agent drifted past 4 m and the two
+    // lane-relative reward terms that read it silently switched off -- which made
+    // leaving the lane graph cheaper than driving imperfectly inside it. Keeping the
+    // measurement alive out to the search horizon is what lets the reward stay
+    // monotone in distance; see the reward block in c_step.
+    agent->lane_ref_valid = 0;
+    agent->lane_heading_error = 0.0f;
+    agent->lane_lateral_offset = 0.0f;
+    if (closest_lane_entity_idx != -1) {
         Entity *lane = &env->entities[closest_lane_entity_idx];
         int g = closest_lane_geometry_idx;
         float sx = lane->traj_x[g], sy = lane->traj_y[g];
@@ -1418,12 +1423,27 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
                 err += 2.0f * (float)M_PI;
             agent->lane_heading_error = err;
             agent->lane_lateral_offset = -dy * (agent->x - sx) + dx * (agent->y - sy);
-            agent->lane_valid = 1;
-        } else {
-            agent->lane_valid = 0;
-            agent->lane_heading_error = 0.0f;
-            agent->lane_lateral_offset = 0.0f;
+            agent->lane_ref_valid = 1;
         }
+    }
+
+    // check if aligned with closest lane and set current lane
+    // 4.0m threshold: agents more than 4 meters from any lane are considered off-road
+    //
+    // Unchanged in meaning: lane_valid, current_lane_idx and LANE_ALIGNED_IDX come
+    // out of this exactly as they did before, including the degenerate-segment case
+    // where the closest lane is recorded but lane_valid is not set. Only the Frenet
+    // pair above now survives past the threshold.
+    if (min_distance > 4.0f || closest_lane_entity_idx == -1) {
+        agent->metrics_array[LANE_ALIGNED_IDX] = 0.0f;
+        agent->current_lane_idx = -1;
+        agent->lane_valid = 0;
+    } else {
+        agent->current_lane_idx = closest_lane_entity_idx;
+        int lane_aligned =
+            check_lane_aligned(agent, &env->entities[closest_lane_entity_idx], closest_lane_geometry_idx);
+        agent->metrics_array[LANE_ALIGNED_IDX] = lane_aligned;
+        agent->lane_valid = agent->lane_ref_valid;
     }
 
     // Check for vehicle collisions
@@ -1640,6 +1660,7 @@ static void giga_place_agent(Drive *env, int agent_idx, int count) {
     agent_dist_sample(&env->rng, &a->type, &a->length, &a->width, &a->height);
     giga_sample_conditioning(&env->rng, a->cond);
     a->lane_valid = 0;
+    a->lane_ref_valid = 0;
     a->lane_heading_error = 0.0f;
     a->lane_lateral_offset = 0.0f;
     a->wheelbase = 0.6f * a->length;
@@ -3079,12 +3100,21 @@ void c_step(Drive *env) {
             r_comfort = -cond[COND_ALPHA_COMFORT] * (float)n;
         }
 
-        // The lane-relative terms need a lane to be relative to. Off the lane graph
-        // they are simply absent rather than zero-substituted, which would otherwise
-        // read as "perfectly aligned".
-        if (a->lane_valid) {
-            float th = a->lane_heading_error;
-            float cos_t = cosf(th);
+        // The lane-relative terms need a lane to be relative to -- but "relative to"
+        // must not be read as "within 4 m of". Gating R_l-align and R_l-center on
+        // lane_valid switched both off the moment the agent drifted past the 4 m
+        // threshold, which made leaving the lane graph strictly cheaper than driving
+        // imperfectly inside it: -0.0039/step outside against -0.0073/step inside.
+        // Policies find that reliably. The last run's lane_alignment_rate fell to
+        // 0.035 by epoch 291 and sat there for the following 700 epochs while
+        // completion_rate decayed 0.196 -> 0.173, because off the graph the landscape
+        // is all penalty and no dense reward, so the cheapest policy is to stop.
+        //
+        // Both terms are now charged wherever find_closest_lane has a centerline to
+        // measure against, which extends them to the edge of its 5x5 grid search.
+        float th = a->lane_heading_error;
+        float cos_t = cosf(th);
+        if (a->lane_ref_valid) {
             // R_l-align: penalises facing against the lane, penalises *moving* against
             // it separately (alpha_vel_align), and pays a small bonus for being
             // straight. Randomizing alpha_l_align across a two-order-of-magnitude
@@ -3095,13 +3125,39 @@ void c_step(Drive *env) {
             // R_l-center, offset by alpha_center_bias so agents prefer different parts
             // of the lane (the strongest behavioural knob in the paper's Sec. F.1
             // mutual-information ranking).
-            float d = fabsf(a->lane_lateral_offset - cond[COND_ALPHA_CENTER_BIAS]);
-            r_center = -cond[COND_ALPHA_L_CENTER] * dt * ((cos_t > 0.5f ? d : 0.0f) - 0.05f / expf(d - 0.5f));
-            // R_velocity: forward progress along the lane. Fixed weight; the paper
-            // credits it with avoiding gridlock in self-play.
-            if (fabsf(signed_v) > 2.5f)
-                r_velocity = GIGA_ALPHA_VELOCITY * dt * fmaxf(cos_t, 0.0f);
+            //
+            // The offset saturates at GIGA_LANE_D_CAP. Because the cap sits above the
+            // largest offset the 4 m gate can produce (d <= 4.5), every state that was
+            // already being rewarded is unchanged to the bit; only the region that
+            // used to pay exactly nothing moves.
+            float d_raw = fabsf(a->lane_lateral_offset - cond[COND_ALPHA_CENTER_BIAS]);
+            float d = fminf(d_raw, GIGA_LANE_D_CAP);
+            // Inside the gate the cos_t test stands as written: an agent crossing the
+            // lane it is sitting on should not be charged for its lateral offset.
+            // Outside the gate that reading does not apply -- past 4 m the agent has
+            // left the lane rather than crossed it -- so the offset is charged whatever
+            // the heading. Without the split, turning more than 60 degrees off the lane
+            // heading would zero the term again and reopen the same hole one level down.
+            float d_charged = (a->lane_valid && cos_t <= 0.5f) ? 0.0f : d;
+            r_center = -cond[COND_ALPHA_L_CENTER] * dt * (d_charged - 0.05f / expf(d - 0.5f));
+        } else {
+            // No centerline anywhere in the search neighbourhood, so the agent is
+            // further out than any offset the branch above can report and is charged
+            // the cap. Charging zero here would move the hole from 4 m out to the edge
+            // of the search window rather than close it. The two branches agree at the
+            // boundary: the horizon is wider than the cap, so a reference found near it
+            // is already saturated.
+            r_center = -cond[COND_ALPHA_L_CENTER] * dt *
+                       (GIGA_LANE_D_CAP - 0.05f / expf(GIGA_LANE_D_CAP - 0.5f));
         }
+
+        // R_velocity: forward progress along the lane. Fixed weight; the paper
+        // credits it with avoiding gridlock in self-play. This one stays inside the
+        // 4 m gate on purpose: it pays for progress *along a lane*, so extending it
+        // would pay the agent to drive fast off the graph, which is the behaviour the
+        // change above exists to remove.
+        if (a->lane_valid && fabsf(signed_v) > 2.5f)
+            r_velocity = GIGA_ALPHA_VELOCITY * dt * fmaxf(cos_t, 0.0f);
 
         if (signed_v < 0.0f)
             r_reverse = -cond[COND_ALPHA_REVERSE] * dt; // R_reverse
