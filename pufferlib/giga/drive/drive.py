@@ -60,7 +60,7 @@ DEBUG_FEATURE_NAMES = [
     "timestep",
     # conditioning.h, in COND_* order
     "cond_delta_goal",
-    "cond_v_goal",
+    "is_final",
     "cond_alpha_collision",
     "cond_alpha_boundary",
     "cond_alpha_comfort",
@@ -184,9 +184,9 @@ class Drive(pufferlib.PufferEnv):
         self.debug_terms = None
 
         # Observation space calculation
-        self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}.get(
+        self.ego_features = {"classic": binding.EGO_FEATURES_CLASSIC, "jerk": binding.EGO_FEATURES_JERK}[
             dynamics_model
-        )
+        ]
 
         # Extract observation shapes from constants
         # These need to be defined in C, since they determine the shape of the arrays

@@ -14,12 +14,14 @@ import sys
 
 import numpy as np
 
+from pufferlib.giga.drive import binding
 from pufferlib.giga.drive.drive import Drive
 
 VEHICLE, PEDESTRIAN, CYCLIST = 1, 2, 3
-GIGA_NUM_COND = 13
+GIGA_NUM_COND = binding.GIGA_NUM_COND
 COND_DELTA_GOAL = 0
-COND_NAMES = ["delta_goal", "v_goal", "a_collision", "a_boundary", "a_comfort", "a_l_align",
+COND_SLOT_IS_FINAL = 1
+COND_NAMES = ["delta_goal", "is_final", "a_collision", "a_boundary", "a_comfort", "a_l_align",
               "a_vel_align", "a_l_center", "a_center_bias", "a_reverse", "C_throttle", "C_steer", "C_acc"]
 NAMES = {VEHICLE: "vehicle", PEDESTRIAN: "pedestrian", CYCLIST: "cyclist"}
 
@@ -189,23 +191,30 @@ def main():
     base = obs.shape[1] - GIGA_NUM_COND
     cond = obs[:, base:]
     print(f"  ego observation width {obs.shape[1]} = {base} state + {GIGA_NUM_COND} conditioning")
+    cw = agents[:, 10]
     bad_range = [COND_NAMES[k] for k in range(GIGA_NUM_COND)
                  if cond[:, k].min() < -1e-3 or cond[:, k].max() > 1 + 1e-3]
     if bad_range:
         fails.append(f"conditioning outside [0,1]: {bad_range}")
-    # The first ten are plain uniforms; the last three are the X(a) dynamics mixture,
-    # which is centred near 1 but not uniform, so only the uniforms get a mean test.
+    # The first ten are plain uniforms except slot 1, which carries the is_final flag;
+    # the last three are the X(a) dynamics mixture, centred near 1 but not uniform.
     off = [f"{COND_NAMES[k]} {cond[:, k].mean():.3f}" for k in range(10)
-           if abs(cond[:, k].mean() - 0.5) > 0.05]
+           if k != COND_SLOT_IS_FINAL and abs(cond[:, k].mean() - 0.5) > 0.05]
     if off:
         fails.append(f"conditioning not uniform: {off}")
+    flag = cond[:, COND_SLOT_IS_FINAL]
+    if not np.isin(flag, (0.0, 1.0)).all():
+        fails.append(f"is_final is not a 0/1 flag: min {flag.min()} max {flag.max()}")
+    # Every agent whose route is a single goal must be flagged, and only those.
+    if not np.array_equal(flag > 0.5, cw >= np.maximum(n_wp, 1) - 1):
+        fails.append("is_final disagrees with current_waypoint / num_waypoints")
+    print(f"  is_final: 0/1 only, agrees with the route, set for {flag.mean() * 100:.1f}% of agents")
     distinct = len(np.unique(np.round(cond[:, COND_DELTA_GOAL], 6)))
     print(f"  range ok: {not bad_range}   uniform ok: {not off}   distinct delta_goal: {distinct}/{len(cond)}")
     if distinct < 0.9 * len(cond):
         fails.append(f"conditioning is not per-agent ({distinct} distinct of {len(cond)})")
 
     # -- waypoint chain integrity --------------------------------------------
-    cw = agents[:, 10]
     if not np.all(cw < np.maximum(n_wp, 1)):
         fails.append("current_waypoint index runs past num_waypoints")
     print(f"  current_waypoint within num_waypoints: {bool(np.all(cw < np.maximum(n_wp, 1)))}")

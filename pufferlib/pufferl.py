@@ -317,7 +317,8 @@ class PuffeRL:
 
                 logits, value = self.policy.forward_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
-                r = torch.clamp(r, -1, 1)
+                if config["reward_clip"] is True:
+                    r = torch.clamp(r, -config["reward_clip_low"], config["reward_clip_high"])
 
             profile("eval_copy", epoch)
             with torch.no_grad():
@@ -438,6 +439,7 @@ class PuffeRL:
 
             state = dict(
                 action=mb_actions,
+                done=mb_terminals,
                 lstm_h=None,
                 lstm_c=None,
             )
@@ -1290,6 +1292,7 @@ def eval(env_name, args=None, vecenv=None, policy=None):
         state = {}
         if args["train"]["use_rnn"]:
             state = dict(
+                done=torch.zeros(num_agents, device=device),
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
             )
@@ -1317,6 +1320,8 @@ def eval(env_name, args=None, vecenv=None, policy=None):
                 action = np.clip(action, vecenv.action_space.low, vecenv.action_space.high)
 
             ob, reward, done, truncated, info = vecenv.step(action)
+            if state:
+                state["done"] = torch.as_tensor(done | truncated).to(device)
 
             if driver.render_mode == 1:
                 frame_count += 1

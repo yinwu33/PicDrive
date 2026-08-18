@@ -113,8 +113,8 @@
 #define PARTNER_FEATURES 7
 
 // Ego features depend on dynamics model
-#define EGO_FEATURES_CLASSIC (8 + GIGA_NUM_COND)
-#define EGO_FEATURES_JERK (11 + GIGA_NUM_COND)
+#define EGO_FEATURES_CLASSIC (6 + GIGA_NUM_COND)
+#define EGO_FEATURES_JERK (9 + GIGA_NUM_COND)
 
 // Observation normalization constants
 #define MAX_SPEED 100.0f
@@ -2723,33 +2723,39 @@ void compute_observations(Drive *env) {
         float rel_goal_x = goal_x * cos_heading + goal_y * sin_heading;
         float rel_goal_y = -goal_x * sin_heading + goal_y * cos_heading;
 
+        // Gigaflow's S(t) (paper Sec. B) carries no collision flag and no respawn flag,
+        // and neither is dropped here by accident: the collision bit told the policy
+        // exactly when it was being charged, which is a shortcut around having to see
+        // the hazard, and the recurrent state is already zeroed on the respawn step.
         obs[0] = rel_goal_x * 0.005f;
         obs[1] = rel_goal_y * 0.005f;
         obs[2] = signed_speed / MAX_SPEED;
         obs[3] = ego_entity->width / MAX_VEH_WIDTH;
         obs[4] = ego_entity->length / MAX_VEH_LEN;
-        obs[5] = (ego_entity->collision_state > 0) ? 1.0f : 0.0f;
 
         if (env->dynamics_model == JERK) {
-            obs[6] = ego_entity->steering_angle / M_PI;
+            obs[5] = ego_entity->steering_angle / M_PI;
             // Asymmetric normalization for a_long to match action space
-            obs[7] =
+            obs[6] =
                 (ego_entity->a_long < 0) ? ego_entity->a_long / (-JERK_LONG[0]) : ego_entity->a_long / JERK_LONG[3];
-            obs[8] = ego_entity->a_lat / JERK_LAT[2];
-            obs[9] = (ego_entity->respawn_timestep == env->timestep) ? 1 : 0;
+            obs[7] = ego_entity->a_lat / JERK_LAT[2];
             // Add normalized entity type (VEHICLE=1, PEDESTRIAN=2, CYCLIST=3)
-            obs[10] = ego_entity->type / 3.0f;
+            obs[8] = ego_entity->type / 3.0f;
         } else {
-            obs[6] = (ego_entity->respawn_timestep == env->timestep) ? 1 : 0;
-            obs[7] = ego_entity->type / 3.0f;
+            obs[5] = ego_entity->type / 3.0f;
         }
 
         // This agent's own conditioning, normalized to [0, 1]. Only its own: the
         // partner observation and the RenderState carry no conditioning, so the policy
         // cannot read anyone else's intentions. That asymmetry is the point.
-        int cond_base = (env->dynamics_model == JERK) ? 11 : 8;
+        int cond_base = (env->dynamics_model == JERK) ? 9 : 6;
         for (int k = 0; k < GIGA_NUM_COND; k++)
             obs[cond_base + k] = giga_cond_norm(k, ego_entity->cond[k]);
+
+        // v_goal is constant, so its normalized slot is always 0. Reuse it for the one
+        // route fact the reward depends on: only the final waypoint has a speed gate.
+        obs[cond_base + COND_SLOT_IS_FINAL] =
+            (ego_entity->current_waypoint >= ego_entity->num_waypoints - 1) ? 1.0f : 0.0f;
 
         // In perspective mode the ego vector is the whole observation: the scene
         // reaches the policy only as rendered pixels, never as entity sets.
@@ -3110,7 +3116,7 @@ void c_step(Drive *env) {
         float distance_to_goal = relative_distance_2d(a->x, a->y, a->goal_position_x, a->goal_position_y);
         int is_final = (a->current_waypoint >= a->num_waypoints - 1);
         if (distance_to_goal < cond[COND_DELTA_GOAL] && !a->current_goal_reached &&
-            (!is_final || speed <= cond[COND_V_GOAL])) {
+            (!is_final || speed <= GIGA_V_GOAL)) {
             r_goal = env->reward_goal;
             a->goals_reached_this_episode += 1.0f;
             env->logs[i].speed_at_goal = speed;
@@ -3187,6 +3193,8 @@ void c_step(Drive *env) {
             row[GIGA_DBG_TIMESTEP] = (float)env->timestep;
             for (int k = 0; k < GIGA_NUM_COND; k++)
                 row[GIGA_DBG_COND + k] = cond[k];
+            // Same override the observation gets, so the trace shows what the policy saw.
+            row[GIGA_DBG_COND + COND_SLOT_IS_FINAL] = (float)is_final;
         }
 
         // Accumulated, not assigned: this is the fraction of the episode spent

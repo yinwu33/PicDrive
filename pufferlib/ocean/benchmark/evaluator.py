@@ -190,6 +190,7 @@ class WOSACEvaluator:
             state = {}
             if args["train"]["use_rnn"]:
                 state = dict(
+                    done=torch.zeros(num_agents, device=device),
                     lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                     lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
                 )
@@ -213,7 +214,9 @@ class WOSACEvaluator:
                 if isinstance(logits, torch.distributions.Normal):
                     action_np = np.clip(action_np, puffer_env.action_space.low, puffer_env.action_space.high)
 
-                obs, _, _, _, _ = puffer_env.step(action_np)
+                obs, _, dones, truncs, _ = puffer_env.step(action_np)
+                if state:
+                    state["done"] = torch.as_tensor(dones | truncs).to(device)
 
         return trajectories
 
@@ -883,6 +886,7 @@ class Evaluator:
         state = {}
         if self.configs["train"]["use_rnn"]:
             state = dict(
+                done=torch.zeros(num_agents, device=device),
                 lstm_h=torch.zeros(num_agents, policy.hidden_size, device=device),
                 lstm_c=torch.zeros(num_agents, policy.hidden_size, device=device),
             )
@@ -905,6 +909,8 @@ class Evaluator:
 
             # Step environment
             obs, rewards, dones, truncs, info_list = env.step(action_np, per_env_logs=per_env_logs)
+            if state:
+                state["done"] = torch.as_tensor(dones | truncs).to(device)
 
             if truncs.all():
                 break

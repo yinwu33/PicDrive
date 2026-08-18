@@ -91,8 +91,9 @@ def build_policy(args, env, config):
     policy.eval()
     device = config["train"]["device"]
     state = {}
-    if config["train"].get("use_rnn", config["rnn_name"] is not None):
+    if config["train"]["use_rnn"]:
         state = dict(
+            done=torch.zeros(env.num_agents, device=device),
             lstm_h=torch.zeros(env.num_agents, policy.hidden_size, device=device),
             lstm_c=torch.zeros(env.num_agents, policy.hidden_size, device=device),
         )
@@ -129,11 +130,10 @@ def rollout(env, policy, state, device, steps, seed):
         obs, reward, terminal, truncated, _ = env.step(action)
         # Copy: the C env overwrites the trace in place on the next step.
         rows.append(trace.copy())
-        if truncated.any() and state:
-            # The episode boundary resets the sim, so the recurrent state has to go
-            # with it or the next episode starts with memory of the previous one.
-            state["lstm_h"].zero_()
-            state["lstm_c"].zero_()
+        if state:
+            # LSTMWrapper zeroes the recurrent state wherever this is set, so a
+            # respawned or reset agent does not start with the last life's memory.
+            state["done"] = torch.as_tensor(terminal | truncated).to(device)
 
     return np.stack(rows), snap  # [steps, agents, features]
 
@@ -171,7 +171,7 @@ def summarize(rec, agent, top_steps):
 
     if top_steps:
         print(f"\nfirst {top_steps} steps")
-        cols = ["reward", "speed", "dist_to_goal", "lane_lateral_offset", "lane_heading_err", "action"]
+        cols = ["reward", "speed", "dist_to_goal", "is_final", "lane_heading_err", "action"]
         print(f"{'t':>5}{'coll':>6}" + "".join(f"{c:>20}" for c in cols))
         for k in range(min(top_steps, steps)):
             state = COLLISION_STATE.get(int(a[k, COL["collision_state"]]), "?")

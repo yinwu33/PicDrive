@@ -135,7 +135,10 @@ class LSTMWrapper(nn.Module):
         # TODO: Don't break compile
         if h is not None:
             assert h.shape[0] == c.shape[0] == observations.shape[0], "LSTM state must be (h, c)"
-            lstm_state = (h, c)
+            # done[i] means o_i is the first observation of a new episode for agent i,
+            # so agent i must not carry memory across it.
+            keep = (1.0 - state["done"].float()).unsqueeze(1)
+            lstm_state = (h * keep, c * keep)
         else:
             lstm_state = None
 
@@ -166,33 +169,37 @@ class LSTMWrapper(nn.Module):
         else:
             raise ValueError("Invalid input tensor shape", x.shape)
 
-        if lstm_h is not None:
-            assert lstm_h.shape[1] == lstm_c.shape[1] == B, "LSTM state must be (h, c)"
-            lstm_state = (lstm_h, lstm_c)
-        else:
-            lstm_state = None
-
         x = x.reshape(B * TT, *space_shape)
         hidden = self.policy.encode_observations(x, state)
         assert hidden.shape == (B * TT, self.input_size)
 
         hidden = hidden.reshape(B, TT, self.input_size)
+        done = state["done"].reshape(B, TT, 1)
 
-        hidden = hidden.transpose(0, 1)
-        # hidden = self.pre_layernorm(hidden)
-        hidden, (lstm_h, lstm_c) = self.lstm.forward(hidden, lstm_state)
-        hidden = hidden.float()
+        # Stepped rather than handed to nn.LSTM in one call: episode boundaries inside
+        # the chunk have to zero the state, which needs the recurrence unrolled. `cell`
+        # shares its parameters with `self.lstm`, so the arithmetic is unchanged.
+        if lstm_h is None:
+            h = hidden.new_zeros(B, self.hidden_size)
+            c = hidden.new_zeros(B, self.hidden_size)
+        else:
+            assert lstm_h.shape[1] == lstm_c.shape[1] == B, "LSTM state must be (h, c)"
+            h, c = lstm_h[0], lstm_c[0]
 
-        # hidden = self.post_layernorm(hidden)
-        hidden = hidden.transpose(0, 1)
+        outputs = []
+        for t in range(TT):
+            keep = 1.0 - done[:, t]
+            h, c = self.cell(hidden[:, t], (h * keep, c * keep))
+            outputs.append(h)
+
+        hidden = torch.stack(outputs, dim=1).float()
 
         flat_hidden = hidden.reshape(B * TT, self.hidden_size)
         logits, values = self.policy.decode_actions(flat_hidden)
         values = values.reshape(B, TT)
-        # state.batch_logits = logits.reshape(B, TT, -1)
         state["hidden"] = hidden
-        state["lstm_h"] = lstm_h.detach()
-        state["lstm_c"] = lstm_c.detach()
+        state["lstm_h"] = h.unsqueeze(0).detach()
+        state["lstm_c"] = c.unsqueeze(0).detach()
         return logits, values
 
 

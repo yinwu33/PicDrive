@@ -1151,6 +1151,7 @@ PyMODINIT_FUNC PyInit_binding(void) {
     PyModule_AddIntConstant(m, "PARTNER_FEATURES", PARTNER_FEATURES);
     PyModule_AddIntConstant(m, "EGO_FEATURES_CLASSIC", EGO_FEATURES_CLASSIC);
     PyModule_AddIntConstant(m, "EGO_FEATURES_JERK", EGO_FEATURES_JERK);
+    PyModule_AddIntConstant(m, "GIGA_NUM_COND", GIGA_NUM_COND);
 
     PyModule_AddIntConstant(m, "RENDER_AGENT_FEATURES", RENDER_AGENT_FEATURES);
     PyModule_AddIntConstant(m, "RENDER_ROAD_FEATURES", RENDER_ROAD_FEATURES);

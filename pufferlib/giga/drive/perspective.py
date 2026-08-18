@@ -22,13 +22,15 @@ both parts without paying float32 for the images:
 
 from __future__ import annotations
 
+import inspect
+
 import gymnasium
 import numpy as np
 import torch
 
 import pufferlib
 from pufferlib.giga.drive import binding, raster_cuda
-from pufferlib.giga.drive.raster_ref import DEFAULT_RIG, Camera, rig_from_config, rig_tensor
+from pufferlib.giga.drive.raster_ref import Camera, rig_from_config, rig_tensor
 
 # Bytes per panel label handed to the viewer, NUL-padded. Long enough for the
 # names in the rigs plus a terminator.
@@ -56,7 +58,7 @@ class PerspectiveVecEnv:
     attributes, `num_agents`, `agents_per_batch` and `driver_env`.
     """
 
-    def __init__(self, vecenv, cameras: list[Camera] | str | None = None, device: str = "cuda"):
+    def __init__(self, vecenv, cameras: list[Camera] | str, device: str = "cuda"):
         self.vecenv = vecenv
         self.device = torch.device(device)
         if self.device.type != "cuda":
@@ -67,13 +69,15 @@ class PerspectiveVecEnv:
         if isinstance(cameras, list) and cameras and all(isinstance(c, Camera) for c in cameras):
             self.cameras = list(cameras)
         else:
-            self.cameras = rig_from_config(cameras) if cameras else list(DEFAULT_RIG)
+            self.cameras = rig_from_config(cameras)
         heights = {c.height for c in self.cameras}
         widths = {c.width for c in self.cameras}
         if len(heights) != 1 or len(widths) != 1:
             raise ValueError("All cameras in a rig must share a resolution")
         self.height, self.width = heights.pop(), widths.pop()
         self.num_cameras = len(self.cameras)
+
+        self._step_takes_per_env_logs = "per_env_logs" in inspect.signature(vecenv.step).parameters
 
         self.envs = self._collect_envs(vecenv)
         for env in self.envs:
@@ -267,11 +271,12 @@ class PerspectiveVecEnv:
         return obs, infos
 
     def step(self, actions, per_env_logs=False):
-        # The evaluator asks for per-environment logs, which only Drive.step
-        # accepts; the Serial backend and PufferEnv.send do not take it.
-        try:
+        # The evaluator asks for per-environment logs, which only Drive.step accepts;
+        # the Serial backend and PufferEnv.send do not take it. Decided from the
+        # signature, so a TypeError raised inside step is not mistaken for this.
+        if self._step_takes_per_env_logs:
             raw = self.vecenv.step(actions, per_env_logs=per_env_logs)
-        except TypeError:
+        else:
             raw = self.vecenv.step(actions)
         self._render()
         self._pack_ego(raw[0])

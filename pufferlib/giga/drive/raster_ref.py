@@ -216,8 +216,6 @@ def rig_from_config(spec) -> list[Camera]:
     Named presets "waymo" (all three Waymo cameras), "nuplan" (Pictura's four)
     and "front" (the default, Waymo's front camera alone) are also accepted.
     """
-    if spec is None:
-        return list(DEFAULT_RIG)
     if isinstance(spec, str):
         text = spec.strip().strip('"').strip("'")
         if text.lower() == "waymo":

@@ -73,6 +73,6 @@ def vecenv_wrapper(env_name, vecenv, args):
 
     return PerspectiveVecEnv(
         vecenv,
-        cameras=args["env"].get("cameras"),
+        cameras=args["env"]["cameras"],
         device=args["train"]["device"],
     )
