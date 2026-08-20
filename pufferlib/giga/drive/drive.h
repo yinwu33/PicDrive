@@ -3652,6 +3652,27 @@ void handle_camera_controls(Client *client) {
     }
 }
 
+// Keep route semantics readable without relying on color: intermediate waypoints
+// retain the circular marker, while the last target in the chain is an X. Cylinders
+// give the X enough thickness to survive full-map scaling and video compression.
+static void draw_goal_marker(Drive *env, const Entity *agent, Vector3 center, Color color, float ring_alpha) {
+    int is_final = (agent->current_waypoint >= agent->num_waypoints - 1);
+    if (!is_final) {
+        DrawSphere(center, 0.5f, color);
+        DrawCircle3D(center, env->goal_radius, (Vector3){0, 0, 1}, 90.0f, Fade(color, ring_alpha));
+        return;
+    }
+
+    float half_extent = fmaxf(1.5f, env->goal_radius * 0.75f);
+    float stroke_radius = 0.12f;
+    Vector3 upper_left = {center.x - half_extent, center.y + half_extent, center.z};
+    Vector3 lower_right = {center.x + half_extent, center.y - half_extent, center.z};
+    Vector3 lower_left = {center.x - half_extent, center.y - half_extent, center.z};
+    Vector3 upper_right = {center.x + half_extent, center.y + half_extent, center.z};
+    DrawCylinderEx(upper_left, lower_right, stroke_radius, stroke_radius, 8, color);
+    DrawCylinderEx(lower_left, upper_right, stroke_radius, stroke_radius, 8, color);
+}
+
 void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int lasers) {
     // Diamond dimensions
     float diamond_height = 3.0f; // Total height of diamond
@@ -3711,18 +3732,16 @@ void draw_agent_obs(Drive *env, int agent_index, int mode, int obs_only, int las
         goal_color = LIGHT_PURPLE;
 
     if (mode == 0) { // agent-relative coordinates
-        DrawSphere((Vector3){goal_x, goal_y, Z_AGENT_DETAILS}, 0.5f, goal_color);
-        DrawCircle3D((Vector3){goal_x, goal_y, Z_AGENT_DETAILS}, env->goal_radius, (Vector3){0, 0, 1}, 90.0f,
-                     Fade(goal_color, 0.3f));
+        draw_goal_marker(env, &env->entities[active_idx], (Vector3){goal_x, goal_y, Z_AGENT_DETAILS}, goal_color,
+                         0.3f);
     }
 
     if (mode == 1) { // world coordinates
 
         float goal_x_world = px + (goal_x * heading_self_x - goal_y * heading_self_y);
         float goal_y_world = py + (goal_x * heading_self_y + goal_y * heading_self_x);
-        DrawSphere((Vector3){goal_x_world, goal_y_world, Z_AGENT_DETAILS}, 0.5f, goal_color);
-        DrawCircle3D((Vector3){goal_x_world, goal_y_world, Z_AGENT_DETAILS}, env->goal_radius, (Vector3){0, 0, 1},
-                     90.0f, Fade(goal_color, 0.3f));
+        draw_goal_marker(env, &env->entities[active_idx],
+                         (Vector3){goal_x_world, goal_y_world, Z_AGENT_DETAILS}, goal_color, 0.3f);
     }
     // First draw other agent observations
     int obs_idx = ego_dim; // Start after ego obs
@@ -4160,12 +4179,10 @@ void draw_scene(Drive *env, Client *client, int mode, int obs_only, int lasers, 
                 else if (env->entities[i].type == CYCLIST)
                     goal_color = LIGHT_PURPLE;
 
-                DrawSphere(
+                draw_goal_marker(
+                    env, &env->entities[i],
                     (Vector3){env->entities[i].goal_position_x, env->entities[i].goal_position_y, Z_AGENT_DETAILS},
-                    0.5f, goal_color);
-                DrawCircle3D(
-                    (Vector3){env->entities[i].goal_position_x, env->entities[i].goal_position_y, Z_AGENT_DETAILS},
-                    env->goal_radius, (Vector3){0, 0, Z_AGENT_DETAILS}, 90.0f, Fade(goal_color, 0.9f));
+                    goal_color, 0.9f);
             }
         }
         // Draw road elements

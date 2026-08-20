@@ -318,7 +318,7 @@ class PuffeRL:
                 logits, value = self.policy.forward_eval(o_device, state)
                 action, logprob, _ = pufferlib.pytorch.sample_logits(logits)
                 if config["reward_clip"] is True:
-                    r = torch.clamp(r, -config["reward_clip_low"], config["reward_clip_high"])
+                    r = torch.clamp(r, config["reward_clip_low"], config["reward_clip_high"])
 
             profile("eval_copy", epoch)
             with torch.no_grad():

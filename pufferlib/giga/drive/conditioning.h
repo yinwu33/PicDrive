@@ -76,11 +76,11 @@ static const float GIGA_COND_LO[GIGA_NUM_COND] = {
     0.0f,        // alpha_collision: collision penalty weight lower bound
     0.0f,        // alpha_boundary: off-road penalty weight lower bound
     0.0f,        // alpha_comfort: acceleration/jerk penalty weight lower bound
-    0.00025f,    // alpha_l_align: lane-heading alignment weight
+    0.,    // alpha_l_align: lane-heading alignment weight
     0.0f,        // alpha_vel_align: wrong-way motion multiplier
-    0.00025f,    // alpha_l_center: lane-centering weight
+    0.,    // alpha_l_center: lane-centering weight
     -0.5f,       // alpha_center_bias: preferred lateral offset lower bound, m (right)
-    0.00025f,    // alpha_reverse: reversing penalty weight lower bound
+    0.,    // alpha_reverse: reversing penalty weight lower bound
     0.8f,        // C_throttle normalization bound; sampled with X(1.25)
     0.8f,        // C_steer normalization bound; sampled with X(1.25)
     2.0f / 3.0f, // C_acc normalization bound; sampled with X(1.5)
@@ -89,12 +89,12 @@ static const float GIGA_COND_LO[GIGA_NUM_COND] = {
 static const float GIGA_COND_HI[GIGA_NUM_COND] = {
     12.0f,   // delta_goal: goal-reach radius upper bound, m
     0.0f,    // COND_SLOT_IS_FINAL placeholder: must equal LO
-    1.0f,    // alpha_collision: paper 3.0 / 3, for dt=0.1 (paper trains at 0.3)
-    1.0f,    // alpha_boundary: paper 3.0 / 3, same reason
-    0.0025f,   // alpha_comfort: paper 0.1 / 3, same reason
-    0.0025f,  // alpha_l_align: lane-heading alignment weight
+    3.0f,    // alpha_collision: paper 3.0 / 3, for dt=0.1 (paper trains at 0.3)
+    3.0f,    // alpha_boundary: paper 3.0 / 3, same reason
+    0.,   // alpha_comfort: paper 0.1 / 3, same reason
+    0.,  // alpha_l_align: lane-heading alignment weight
     1.0f,    // alpha_vel_align: wrong-way motion multiplier
-    0.0075f, // alpha_l_center: lane-centering weight
+    0., // alpha_l_center: lane-centering weight
     0.5f,    // alpha_center_bias: preferred lateral offset upper bound, m (left)
     0.0075f, // alpha_reverse: reversing penalty weight upper bound
     1.25f,   // C_throttle normalization bound; sampled with X(1.25)
