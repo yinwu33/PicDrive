@@ -58,6 +58,7 @@ DEBUG_FEATURE_NAMES = [
     "respawn_count",
     "action",
     "timestep",
+    "lane_dist",
     # conditioning.h, in COND_* order
     "cond_delta_goal",
     "is_final",

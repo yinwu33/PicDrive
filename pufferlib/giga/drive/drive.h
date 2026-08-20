@@ -297,6 +297,10 @@ struct Entity {
     // these, and nothing computed them before.
     float lane_heading_error;
     float lane_lateral_offset;
+    // Plain geometric distance to the nearest centerline in the search neighbourhood,
+    // with no heading penalty, and INT16_MAX when the neighbourhood held no lane at
+    // all. This is what the off-road test compares against half of lane_width.
+    float lane_distance;
     // Two flags, deliberately not one. lane_valid is the original strict test --
     // within 4 m of a centerline -- and LANE_ALIGNED_IDX, the lane_alignment_rate
     // log and the debug row are all defined against it, so it must keep that
@@ -434,11 +438,15 @@ struct GridMap {
 #define GIGA_DBG_RESPAWN_COUNT 31
 #define GIGA_DBG_ACTION 32
 #define GIGA_DBG_TIMESTEP 33
+// Geometric distance to the nearest centerline, the quantity the off-road test reads.
+// Distinct from LANE_LATERAL_OFFSET, which is measured against the heading-penalised
+// pick and so answers a different question.
+#define GIGA_DBG_LANE_DIST 34
 // The agent's own conditioning, raw (not normalized as in the observation). Every
 // penalty above is scaled by one of these and they are redrawn on every respawn, so
 // a trace without them cannot be read: an agent paying 0.1 for leaving the road and
 // one paying 3.0 are running different reward functions.
-#define GIGA_DBG_COND 34
+#define GIGA_DBG_COND 35
 #define GIGA_DEBUG_FEATURES (GIGA_DBG_COND + GIGA_NUM_COND)
 
 struct Drive {
@@ -1323,7 +1331,15 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
     float half_width = agent->width / 2.0f;
     float cos_heading = cosf(agent->heading);
     float sin_heading = sinf(agent->heading);
+    // Two minima over the same lane segments, and they are not interchangeable.
+    // `min_distance` carries the +3 m heading penalty applied below, so it answers
+    // "which lane is this agent travelling along" -- the right question for picking a
+    // segment to build a Frenet frame on. `min_lane_distance` is the plain geometric
+    // distance, which is the only one that can answer "is this agent on the drivable
+    // surface": a car turning through an intersection is 90 degrees off the lane it
+    // is crossing, and charging that as off-road would make every turn illegal.
     float min_distance = (float)INT16_MAX;
+    float min_lane_distance = (float)INT16_MAX;
 
     int closest_lane_entity_idx = -1;
     int closest_lane_geometry_idx = -1;
@@ -1362,8 +1378,10 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             }
         }
 
-        if (collided == OFFROAD)
-            break;
+        // Deliberately no early exit on OFFROAD any more. Off-road is now decided by
+        // the union of the road-edge test above and the lane-distance test below the
+        // loop, and both `min_lane_distance` and the Frenet frame have to be complete
+        // for the lane-relative reward terms whether or not an edge was crossed.
 
         // Find closest point on the road centerline to the agent
         if (entity->type == ROAD_LANE) {
@@ -1374,6 +1392,11 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
             float end[2] = {entity->traj_x[geometry_idx + 1], entity->traj_y[geometry_idx + 1]};
 
             float dist = point_to_segment_distance_2d(agent->x, agent->y, start[0], start[1], end[0], end[1]);
+            // Taken before the heading penalty below, which would otherwise put every
+            // turning agent 3 m further from the road than it is.
+            if (dist < min_lane_distance)
+                min_lane_distance = dist;
+
             float heading_diff = fabsf(atan2f(end[1] - start[1], end[0] - start[0]) - agent->heading);
 
             // Normalize heading difference to [0, pi]
@@ -1446,7 +1469,32 @@ void compute_agent_metrics(Drive *env, int agent_idx) {
         agent->lane_valid = agent->lane_ref_valid;
     }
 
-    // Check for vehicle collisions
+    agent->lane_distance = min_lane_distance;
+
+    // Off-road, second test: distance from the drivable surface.
+    //
+    // The road-edge test in the loop above only fires where the map actually carries a
+    // ROAD_EDGE to cross. WOMD crops carry them sparsely and past the edge of the crop
+    // there are none at all, so an agent that left the road network entirely was
+    // charged nothing -- measured on a trained policy, 98.65% of its steps had no
+    // centerline within the search neighbourhood at all while off-road fired on 0.09%
+    // of them. Driving out of the map was 21x cheaper per step than staying on it, and
+    // the policy duly drove 2 km off a 358 m map every episode.
+    //
+    // Distance to the lane graph is well defined everywhere the search can see, and it
+    // is also the geometry the *policy* is shown: with draw_lane_area the rasterizer
+    // paints the drivable surface by widening these same centerlines to lane_width, so
+    // testing against half of that width is what finally makes the reward agree with
+    // the picture. `min_lane_distance` is still INT16_MAX when the neighbourhood held
+    // no lane at all, which is the far-field case and lands on the same branch.
+    //
+    // Union rather than replacement: road edges still catch surfaces that are close to
+    // a centerline but not drivable, which a distance test alone cannot see.
+    if (min_lane_distance > 0.5f * env->lane_width)
+        collided = OFFROAD;
+
+    // Check for vehicle collisions. Ordered after the off-road tests so that a vehicle
+    // collision still takes precedence, as it did before.
     int car_collided_with_index = collision_check(env, agent_idx);
     if (car_collided_with_index != -1)
         collided = VEHICLE_COLLISION;
@@ -1663,6 +1711,7 @@ static void giga_place_agent(Drive *env, int agent_idx, int count) {
     a->lane_ref_valid = 0;
     a->lane_heading_error = 0.0f;
     a->lane_lateral_offset = 0.0f;
+    a->lane_distance = (float)INT16_MAX;
     a->wheelbase = 0.6f * a->length;
     a->removed = 0;
     a->stopped = 0;
@@ -3234,6 +3283,7 @@ void c_step(Drive *env) {
             row[GIGA_DBG_LANE_VALID] = (float)a->lane_valid;
             row[GIGA_DBG_LANE_HEADING_ERR] = a->lane_heading_error;
             row[GIGA_DBG_LANE_LATERAL_OFFSET] = a->lane_lateral_offset;
+            row[GIGA_DBG_LANE_DIST] = a->lane_distance;
             row[GIGA_DBG_LANE_ALIGNED] = a->metrics_array[LANE_ALIGNED_IDX];
             row[GIGA_DBG_DIST_TO_GOAL] = distance_to_goal;
             row[GIGA_DBG_CURRENT_WAYPOINT] = (float)a->current_waypoint;

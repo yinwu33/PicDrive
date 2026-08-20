@@ -91,8 +91,8 @@ static const float GIGA_COND_HI[GIGA_NUM_COND] = {
     0.0f,    // COND_SLOT_IS_FINAL placeholder: must equal LO
     1.0f,    // alpha_collision: paper 3.0 / 3, for dt=0.1 (paper trains at 0.3)
     1.0f,    // alpha_boundary: paper 3.0 / 3, same reason
-    0.03f,   // alpha_comfort: paper 0.1 / 3, same reason
-    0.025f,  // alpha_l_align: lane-heading alignment weight
+    0.0025f,   // alpha_comfort: paper 0.1 / 3, same reason
+    0.0025f,  // alpha_l_align: lane-heading alignment weight
     1.0f,    // alpha_vel_align: wrong-way motion multiplier
     0.0075f, // alpha_l_center: lane-centering weight
     0.5f,    // alpha_center_bias: preferred lateral offset upper bound, m (left)
